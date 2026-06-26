@@ -24,6 +24,18 @@ async def main():
         )
         page = await ctx.new_page()
 
+        # 检查登录状态
+        await page.goto("https://u.ccb.com/portal/#/study", wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(3000)
+        if "/sys/#/login" in page.url or "密码登录" in (await page.locator("body").inner_text(timeout=3000))[:500]:
+            print("未登录，请在浏览器中手动登录后按回车...")
+            input()
+            # 保存会话供下次使用
+            await ctx.storage_state(path="ccbu_session.json")
+            print("会话已保存")
+        else:
+            print("已登录")
+
         for ws_id in TEST_IDS:
             url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
             print(f"\n{'='*60}")
