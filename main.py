@@ -2610,22 +2610,38 @@ def start(headless, workers, target_hours, tags):
 
             # ===== 按需翻页 + 逐页采集 + 学习 =====
             page_num = 1
-            has_more_pages = True
             no_more_pages = False  # 标记是否已无更多页
+            tasks = []
+            ws_locks = {}
 
-            # 采集第一页
-            current_workshops = await learner.get_workshops(page)
-            if not current_workshops:
-                console.print("第 1 页无专题班", style="yellow")
-                has_more_pages = False
-            else:
+            # 采集课程，至少凑够 worker 数量再开始学（除非已无更多页）
+            while len(tasks) < learner.workers and not no_more_pages:
+                current_workshops = await learner.get_workshops(page)
+                if not current_workshops:
+                    no_more_pages = True
+                    break
+
                 console.print(f"\n{'='*50}", style="bold blue")
                 console.print(f"第 {page_num} 页: {len(current_workshops)} 个专题班", style="bold blue")
                 console.print(f"{'='*50}", style="bold blue")
                 await learner.display_workshops(current_workshops)
-                tasks, ws_locks = await learner._collect_workshops_courses(
+
+                new_tasks, new_locks = await learner._collect_workshops_courses(
                     page, current_workshops, completed_ids)
                 learner.save_progress(completed_ids, page_num, 0)
+                tasks.extend(new_tasks)
+                ws_locks.update(new_locks)
+
+                if len(tasks) >= learner.workers:
+                    break
+
+                # 不够，翻页继续采
+                moved = await learner.go_to_next_page(page)
+                if not moved:
+                    no_more_pages = True
+                else:
+                    page_num += 1
+                    await page.wait_for_timeout(3000)
 
             if tasks:
                 # 定义回调：worker队列空时自动翻页采集更多课程
@@ -2633,7 +2649,7 @@ def start(headless, workers, target_hours, tags):
                 _page_ref = [page]  # 用列表包装以便闭包修改
 
                 async def fetch_more_courses(queue):
-                    nonlocal no_more_pages, page_num, has_more_pages
+                    nonlocal no_more_pages, page_num
                     if no_more_pages:
                         return 0
                     async with _fetch_lock:
