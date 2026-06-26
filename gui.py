@@ -798,8 +798,19 @@ class DashboardScreen(QWidget):
 
             progress = learner.load_progress()
             completed_ids = set(progress.get("completed_ws_ids", []))
+            last_page = progress.get("last_page", 1)
 
+            # 跳转到上次的页码
             page_num = 1
+            if last_page > 1:
+                log(f"跳转到第 {last_page} 页（上次进度）", "blue")
+                for _ in range(last_page - 1):
+                    moved = await learner.go_to_next_page(page)
+                    if not moved:
+                        break
+                    page_num += 1
+                    await page.wait_for_timeout(1000)
+
             no_more_pages = False
             tasks = []
             ws_locks = {}
@@ -810,6 +821,7 @@ class DashboardScreen(QWidget):
                     no_more_pages = True
                     break
                 log(f"第 {page_num} 页: {len(workshops)} 个专题班", "blue")
+                learner.save_progress(completed_ids, page_num, 0)
                 new_tasks, new_locks = await learner._collect_workshops_courses(
                     page, workshops, completed_ids
                 )
@@ -852,6 +864,7 @@ class DashboardScreen(QWidget):
                         if not new_ws:
                             return 0
                         log(f"自动翻到第 {page_num} 页: {len(new_ws)} 个专题班", "blue")
+                        learner.save_progress(completed_ids, page_num, 0)
                         new_t, new_l = await learner._collect_workshops_courses(
                             page, new_ws, completed_ids
                         )
