@@ -1924,6 +1924,23 @@ class CCBULearner:
                     except:
                         pass
 
+                # 等待课程表格加载（表格可能有结构但没数据）
+                for _wait in range(3):
+                    row_count = await cp.locator("tr.text-center").count()
+                    if row_count > 0:
+                        break
+                    # 检查是否有NaN（数据未加载完）
+                    page_text = ""
+                    try:
+                        page_text = await cp.locator("body").inner_text(timeout=2000)
+                    except:
+                        pass
+                    if "NaN" in page_text or "总课程门" in page_text:
+                        debug(f"  表格数据未加载，等待刷新({_wait+1}/3)")
+                        await cp.wait_for_timeout(5000)
+                    else:
+                        break
+
                 # 检查是否需要报名（页面上有"立即报名"按钮）
                 need_enroll = False
                 for kw in ["立即报名", "加入学习", "免费报名"]:
