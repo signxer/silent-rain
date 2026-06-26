@@ -1482,12 +1482,16 @@ class CCBULearner:
         courses = []
         try:
             debug("正在获取课程列表...")
-            # 先等表格出现（最多10秒）
-            try:
-                await page.wait_for_selector("tr.text-center", timeout=10000)
-            except:
-                debug("等待课程表格超时")
-            await page.wait_for_timeout(2000)
+            # 等待表格tbody有数据行（API异步加载）
+            for _wait in range(6):
+                row_count = await page.locator("tr.text-center").count()
+                tbody_has_children = await page.evaluate(
+                    "() => { const tb = document.querySelector('tbody.content'); return tb ? tb.children.length : 0; }")
+                if row_count > 0 or tbody_has_children > 0:
+                    break
+                debug(f"  等待课程数据加载({_wait+1}/6)...")
+                await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(1000)
 
             # 检查页面是否加载了课程表格
             row_count = await page.locator("tr.text-center").count()
