@@ -1889,8 +1889,9 @@ class CCBULearner:
 
         return all_tasks, ws_locks
 
-    async def parallel_learn_courses(self, all_tasks: List, ws_locks: Dict):
-        """全局课程队列：所有 worker 跨专题班并发消费，自动标记已完成专题班"""
+    async def parallel_learn_courses(self, all_tasks: List, ws_locks: Dict, fetch_more_callback=None):
+        """全局课程队列：所有 worker 跨专题班并发消费，自动标记已完成专题班
+        fetch_more_callback: async callable(queue) -> int，队列空时调用，往queue里加新任务，返回新增数"""
         if not all_tasks:
             console.print("没有需要学习的课程", style="green")
             return set()
@@ -2076,6 +2077,14 @@ class CCBULearner:
                     ws_id, cidx, course, ws_title, retry = await asyncio.wait_for(
                         course_queue.get(), timeout=30)
                 except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                    # 队列空了，尝试采集更多课程
+                    if fetch_more_callback:
+                        try:
+                            added = await fetch_more_callback(course_queue)
+                            if added > 0:
+                                continue  # 有新课程，继续取
+                        except Exception as e:
+                            debug(f"[工作线程 {w_id+1}] 采集回调异常: {e}")
                     break
 
                 title = course['title'][:40]
@@ -2601,61 +2610,81 @@ def start(headless, workers, target_hours, tags):
 
             # ===== 按需翻页 + 逐页采集 + 学习 =====
             page_num = 1
-            all_tasks = []
-            all_ws_locks = {}
             has_more_pages = True
+            no_more_pages = False  # 标记是否已无更多页
 
-            while has_more_pages:
-                # 获取当前页的专题班
-                current_workshops = await learner.get_workshops(page)
-                if not current_workshops:
-                    console.print(f"第 {page_num} 页无专题班", style="yellow")
-                    break
-
+            # 采集第一页
+            current_workshops = await learner.get_workshops(page)
+            if not current_workshops:
+                console.print("第 1 页无专题班", style="yellow")
+                has_more_pages = False
+            else:
                 console.print(f"\n{'='*50}", style="bold blue")
                 console.print(f"第 {page_num} 页: {len(current_workshops)} 个专题班", style="bold blue")
                 console.print(f"{'='*50}", style="bold blue")
                 await learner.display_workshops(current_workshops)
-
-                # 采集当前页的课程
                 tasks, ws_locks = await learner._collect_workshops_courses(
                     page, current_workshops, completed_ids)
-                # 采集后保存进度（新标记的已完成专题班）
                 learner.save_progress(completed_ids, page_num, 0)
-                if tasks:
-                    all_tasks.extend(tasks)
-                    all_ws_locks.update(ws_locks)
-                    console.print(f"累计 {len(all_tasks)} 门待学课程", style="green")
 
-                # 如果已有待学课程，先学完再决定是否翻页
-                if all_tasks:
-                    console.print(f"\n{'='*50}", style="bold blue")
-                    console.print(f"开始学习（{len(all_tasks)} 门课程, {learner.workers} 个线程）", style="bold blue")
-                    console.print(f"{'='*50}", style="bold blue")
-                    await learner.parallel_learn_courses(all_tasks, all_ws_locks)
-                    all_tasks = []
-                    all_ws_locks = {}
-                    # 学完后重新加载已完成列表
-                    progress = learner.load_progress()
-                    completed_ids = set(progress.get("completed_ws_ids", []))
+            if tasks:
+                # 定义回调：worker队列空时自动翻页采集更多课程
+                _fetch_lock = asyncio.Lock()
+                _page_ref = [page]  # 用列表包装以便闭包修改
 
-                # 检查是否还需要继续（目标学时达标则停止）
-                if learner.study_goal > 0:
-                    _h = await learner._get_study_hours(page)
-                    _cur = _h.get(learner.goal_type, 0)
-                    _tn = "集中培训" if learner.goal_type == "central" else "网络自学"
-                    console.print(f"当前{_tn}: {_cur:.1f}/{learner.study_goal} 学时", style="blue")
-                    if _cur >= learner.study_goal:
-                        console.print(f"已达到学习目标! 停止翻页", style="bold green")
-                        break
+                async def fetch_more_courses(queue):
+                    nonlocal no_more_pages, page_num, has_more_pages
+                    if no_more_pages:
+                        return 0
+                    async with _fetch_lock:
+                        # 再次检查（可能其他worker已经采了）
+                        if no_more_pages:
+                            return 0
+                        # 检查目标学时
+                        if learner.study_goal > 0:
+                            try:
+                                _h = await learner._get_study_hours(_page_ref[0])
+                                _cur = _h.get(learner.goal_type, 0)
+                                if _cur >= learner.study_goal:
+                                    console.print(f"\n已达到学习目标! 停止采集", style="bold green")
+                                    no_more_pages = True
+                                    return 0
+                            except:
+                                pass
+                        # 翻页
+                        moved = await learner.go_to_next_page(_page_ref[0])
+                        if not moved:
+                            console.print("\n已无更多页", style="yellow")
+                            no_more_pages = True
+                            return 0
+                        page_num += 1
+                        await _page_ref[0].wait_for_timeout(3000)
+                        # 采集新页
+                        new_ws = await learner.get_workshops(_page_ref[0])
+                        if not new_ws:
+                            no_more_pages = True
+                            return 0
+                        console.print(f"\n自动翻到第 {page_num} 页: {len(new_ws)} 个专题班", style="bold blue")
+                        new_tasks, new_locks = await learner._collect_workshops_courses(
+                            _page_ref[0], new_ws, completed_ids)
+                        learner.save_progress(completed_ids, page_num, 0)
+                        # 合并锁
+                        ws_locks.update(new_locks)
+                        # 加入队列
+                        for t in new_tasks:
+                            queue.put_nowait((*t, 0))
+                        if new_tasks:
+                            console.print(f"新增 {len(new_tasks)} 门课程", style="green")
+                        return len(new_tasks)
 
-                # 翻到下一页
-                has_more_pages = await learner.go_to_next_page(page)
-                if has_more_pages:
-                    page_num += 1
-                    await page.wait_for_timeout(3000)
-
-            if not all_tasks and page_num == 1:
+                console.print(f"\n{'='*50}", style="bold blue")
+                console.print(f"开始学习（{len(tasks)} 门课程, {learner.workers} 个线程）", style="bold blue")
+                console.print(f"{'='*50}", style="bold blue")
+                await learner.parallel_learn_courses(tasks, ws_locks, fetch_more_courses)
+                # 学完后重新加载已完成列表
+                progress = learner.load_progress()
+                completed_ids = set(progress.get("completed_ws_ids", []))
+            else:
                 console.print("没有需要学习的课程", style="yellow")
 
             console.print("\n✓ 学习流程完成! 浏览器将保持打开", style="bold green")
