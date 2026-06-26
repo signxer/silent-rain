@@ -23,7 +23,7 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, ToolButton,
     LineEdit, SpinBox, SwitchButton,
     RadioButton, CheckBox,
-    TableWidget, ProgressBar,
+    TableWidget, ProgressBar, ProgressRing,
     PlainTextEdit, TextEdit,
     SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
     TitleLabel,
@@ -421,8 +421,6 @@ class DashboardScreen(QWidget):
         title.setFont(QFont("", 16, QFont.Bold))
         header.addWidget(title)
         header.addStretch()
-        self.lbl_status = CaptionLabel("正在启动...")
-        header.addWidget(self.lbl_status)
         layout.addLayout(header)
 
         # Main area: left info | center table | right log
@@ -453,13 +451,21 @@ class DashboardScreen(QWidget):
         goal_card.setFixedWidth(200)
         gl = QVBoxLayout(goal_card)
         gl.setContentsMargins(14, 10, 14, 10)
-        gl.setSpacing(6)
+        gl.setSpacing(8)
         gl.addWidget(SubtitleLabel("学习目标"))
         self.lbl_goal_info = BodyLabel("--")
-        self.progress_goal = ProgressBar()
-        self.progress_goal.setValue(0)
         gl.addWidget(self.lbl_goal_info)
-        gl.addWidget(self.progress_goal)
+
+        # Progress ring centered
+        ring_layout = QHBoxLayout()
+        ring_layout.addStretch()
+        self.progress_ring = ProgressRing()
+        self.progress_ring.setFixedSize(80, 80)
+        self.progress_ring.setValue(0)
+        self.progress_ring.setTextVisible(True)
+        ring_layout.addWidget(self.progress_ring)
+        ring_layout.addStretch()
+        gl.addLayout(ring_layout)
         left.addWidget(goal_card)
 
         left.addStretch()
@@ -718,12 +724,11 @@ class DashboardScreen(QWidget):
         if goal_hours > 0:
             cur = data.get(goal_type, 0)
             pct = min(100, int(cur / goal_hours * 100))
-            self.progress_goal.setValue(pct)
+            self.progress_ring.setValue(pct)
             type_name = "集中培训" if goal_type == "central" else "网络自学"
             self.lbl_goal_info.setText(f"{type_name} {cur:.1f}/{goal_hours:.0f} 学时 ({pct}%)")
 
     def _on_done(self, success, failed):
-        self.lbl_status.setText(f"完成: 成功 {success}, 失败 {failed}")
         InfoBar.success("完成", f"学习流程结束，成功 {success} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_tag_request(self, tags_by_category):
