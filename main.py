@@ -2012,21 +2012,29 @@ class CCBULearner:
                         except:
                             pass
 
-                    # 获取课程列表（重试10次）
+                    # 获取课程列表（重试10次，每次重新打开列表页点击）
                     courses = []
                     for attempt in range(10):
                         if attempt > 0:
                             console.print(f"  第 {attempt+1} 次获取课程...", style="yellow")
-                            debug(f"  [{ws_title[:20]}] 第{attempt+1}次重试, URL: {cp.url}")
+                            debug(f"  [{ws_title[:20]}] 第{attempt+1}次重试")
+                            # 重新打开列表页并点击
                             try:
-                                await cp.goto(ws_url, wait_until="domcontentloaded", timeout=20000)
-                                await cp.wait_for_timeout(8000)
+                                await cp.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                                await cp.wait_for_timeout(5000)
+                                link = cp.locator(f"a[href*='{ws_id}']").first
+                                if await link.count() > 0:
+                                    await link.click()
+                                else:
+                                    link = cp.locator(f"text={ws_title[:20]}").first
+                                    if await link.count() > 0 and await link.is_visible():
+                                        await link.click()
+                                    else:
+                                        await cp.goto(f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}",
+                                                      wait_until="domcontentloaded", timeout=20000)
+                                await cp.wait_for_timeout(6000)
                             except:
-                                try:
-                                    await cp.reload(wait_until="domcontentloaded", timeout=20000)
-                                    await cp.wait_for_timeout(8000)
-                                except:
-                                    pass
+                                pass
                         courses = await self.get_courses_from_workshop(cp)
                         if courses:
                             break
