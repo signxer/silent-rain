@@ -792,6 +792,20 @@ class MainWindow(MSFluentWindow):
         self.setWindowTitle("CCBU-Auto 自动学习")
         self.resize(1000, 650)
         self.setMinimumSize(800, 500)
+        self._drag_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.pos()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() == Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
 
         # Config state
         self.cfg_workers = 1
