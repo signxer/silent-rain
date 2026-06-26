@@ -16,6 +16,12 @@ TEST_IDS = [
 
 
 async def main():
+    log_file = open("debug_collect.log", "w", encoding="utf-8")
+    def log(msg):
+        log(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         ctx = await browser.new_context(
@@ -26,22 +32,28 @@ async def main():
 
         # 检查登录状态
         await page.goto("https://u.ccb.com/portal/#/study", wait_until="domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(3000)
-        if "/sys/#/login" in page.url or "密码登录" in (await page.locator("body").inner_text(timeout=3000))[:500]:
-            print("未登录，请在浏览器中手动登录后按回车...")
+        await page.wait_for_timeout(5000)
+        url = page.url
+        body = (await page.locator("body").inner_text(timeout=5000))[:1000]
+        log(f"检查登录 - URL: {url}")
+        log(f"检查登录 - 页面前100字: {body[:100]}")
+
+        # 如果URL包含login，或页面有登录表单，就是未登录
+        is_logged_in = "/sys/#/login" not in url and "密码登录" not in body and "统一认证" not in body
+        if not is_logged_in:
+            log("未登录，请在浏览器中手动登录后按回车...")
             input()
-            # 保存会话供下次使用
             await ctx.storage_state(path="ccbu_session.json")
-            print("会话已保存")
+            log("会话已保存")
         else:
-            print("已登录")
+            log("已登录")
 
         for ws_id in TEST_IDS:
             url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
-            print(f"\n{'='*60}")
-            print(f"测试: {ws_id}")
-            print(f"URL: {url}")
-            print(f"{'='*60}")
+            log(f"\n{'='*60}")
+            log(f"测试: {ws_id}")
+            log(f"URL: {url}")
+            log(f"{'='*60}")
 
             # 1. 导航
             try:
@@ -52,10 +64,10 @@ async def main():
                 continue
 
             # 2. 页面基本信息
-            print(f"  当前URL: {page.url}")
+            log(f"  当前URL: {page.url}")
             body_text = await page.locator("body").inner_text(timeout=5000)
-            print(f"  页面文本长度: {len(body_text)}")
-            print(f"  页面文本前200字: {body_text[:200]}")
+            log(f"  页面文本长度: {len(body_text)}")
+            log(f"  页面文本前200字: {body_text[:200]}")
 
             # 3. 检查常见元素
             checks = [
@@ -100,7 +112,7 @@ async def main():
 
             # 5. 再次检查课程表格
             row_count = await page.locator("tr.text-center").count()
-            print(f"  点击标签后表格行数: {row_count}")
+            log(f"  点击标签后表格行数: {row_count}")
 
             # 6. 如果还是0，dump页面HTML结构
             if row_count == 0:
@@ -122,6 +134,9 @@ async def main():
             await page.wait_for_timeout(1000)
 
         await browser.close()
+
+    log(f"\n调试完成，结果已保存到 debug_collect.log")
+    log_file.close()
 
 
 if __name__ == "__main__":
