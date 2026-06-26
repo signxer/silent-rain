@@ -1477,7 +1477,7 @@ class CCBULearner:
             return False
 
 
-    async def get_courses_from_workshop(self, page: Page) -> List[Dict]:
+    async def get_courses_from_workshop(self, page: Page, ws_title: str = "") -> List[Dict]:
         # 从表格提取全部课程信息（不含URL，URL由collector动态采集）
         courses = []
         try:
@@ -1581,7 +1581,8 @@ class CCBULearner:
                 if len(skipped) > 5:
                     skipped_str += f" 等{len(skipped)}项"
                 debug(f"  表格有{raw_count}行但全被过滤: {skipped_str}")
-                console.print(f"课程列表: 0 门（过滤: {skipped_str}）", style="yellow")
+                prefix = f"[{ws_title[:20]}] " if ws_title else ""
+                console.print(f"{prefix}课程列表: 0 门（过滤: {skipped_str}）", style="yellow")
                 return []  # 返回空列表表示确实没有可学课程
 
             if raw_count == 0 and len(courses) == 0:
@@ -1589,7 +1590,8 @@ class CCBULearner:
                 debug("  表格无数据行，需要重试")
                 return None  # 返回None表示需要重试
 
-            console.print(f"课程列表: {len(courses)} 门", style="green")
+            prefix = f"[{ws_title[:20]}] " if ws_title else ""
+            console.print(f"{prefix}课程列表: {len(courses)} 门", style="green")
         except Exception as e:
             console.print(f"获取课程列表失败: {e}", style="yellow")
             import traceback
@@ -2053,7 +2055,7 @@ class CCBULearner:
                                 await cp.wait_for_timeout(6000)
                             except:
                                 pass
-                        result = await self.get_courses_from_workshop(cp)
+                        result = await self.get_courses_from_workshop(cp, ws_title)
                         if result is None:
                             # 需要重试（表格没数据）
                             continue
