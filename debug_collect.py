@@ -38,8 +38,8 @@ async def main():
         log(f"检查登录 - URL: {url}")
         log(f"检查登录 - 页面前100字: {body[:100]}")
 
-        # 如果URL包含login，或页面有登录表单，就是未登录
-        is_logged_in = "/sys/#/login" not in url and "密码登录" not in body and "统一认证" not in body
+        # 如果URL包含login，或页面有登录相关文字，就是未登录
+        is_logged_in = "/sys/#/login" not in url and "立即登录" not in body and "密码登录" not in body and "统一认证" not in body and "登录跟进" not in body
         if not is_logged_in:
             log("未登录，请在浏览器中手动登录后按回车...")
             input()
