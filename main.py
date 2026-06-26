@@ -1896,35 +1896,41 @@ class CCBULearner:
                     console.print(f"  ⊘ 已完成，跳过: {ws_title[:30]}", style="green")
                     return None
 
-                # 导航到专题班详情页（尝试两种URL格式）
+                # 导航到专题班详情页
+                # 先离开当前页，再导航到目标页（强制SPA重新渲染）
                 ws_url_my = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
                 ws_url_detail = f"https://u.ccb.com/workshop/#/detail?id={ws_id}"
 
                 for nav_url in [ws_url_my, ws_url_detail]:
                     try:
+                        # 先导航到空白页重置SPA状态
+                        await cp.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                        await cp.wait_for_timeout(500)
+                        # 再导航到目标页
                         await cp.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
                         await cp.wait_for_timeout(5000)
                     except Exception as e:
                         debug(f"  导航异常: {e}")
 
-                    # 检查页面是否加载了专题班内容（不只是导航菜单）
+                    # 检查页面是否加载了专题班内容
                     body_text = ""
                     try:
                         body_text = await cp.locator("body").inner_text(timeout=3000)
                     except:
                         pass
-                    # 如果页面有专题班标题或课程相关内容，说明加载成功
-                    if len(body_text.strip()) > 500 and ("创建日期" in body_text or "报名" in body_text or "课程" in body_text):
+                    # 有"创建日期"或"课程"标签页才算加载成功
+                    has_workshop_content = ("创建日期" in body_text or "报名" in body_text)
+                    if has_workshop_content:
                         break
                     # 没加载出来，尝试reload
                     try:
                         await cp.reload(wait_until="domcontentloaded", timeout=15000)
                         await cp.wait_for_timeout(5000)
                         body_text = await cp.locator("body").inner_text(timeout=3000)
+                        if "创建日期" in body_text or "报名" in body_text:
+                            break
                     except:
                         pass
-                    if len(body_text.strip()) > 500:
-                        break
 
                 # 检查是否报名截止
                 if "报名截止" in body_text:
@@ -2566,9 +2572,11 @@ class CCBULearner:
             ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
             _log(f"正在采集: {ws_id[:16]}...", "blue")
 
-            # 导航
+            # 导航（先离开再回来，强制SPA重新渲染）
             for nav_url in [ws_url, ws_url.replace("/myworkshop/detail", "/detail")]:
                 try:
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                    await page.wait_for_timeout(500)
                     await page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
                     await page.wait_for_timeout(5000)
                 except:
@@ -2578,7 +2586,7 @@ class CCBULearner:
                     body = await page.locator("body").inner_text(timeout=3000)
                 except:
                     pass
-                if len(body) > 500 and ("创建日期" in body or "课程" in body):
+                if "创建日期" in body or "报名" in body:
                     break
 
             if "报名截止" in body:
