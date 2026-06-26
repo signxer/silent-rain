@@ -1,226 +1,67 @@
 #!/usr/bin/env python3
-"""CCBU-Auto Qt GUI Application"""
+"""CCBU-Auto Fluent Design GUI (QFluentWidgets)"""
 import asyncio
 import json
 import os
-import threading
 import sys
+import threading
 from datetime import datetime
 
-from PySide6.QtCore import (
-    Qt, QThread, Signal, Slot, QTimer,
-)
-from PySide6.QtGui import QFont, QColor, QTextCursor
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QStackedWidget,
-    QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
-    QLabel, QLineEdit, QPushButton, QSpinBox, QCheckBox,
-    QRadioButton, QButtonGroup, QGroupBox,
-    QTableWidget, QTableWidgetItem, QHeaderView,
-    QPlainTextEdit, QListWidget, QListWidgetItem,
-    QProgressBar, QSplitter, QMessageBox, QSizePolicy,
+from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QSize
+from PyQt5.QtGui import QColor, QFont, QIcon
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QFormLayout, QStackedWidget, QTableWidgetItem,
+    QHeaderView, QSizePolicy, QSpacerItem,
+    QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
 )
 
-from main import CCBULearner, CONFIG_PATH, PROGRESS_PATH
+from qfluentwidgets import (
+    FluentWindow, MSFluentWindow,
+    NavigationItemPosition, FluentIcon as FIF,
+    CardWidget, HeaderCardWidget, SimpleCardWidget,
+    PrimaryPushButton, PushButton, ToolButton,
+    LineEdit, SpinBox, SwitchButton,
+    RadioButton, CheckBox,
+    TableWidget, ProgressBar,
+    PlainTextEdit, TextEdit,
+    SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
+    TitleLabel,
+    InfoBar, InfoBarPosition,
+    MessageBox, Dialog,
+    HyperlinkButton,
+    isDarkTheme, setTheme, Theme,
+)
+
+from main import CCBULearner, CONFIG_PATH, PROGRESS_PATH, STORAGE_STATE_PATH
 
 
 # ─── Async Thread ──────────────────────────────────────────────────
 
 
 class AsyncThread(QThread):
-    """Runs an async function in a dedicated thread with its own event loop."""
-
-    log_signal = Signal(str, str)          # (message, style)
-    progress_signal = Signal(dict)         # worker progress
-    hours_signal = Signal(dict)            # study hours
-    done_signal = Signal(int, int)         # (success, failed)
-    login_done_signal = Signal(bool, str)  # (success, username)
-    tag_request_signal = Signal(dict)      # 请求选择标签，传入tags_by_category
-    tag_result_signal = Signal(list)       # 标签选择结果
+    log_signal = Signal(str, str)
+    progress_signal = Signal(dict)
+    hours_signal = Signal(dict)
+    done_signal = Signal(int, int)
+    tag_request_signal = Signal(dict)
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
         self._coro_func = coro_func
-        self._loop = None
 
     def run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            self._loop.run_until_complete(self._coro_func(self))
+            loop.run_until_complete(self._coro_func(self))
         except Exception as e:
             self.log_signal.emit(f"错误: {e}", "red")
         finally:
-            self._loop.close()
-
-    def stop(self):
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            loop.close()
 
 
-# ─── Styles ────────────────────────────────────────────────────────
-
-STYLE = """
-QMainWindow {
-    background-color: #1e1e2e;
-}
-QWidget {
-    color: #cdd6f4;
-    font-size: 14px;
-}
-QGroupBox {
-    border: 1px solid #45475a;
-    border-radius: 8px;
-    margin-top: 12px;
-    padding-top: 16px;
-    font-weight: bold;
-    color: #89b4fa;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 12px;
-    padding: 0 6px;
-}
-QPushButton {
-    background-color: #313244;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    padding: 8px 20px;
-    font-weight: bold;
-    color: #cdd6f4;
-}
-QPushButton:hover {
-    background-color: #45475a;
-}
-QPushButton:pressed {
-    background-color: #585b70;
-}
-QPushButton#primary {
-    background-color: #89b4fa;
-    color: #1e1e2e;
-    border: none;
-}
-QPushButton#primary:hover {
-    background-color: #74c7ec;
-}
-QLineEdit {
-    background-color: #313244;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: #cdd6f4;
-}
-QLineEdit:focus {
-    border-color: #89b4fa;
-}
-QSpinBox {
-    background-color: #313244;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: #cdd6f4;
-}
-QCheckBox {
-    spacing: 8px;
-    color: #cdd6f4;
-}
-QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
-    border-radius: 4px;
-    border: 1px solid #45475a;
-    background-color: #313244;
-}
-QCheckBox::indicator:checked {
-    background-color: #89b4fa;
-    border-color: #89b4fa;
-}
-QRadioButton {
-    spacing: 8px;
-    color: #cdd6f4;
-}
-QRadioButton::indicator {
-    width: 18px;
-    height: 18px;
-    border-radius: 10px;
-    border: 1px solid #45475a;
-    background-color: #313244;
-}
-QRadioButton::indicator:checked {
-    background-color: #89b4fa;
-    border-color: #89b4fa;
-}
-QTableWidget {
-    background-color: #181825;
-    alternate-background-color: #1e1e2e;
-    border: 1px solid #313244;
-    border-radius: 6px;
-    gridline-color: #313244;
-    selection-background-color: #45475a;
-}
-QTableWidget::item {
-    padding: 4px 8px;
-}
-QHeaderView::section {
-    background-color: #313244;
-    color: #89b4fa;
-    padding: 6px 8px;
-    border: none;
-    border-right: 1px solid #45475a;
-    border-bottom: 1px solid #45475a;
-    font-weight: bold;
-}
-QPlainTextEdit {
-    background-color: #181825;
-    border: 1px solid #313244;
-    border-radius: 6px;
-    color: #a6adc8;
-    font-family: 'Menlo', 'Consolas', monospace;
-    font-size: 12px;
-    padding: 6px;
-}
-QProgressBar {
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    text-align: center;
-    color: #1e1e2e;
-    font-weight: bold;
-    background-color: #313244;
-    height: 22px;
-}
-QProgressBar::chunk {
-    background-color: #a6e3a1;
-    border-radius: 5px;
-}
-QLabel#title {
-    font-size: 20px;
-    font-weight: bold;
-    color: #89b4fa;
-}
-QLabel#subtitle {
-    color: #a6adc8;
-    font-size: 12px;
-}
-QListWidget {
-    background-color: #181825;
-    border: 1px solid #313244;
-    border-radius: 6px;
-    padding: 4px;
-}
-QListWidget::item {
-    padding: 6px 8px;
-    border-radius: 4px;
-}
-QListWidget::item:hover {
-    background-color: #313244;
-}
-QListWidget::item:selected {
-    background-color: #45475a;
-}
-"""
-
-
-# ─── Screens ───────────────────────────────────────────────────────
+# ─── Config Screen ─────────────────────────────────────────────────
 
 
 class ConfigScreen(QWidget):
@@ -240,45 +81,73 @@ class ConfigScreen(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(200, 40, 200, 40)
-        layout.setSpacing(16)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignTop)
 
-        title = QLabel("运行配置")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Title
+        title = TitleLabel("运行配置")
         layout.addWidget(title)
 
-        group = QGroupBox("参数设置")
-        form = QFormLayout()
-        form.setSpacing(12)
+        subtitle = BodyLabel("设置工作线程数和浏览器模式")
+        subtitle.setForegroundRole(self.palette().PlaceholderText)
+        layout.addWidget(subtitle)
 
-        self.spin_workers = QSpinBox()
+        layout.addSpacing(10)
+
+        # Workers card
+        workers_card = HeaderCardWidget(self)
+        workers_card.setTitle("工作线程数")
+        workers_card.setBorderRadius(8)
+        w_layout = QVBoxLayout()
+        w_layout.setSpacing(12)
+
+        self.spin_workers = SpinBox()
         self.spin_workers.setRange(1, 20)
         self.spin_workers.setValue(self._saved.get("workers", 1))
-        form.addRow("工作线程数:", self.spin_workers)
+        self.spin_workers.setFixedWidth(200)
+        w_label = BodyLabel("同时学习的课程数量，建议 3-10")
+        w_label.setForegroundRole(self.palette().PlaceholderText)
+        w_layout.addWidget(self.spin_workers)
+        w_layout.addWidget(w_label)
+        workers_card.viewLayout.addLayout(w_layout)
+        layout.addWidget(workers_card)
 
-        self.chk_headless = QCheckBox("无头模式（后台运行）")
-        self.chk_headless.setChecked(self._saved.get("headless", False))
-        form.addRow("", self.chk_headless)
+        # Headless card
+        headless_card = HeaderCardWidget(self)
+        headless_card.setTitle("浏览器模式")
+        headless_card.setBorderRadius(8)
+        h_layout = QHBoxLayout()
+        h_layout.setSpacing(12)
 
-        group.setLayout(form)
-        layout.addWidget(group)
+        self.switch_headless = SwitchButton()
+        self.switch_headless.setChecked(self._saved.get("headless", False))
+        self.switch_headless.setOnText("后台运行")
+        self.switch_headless.setOffText("显示浏览器")
+        h_label = BodyLabel("无头模式下浏览器不显示界面，适合后台挂机")
+        h_label.setForegroundRole(self.palette().PlaceholderText)
+        h_layout.addWidget(self.switch_headless)
+        h_layout.addWidget(h_label)
+        h_layout.addStretch()
+        headless_card.viewLayout.addLayout(h_layout)
+        layout.addWidget(headless_card)
 
+        layout.addStretch()
+
+        # Start button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.btn_start = QPushButton("开始")
-        self.btn_start.setObjectName("primary")
-        self.btn_start.setFixedWidth(160)
+        self.btn_start = PrimaryPushButton("  开始")
+        self.btn_start.setIcon(FIF.PLAY)
+        self.btn_start.setFixedSize(160, 40)
         self.btn_start.clicked.connect(self._on_start)
         btn_layout.addWidget(self.btn_start)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        layout.addStretch()
-
     def _on_start(self):
         workers = self.spin_workers.value()
-        headless = self.chk_headless.isChecked()
+        headless = self.switch_headless.isChecked()
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -290,10 +159,13 @@ class ConfigScreen(QWidget):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
             pass
-        main_win = self.window()
-        main_win.cfg_workers = workers
-        main_win.cfg_headless = headless
-        main_win.next_screen()
+        win = self.window()
+        win.cfg_workers = workers
+        win.cfg_headless = headless
+        win.next_screen()
+
+
+# ─── Login Screen ──────────────────────────────────────────────────
 
 
 class LoginScreen(QWidget):
@@ -303,62 +175,87 @@ class LoginScreen(QWidget):
         self._build_ui()
 
     def _load_creds(self):
-        creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccbu_credentials.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccbu_credentials.json")
         self._creds = {}
-        if os.path.exists(creds_path):
+        if os.path.exists(path):
             try:
-                with open(creds_path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     self._creds = json.load(f)
             except:
                 pass
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(200, 40, 200, 40)
-        layout.setSpacing(16)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignTop)
 
-        title = QLabel("用户登录")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title = TitleLabel("用户登录")
         layout.addWidget(title)
 
-        group = QGroupBox("账号信息")
-        form = QFormLayout()
-        form.setSpacing(12)
-        self.input_user = QLineEdit(self._creds.get("username", ""))
-        form.addRow("账号:", self.input_user)
-        self.input_pass = QLineEdit(self._creds.get("password", ""))
-        self.input_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("密码:", self.input_pass)
-        group.setLayout(form)
-        layout.addWidget(group)
+        subtitle = BodyLabel("输入建行统一认证账号密码")
+        subtitle.setForegroundRole(self.palette().PlaceholderText)
+        layout.addWidget(subtitle)
 
-        mode_group = QGroupBox("登录方式")
-        mode_layout = QHBoxLayout()
-        self.radio_auto = QRadioButton("自动登录")
-        self.radio_manual = QRadioButton("手动登录")
+        layout.addSpacing(10)
+
+        # Account card
+        account_card = HeaderCardWidget(self)
+        account_card.setTitle("账号信息")
+        account_card.setBorderRadius(8)
+        a_layout = QFormLayout()
+        a_layout.setSpacing(16)
+        a_layout.setContentsMargins(0, 8, 0, 8)
+
+        self.input_user = LineEdit()
+        self.input_user.setText(self._creds.get("username", ""))
+        self.input_user.setPlaceholderText("请输入账号")
+        a_layout.addRow("账号", self.input_user)
+
+        self.input_pass = LineEdit()
+        self.input_pass.setText(self._creds.get("password", ""))
+        self.input_pass.setPlaceholderText("请输入密码")
+        self.input_pass.setEchoMode(LineEdit.Password)
+        a_layout.addRow("密码", self.input_pass)
+
+        account_card.viewLayout.addLayout(a_layout)
+        layout.addWidget(account_card)
+
+        # Mode card
+        mode_card = HeaderCardWidget(self)
+        mode_card.setTitle("登录方式")
+        mode_card.setBorderRadius(8)
+        m_layout = QHBoxLayout()
+        m_layout.setSpacing(20)
+        m_layout.setContentsMargins(0, 8, 0, 8)
+
+        self.radio_auto = RadioButton("自动登录")
+        self.radio_manual = RadioButton("手动登录")
         self.radio_auto.setChecked(True)
-        mode_layout.addWidget(self.radio_auto)
-        mode_layout.addWidget(self.radio_manual)
-        mode_group.setLayout(mode_layout)
-        layout.addWidget(mode_group)
+        m_layout.addWidget(self.radio_auto)
+        m_layout.addWidget(self.radio_manual)
+        m_layout.addStretch()
+        mode_card.viewLayout.addLayout(m_layout)
+        layout.addWidget(mode_card)
 
-        self.lbl_status = QLabel("")
-        self.lbl_status.setObjectName("subtitle")
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Status
+        self.lbl_status = BodyLabel("")
+        self.lbl_status.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_status)
 
+        layout.addStretch()
+
+        # Button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.btn_login = QPushButton("登录")
-        self.btn_login.setObjectName("primary")
-        self.btn_login.setFixedWidth(160)
+        self.btn_login = PrimaryPushButton("  登录")
+        self.btn_login.setIcon(FIF.PEOPLE)
+        self.btn_login.setFixedSize(160, 40)
         self.btn_login.clicked.connect(self._on_login)
         btn_layout.addWidget(self.btn_login)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        layout.addStretch()
         self.input_pass.returnPressed.connect(self._on_login)
 
     def _on_login(self):
@@ -367,22 +264,24 @@ class LoginScreen(QWidget):
         auto = self.radio_auto.isChecked()
 
         if not username:
-            self.lbl_status.setText("[red]请输入账号[/red]")
+            InfoBar.warning("提示", "请输入账号", parent=self, position=InfoBarPosition.TOP)
             return
 
-        # Save creds
-        creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccbu_credentials.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccbu_credentials.json")
         try:
-            with open(creds_path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump({"username": username, "password": password}, f, ensure_ascii=False, indent=2)
         except:
             pass
 
-        main_win = self.window()
-        main_win.cfg_username = username
-        main_win.cfg_password = password
-        main_win.cfg_auto_login = auto
-        main_win.next_screen()
+        win = self.window()
+        win.cfg_username = username
+        win.cfg_password = password
+        win.cfg_auto_login = auto
+        win.next_screen()
+
+
+# ─── Goal Screen ───────────────────────────────────────────────────
 
 
 class GoalScreen(QWidget):
@@ -405,54 +304,79 @@ class GoalScreen(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(200, 40, 200, 40)
-        layout.setSpacing(16)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignTop)
 
-        title = QLabel("学习目标")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title = TitleLabel("学习目标")
         layout.addWidget(title)
 
-        group = QGroupBox("目标设置")
-        form = QFormLayout()
-        form.setSpacing(12)
-        type_layout = QHBoxLayout()
-        self.radio_central = QRadioButton("集中培训")
-        self.radio_online = QRadioButton("网络自学")
+        subtitle = BodyLabel("设置本次学习的目标学时（可跳过）")
+        subtitle.setForegroundRole(self.palette().PlaceholderText)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(10)
+
+        # Goal type card
+        type_card = HeaderCardWidget(self)
+        type_card.setTitle("目标类型")
+        type_card.setBorderRadius(8)
+        t_layout = QHBoxLayout()
+        t_layout.setSpacing(20)
+        t_layout.setContentsMargins(0, 8, 0, 8)
+
+        self.radio_central = RadioButton("集中培训")
+        self.radio_online = RadioButton("网络自学")
         if self._saved_type == "central":
             self.radio_central.setChecked(True)
         else:
             self.radio_online.setChecked(True)
-        type_layout.addWidget(self.radio_central)
-        type_layout.addWidget(self.radio_online)
-        form.addRow("目标类型:", type_layout)
-        self.spin_hours = QSpinBox()
+        t_layout.addWidget(self.radio_central)
+        t_layout.addWidget(self.radio_online)
+        t_layout.addStretch()
+        type_card.viewLayout.addLayout(t_layout)
+        layout.addWidget(type_card)
+
+        # Hours card
+        hours_card = HeaderCardWidget(self)
+        hours_card.setTitle("目标学时")
+        hours_card.setBorderRadius(8)
+        h_layout = QHBoxLayout()
+        h_layout.setSpacing(12)
+        h_layout.setContentsMargins(0, 8, 0, 8)
+
+        self.spin_hours = SpinBox()
         self.spin_hours.setRange(0, 9999)
         self.spin_hours.setValue(int(self._saved_goal))
         self.spin_hours.setSpecialValueText("不限制")
-        form.addRow("目标学时:", self.spin_hours)
-        group.setLayout(form)
-        layout.addWidget(group)
+        self.spin_hours.setFixedWidth(200)
+        h_label = BodyLabel("设为 0 表示不限制学时")
+        h_label.setForegroundRole(self.palette().PlaceholderText)
+        h_layout.addWidget(self.spin_hours)
+        h_layout.addWidget(h_label)
+        h_layout.addStretch()
+        hours_card.viewLayout.addLayout(h_layout)
+        layout.addWidget(hours_card)
+
+        layout.addStretch()
 
         # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        self.btn_skip = QPushButton("跳过")
-        self.btn_skip.setFixedWidth(120)
-        self.btn_skip.clicked.connect(lambda: self._on_done(0, "central"))
-        btn_layout.addWidget(self.btn_skip)
+        btn_skip = PushButton("  跳过")
+        btn_skip.setIcon(FIF.SKIP)
+        btn_skip.setFixedSize(120, 40)
+        btn_skip.clicked.connect(lambda: self._on_done(0, "central"))
+        btn_layout.addWidget(btn_skip)
 
-        self.btn_next = QPushButton("继续")
-        self.btn_next.setObjectName("primary")
-        self.btn_next.setFixedWidth(120)
-        self.btn_next.clicked.connect(self._on_next)
-        btn_layout.addWidget(self.btn_next)
+        btn_next = PrimaryPushButton("  继续")
+        btn_next.setIcon(FIF.RIGHT_ARROW)
+        btn_next.setFixedSize(120, 40)
+        btn_next.clicked.connect(self._on_next)
+        btn_layout.addWidget(btn_next)
 
-        btn_layout.addStretch()
         layout.addLayout(btn_layout)
-
-        layout.addStretch()
 
     def _on_next(self):
         goal_type = "central" if self.radio_central.isChecked() else "online"
@@ -460,13 +384,6 @@ class GoalScreen(QWidget):
         self._on_done(hours, goal_type)
 
     def _on_done(self, hours, goal_type):
-        self._save_goal(hours, goal_type)
-        main_win = self.window()
-        main_win.cfg_goal_type = goal_type
-        main_win.cfg_goal_hours = hours
-        main_win.next_screen()
-
-    def _save_goal(self, hours, goal_type):
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -478,178 +395,128 @@ class GoalScreen(QWidget):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
             pass
+        win = self.window()
+        win.cfg_goal_type = goal_type
+        win.cfg_goal_hours = hours
+        win.next_screen()
 
 
-class TagScreen(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel("选择标签（可多选）")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-
-        self.tag_list = QListWidget()
-        self.tag_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        layout.addWidget(self.tag_list)
-
-        self.lbl_hint = QLabel("标签将在浏览器加载后自动填充")
-        self.lbl_hint.setObjectName("subtitle")
-        self.lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.lbl_hint)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        btn_skip = QPushButton("跳过")
-        btn_skip.setFixedWidth(120)
-        btn_skip.clicked.connect(self._on_skip)
-        btn_layout.addWidget(btn_skip)
-
-        self.btn_confirm = QPushButton("确认选择")
-        self.btn_confirm.setObjectName("primary")
-        self.btn_confirm.setFixedWidth(120)
-        self.btn_confirm.clicked.connect(self._on_confirm)
-        btn_layout.addWidget(self.btn_confirm)
-
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-    def set_tags(self, tags_by_category: dict):
-        """Populate tag list from browser data."""
-        self.tag_list.clear()
-        self._all_tags = []
-        for category, tags in tags_by_category.items():
-            for tag in tags:
-                self._all_tags.append(tag)
-                item = QListWidgetItem(f"  {category} → {tag}")
-                self.tag_list.addItem(item)
-        self.lbl_hint.setText(f"共 {len(self._all_tags)} 个标签，点击选择")
-
-    def _on_skip(self):
-        main_win = self.window()
-        main_win.cfg_tags = []
-        main_win.next_screen()
-
-    def _on_confirm(self):
-        selected = []
-        for i in range(self.tag_list.count()):
-            if self.tag_list.item(i).isSelected():
-                tag = self._all_tags[i] if i < len(self._all_tags) else ""
-                if tag:
-                    selected.append(tag)
-        main_win = self.window()
-        main_win.cfg_tags = selected
-        main_win.next_screen()
-
-
-# ─── Dashboard ─────────────────────────────────────────────────────
+# ─── Dashboard Screen ──────────────────────────────────────────────
 
 
 class DashboardScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._tag_event = threading.Event()
         self._build_ui()
-        self._worker = None
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
 
-        # Top bar
-        top = QHBoxLayout()
-        self.lbl_title = QLabel("CCBU-Auto 自动学习")
-        self.lbl_title.setObjectName("title")
-        top.addWidget(self.lbl_title)
-        top.addStretch()
-        self.lbl_status = QLabel("正在启动...")
-        self.lbl_status.setObjectName("subtitle")
-        top.addWidget(self.lbl_status)
-        layout.addLayout(top)
+        # Header
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title = StrongBodyLabel("学习仪表盘")
+        title.setFont(QFont("", 16, QFont.Bold))
+        header.addWidget(title)
+        header.addStretch()
+        self.lbl_status = CaptionLabel("正在启动...")
+        header.addWidget(self.lbl_status)
+        layout.addLayout(header)
 
-        # Main splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Top info cards
+        info_layout = QHBoxLayout()
+        info_layout.setSpacing(12)
 
-        # Left panel
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        # Hours card
+        hours_card = SimpleCardWidget(self)
+        hours_card.setBorderRadius(8)
+        hl = QVBoxLayout(hours_card)
+        hl.setContentsMargins(16, 12, 16, 12)
+        hl.setSpacing(8)
+        hl.addWidget(SubtitleLabel("培训学时"))
+        self.lbl_central = BodyLabel("集中培训: -- 学时")
+        self.lbl_online = BodyLabel("网络自学: -- 学时")
+        self.lbl_updated = CaptionLabel("更新时间: --")
+        hl.addWidget(self.lbl_central)
+        hl.addWidget(self.lbl_online)
+        hl.addWidget(self.lbl_updated)
+        info_layout.addWidget(hours_card)
 
-        # Hours group
-        hours_group = QGroupBox("培训学时")
-        hours_form = QFormLayout()
-        self.lbl_central = QLabel("-- 学时")
-        self.lbl_online = QLabel("-- 学时")
-        self.lbl_updated = QLabel("--")
-        hours_form.addRow("集中培训:", self.lbl_central)
-        hours_form.addRow("网络自学:", self.lbl_online)
-        hours_form.addRow("更新时间:", self.lbl_updated)
-        hours_group.setLayout(hours_form)
-        left_layout.addWidget(hours_group)
-
-        # Goal group
-        goal_group = QGroupBox("学习目标")
-        goal_layout = QVBoxLayout()
-        self.lbl_goal_info = QLabel("--")
-        self.progress_goal = QProgressBar()
+        # Goal card
+        goal_card = SimpleCardWidget(self)
+        goal_card.setBorderRadius(8)
+        gl = QVBoxLayout(goal_card)
+        gl.setContentsMargins(16, 12, 16, 12)
+        gl.setSpacing(8)
+        gl.addWidget(SubtitleLabel("学习目标"))
+        self.lbl_goal_info = BodyLabel("--")
+        self.progress_goal = ProgressBar()
         self.progress_goal.setValue(0)
-        goal_layout.addWidget(self.lbl_goal_info)
-        goal_layout.addWidget(self.progress_goal)
-        goal_group.setLayout(goal_layout)
-        left_layout.addWidget(goal_group)
+        gl.addWidget(self.lbl_goal_info)
+        gl.addWidget(self.progress_goal)
+        info_layout.addWidget(goal_card)
 
-        left_layout.addStretch()
-        splitter.addWidget(left)
-
-        # Right panel
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(info_layout)
 
         # Worker table
-        self.table = QTableWidget()
+        table_card = SimpleCardWidget(self)
+        table_card.setBorderRadius(8)
+        tl = QVBoxLayout(table_card)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(0)
+
+        table_header = QHBoxLayout()
+        table_header.setContentsMargins(16, 12, 16, 8)
+        table_header.addWidget(SubtitleLabel("学习进度"))
+        table_header.addStretch()
+        self.lbl_progress_summary = CaptionLabel("")
+        table_header.addWidget(self.lbl_progress_summary)
+        tl.addLayout(table_header)
+
+        self.table = TableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["线程", "课程", "进度", "预计", "状态"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 50)
-        self.table.setColumnWidth(2, 60)
-        self.table.setColumnWidth(3, 60)
-        self.table.setColumnWidth(4, 90)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.table.setAlternatingRowColors(True)
-        right_layout.addWidget(self.table)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(2, 70)
+        self.table.setColumnWidth(3, 70)
+        self.table.setColumnWidth(4, 100)
+        self.table.setEditTriggers(TableWidget.NoEditTriggers)
+        self.table.setSelectionMode(TableWidget.NoSelection)
+        self.table.setBorderRadius(8)
+        tl.addWidget(self.table)
+
+        layout.addWidget(table_card, 1)
 
         # Log
-        log_group = QGroupBox("日志")
-        log_layout = QVBoxLayout()
-        self.log_view = QPlainTextEdit()
+        log_card = SimpleCardWidget(self)
+        log_card.setBorderRadius(8)
+        ll = QVBoxLayout(log_card)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+
+        log_header = QHBoxLayout()
+        log_header.setContentsMargins(16, 10, 16, 6)
+        log_header.addWidget(SubtitleLabel("日志"))
+        log_header.addStretch()
+        ll.addLayout(log_header)
+
+        self.log_view = PlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
-        log_layout.addWidget(self.log_view)
-        log_group.setLayout(log_layout)
-        log_group.setMaximumHeight(200)
-        right_layout.addWidget(log_group)
+        self.log_view.setMaximumHeight(180)
+        ll.addWidget(self.log_view)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 5)
-
-        layout.addWidget(splitter)
+        layout.addWidget(log_card)
 
     def start_learning(self):
-        main_win = self.window()
-        self._init_table(main_win.cfg_workers)
-        self._set_goal_info(main_win)
-
-        self._tag_event = threading.Event()
-        self._tag_result = []
+        win = self.window()
+        self._init_table(win.cfg_workers)
+        self._set_goal_info(win)
 
         self._worker = AsyncThread(self._run_learning, self)
         self._worker.log_signal.connect(self._on_log)
@@ -668,9 +535,9 @@ class DashboardScreen(QWidget):
             self.table.setItem(i, 3, QTableWidgetItem("-"))
             self.table.setItem(i, 4, QTableWidgetItem("等待中"))
 
-    def _set_goal_info(self, main_win):
-        goal_type = getattr(main_win, "cfg_goal_type", "central")
-        goal_hours = getattr(main_win, "cfg_goal_hours", 0)
+    def _set_goal_info(self, win):
+        goal_type = getattr(win, "cfg_goal_type", "central")
+        goal_hours = getattr(win, "cfg_goal_hours", 0)
         type_name = "集中培训" if goal_type == "central" else "网络自学"
         if goal_hours > 0:
             self.lbl_goal_info.setText(f"{type_name} {goal_hours:.0f} 学时")
@@ -678,15 +545,15 @@ class DashboardScreen(QWidget):
             self.lbl_goal_info.setText("不限制")
 
     async def _run_learning(self, thread: AsyncThread):
-        main_win = self.window()
-        cfg_workers = getattr(main_win, "cfg_workers", 1)
-        cfg_headless = getattr(main_win, "cfg_headless", False)
-        cfg_username = getattr(main_win, "cfg_username", "")
-        cfg_password = getattr(main_win, "cfg_password", "")
-        cfg_auto_login = getattr(main_win, "cfg_auto_login", True)
-        cfg_goal_type = getattr(main_win, "cfg_goal_type", "central")
-        cfg_goal_hours = getattr(main_win, "cfg_goal_hours", 0)
-        cfg_tags = getattr(main_win, "cfg_tags", [])
+        win = self.window()
+        cfg_workers = getattr(win, "cfg_workers", 1)
+        cfg_headless = getattr(win, "cfg_headless", False)
+        cfg_username = getattr(win, "cfg_username", "")
+        cfg_password = getattr(win, "cfg_password", "")
+        cfg_auto_login = getattr(win, "cfg_auto_login", True)
+        cfg_goal_type = getattr(win, "cfg_goal_type", "central")
+        cfg_goal_hours = getattr(win, "cfg_goal_hours", 0)
+        cfg_tags = getattr(win, "cfg_tags", [])
 
         log = lambda msg, style="": thread.log_signal.emit(msg, style)
         progress_cb = lambda data: thread.progress_signal.emit(data)
@@ -714,29 +581,22 @@ class DashboardScreen(QWidget):
                 learner.tags_to_learn = cfg_tags
 
             page = learner.pages[0]
-
-            # 导航到专题班页面后加载标签
             await page.goto(
                 "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise",
                 wait_until="networkidle", timeout=30000,
             )
             await page.wait_for_timeout(5000)
 
-            # 如果没有CLI标签，尝试从浏览器加载并让用户选择
             if not cfg_tags:
                 try:
                     tags_by_category = await learner.get_available_tags(page)
                     if tags_by_category:
                         tag_count = sum(len(v) for v in tags_by_category.values())
                         log(f"发现 {tag_count} 个标签，等待选择...", "blue")
-                        # 请求UI弹出标签选择对话框
                         self._tag_event.clear()
                         thread.tag_request_signal.emit(tags_by_category)
-                        # 等待用户选择（在子线程中阻塞等待，不阻塞UI）
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, self._tag_event.wait
-                        )
-                        cfg_tags = getattr(self.window(), "cfg_tags", [])
+                        await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
+                        cfg_tags = getattr(win, "cfg_tags", [])
                 except Exception as e:
                     log(f"标签加载失败: {e}", "yellow")
 
@@ -773,7 +633,6 @@ class DashboardScreen(QWidget):
 
             if tasks:
                 log(f"开始学习（{len(tasks)} 门课程, {cfg_workers} 个线程）", "bold blue")
-
                 _fetch_lock = asyncio.Lock()
 
                 async def fetch_more_courses(queue):
@@ -826,62 +685,26 @@ class DashboardScreen(QWidget):
 
     # ── Slots ──
 
-    @Slot(str, str)
     def _on_log(self, msg, style):
         ts = datetime.now().strftime("%H:%M:%S")
-        if "red" in style:
-            color = "#f38ba8"
-        elif "green" in style:
-            color = "#a6e3a1"
-        elif "blue" in style:
-            color = "#89b4fa"
-        elif "yellow" in style:
-            color = "#f9e2af"
-        else:
-            color = "#a6adc8"
+        self.log_view.appendPlainText(f"[{ts}] {msg}")
 
-        cursor = self.log_view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.log_view.setTextCursor(cursor)
-        self.log_view.appendHtml(
-            f'<span style="color:#585b70">[{ts}]</span> '
-            f'<span style="color:{color}">{msg}</span>'
-        )
-
-    @Slot(dict)
     def _on_progress(self, data):
         wid = data.get("wid", 0)
         if wid >= self.table.rowCount():
             return
+        self.table.setItem(wid, 1, QTableWidgetItem(str(data.get("course", "-"))[:40]))
+        self.table.setItem(wid, 2, QTableWidgetItem(str(data.get("progress", "-"))))
+        self.table.setItem(wid, 3, QTableWidgetItem(str(data.get("eta", "-"))))
+        self.table.setItem(wid, 4, QTableWidgetItem(str(data.get("status", "-"))))
 
-        course = data.get("course", "-")
-        progress = data.get("progress", "-")
-        eta = data.get("eta", "-")
-        status = data.get("status", "-")
-
-        self.table.setItem(wid, 1, QTableWidgetItem(str(course)[:40]))
-        self.table.setItem(wid, 2, QTableWidgetItem(str(progress)))
-        self.table.setItem(wid, 3, QTableWidgetItem(str(eta)))
-        self.table.setItem(wid, 4, QTableWidgetItem(str(status)))
-
-        # Color status
-        status_item = self.table.item(wid, 4)
-        if status in ("✓ 完成", "目标达成!"):
-            status_item.setForeground(QColor("#a6e3a1"))
-        elif "失败" in status or "异常" in status:
-            status_item.setForeground(QColor("#f38ba8"))
-        elif status == "学习中":
-            status_item.setForeground(QColor("#89b4fa"))
-
-    @Slot(dict)
     def _on_hours(self, data):
-        self.lbl_central.setText(f"{data.get('central', 0):.1f} 学时")
-        self.lbl_online.setText(f"{data.get('online', 0):.1f} 学时")
-        self.lbl_updated.setText(data.get("updated", "--"))
-
-        main_win = self.window()
-        goal_type = getattr(main_win, "cfg_goal_type", "central")
-        goal_hours = getattr(main_win, "cfg_goal_hours", 0)
+        self.lbl_central.setText(f"集中培训: {data.get('central', 0):.1f} 学时")
+        self.lbl_online.setText(f"网络自学: {data.get('online', 0):.1f} 学时")
+        self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
+        win = self.window()
+        goal_type = getattr(win, "cfg_goal_type", "central")
+        goal_hours = getattr(win, "cfg_goal_hours", 0)
         if goal_hours > 0:
             cur = data.get(goal_type, 0)
             pct = min(100, int(cur / goal_hours * 100))
@@ -889,55 +712,38 @@ class DashboardScreen(QWidget):
             type_name = "集中培训" if goal_type == "central" else "网络自学"
             self.lbl_goal_info.setText(f"{type_name} {cur:.1f}/{goal_hours:.0f} 学时 ({pct}%)")
 
-    @Slot(int, int)
     def _on_done(self, success, failed):
-        self.lbl_status.setText(f"[green]完成: 成功 {success}, 失败 {failed}[/green]")
-        self._on_log("学习流程完成!", "green")
+        self.lbl_status.setText(f"完成: 成功 {success}, 失败 {failed}")
+        InfoBar.success("完成", f"学习流程结束，成功 {success} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
-    @Slot(dict)
     def _on_tag_request(self, tags_by_category):
-        """弹出标签选择对话框（在主线程中运行）。"""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("选择标签")
-        dlg.setMinimumWidth(400)
+        dlg = Dialog("选择标签", "选择要学习的标签（不选则全部学习）", self)
+        dlg.cancelButton.setText("跳过")
+        dlg.yesButton.setText("确认选择")
+        dlg.setMinimumWidth(450)
         dlg.setMinimumHeight(500)
 
-        layout = QVBoxLayout(dlg)
-
-        lbl = QLabel("选择要学习的标签（可多选，不选则全部学习）")
-        lbl.setWordWrap(True)
-        layout.addWidget(lbl)
-
         list_widget = QListWidget()
-        list_widget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        list_widget.setSelectionMode(QListWidget.MultiSelection)
         all_tags = []
         for category, tags in tags_by_category.items():
             for tag in tags:
                 all_tags.append(tag)
-                list_widget.addItem(f"  {category} → {tag}")
-        layout.addWidget(list_widget)
+                list_widget.addItem(f"{category} → {tag}")
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Skip)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认选择")
-        buttons.button(QDialogButtonBox.StandardButton.Skip).setText("跳过（全部学习）")
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.accept)  # Skip也用accept，通过result区分
-        layout.addWidget(buttons)
+        dlg.textLayout.addWidget(list_widget)
+        dlg.widgetLayout.insertLayout(1, dlg.textLayout)
 
-        dlg.exec()
-
-        # 获取选择结果
-        selected = []
-        if dlg.result() == QDialog.DialogCode.Accepted:
+        if dlg.exec():
+            selected = []
             for i in range(list_widget.count()):
                 if list_widget.item(i).isSelected():
                     selected.append(all_tags[i])
+        else:
+            selected = []
 
-        self._tag_result = selected
-        main_win = self.window()
-        main_win.cfg_tags = selected
+        win = self.window()
+        win.cfg_tags = selected
         if selected:
             self._on_log(f"已选择 {len(selected)} 个标签", "green")
         else:
@@ -948,12 +754,12 @@ class DashboardScreen(QWidget):
 # ─── Main Window ───────────────────────────────────────────────────
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCBU-Auto 自动学习")
-        self.setMinimumSize(900, 600)
-        self.resize(1100, 700)
+        self.resize(1000, 650)
+        self.setMinimumSize(800, 500)
 
         # Config state
         self.cfg_workers = 1
@@ -965,21 +771,27 @@ class MainWindow(QMainWindow):
         self.cfg_goal_hours = 0
         self.cfg_tags = []
 
-        # Stacked widget for screens
+        # Screens
+        self.screen_config = ConfigScreen(self)
+        self.screen_login = LoginScreen(self)
+        self.screen_goal = GoalScreen(self)
+        self.screen_dashboard = DashboardScreen(self)
+
+        # Stack
         self.stack = QStackedWidget()
-        self.setCentralWidget(self.stack)
-
-        self.screen_config = ConfigScreen()
-        self.screen_login = LoginScreen()
-        self.screen_goal = GoalScreen()
-        self.screen_dashboard = DashboardScreen()
-
-        self.stack.addWidget(self.screen_config)   # 0
-        self.stack.addWidget(self.screen_login)     # 1
-        self.stack.addWidget(self.screen_goal)      # 2
-        self.stack.addWidget(self.screen_dashboard) # 3
+        self.stack.addWidget(self.screen_config)
+        self.stack.addWidget(self.screen_login)
+        self.stack.addWidget(self.screen_goal)
+        self.stack.addWidget(self.screen_dashboard)
 
         self._screen_index = 0
+
+        # Hide navigation (we use sequential screens, not side nav)
+        self.navigationInterface.setFixedWidth(0)
+        self.navigationInterface.hide()
+
+        self.stackedWidget.addWidget(self.stack)
+        self.stackedWidget.setCurrentWidget(self.stack)
 
     def next_screen(self):
         self._screen_index += 1
@@ -989,16 +801,16 @@ class MainWindow(QMainWindow):
                 self.screen_dashboard.start_learning()
 
 
-# ─── Entry Point ───────────────────────────────────────────────────
+# ─── Entry ─────────────────────────────────────────────────────────
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE)
+    app.setStyle("Windows")
+    setTheme(Theme.AUTO)
 
     window = MainWindow()
     window.show()
-
     sys.exit(app.exec())
 
 
