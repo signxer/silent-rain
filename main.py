@@ -1570,13 +1570,27 @@ class CCBULearner:
                         break
             if has_nan:
                 debug("  课程数据包含NaN，页面未完全加载")
-                courses = []
+                return None  # 返回None表示需要重试
+
+            # 区分：表格有数据但全被过滤 vs 表格根本没数据
+            raw_count = await page.locator("tr.text-center").count()
+            if raw_count > 0 and len(courses) == 0:
+                # 表格有行但全被过滤（图书/考试等），不需要重试
+                debug(f"  表格有{raw_count}行但全被过滤，无需重试")
+                console.print(f"课程列表: 0 门（全被过滤）", style="yellow")
+                return []  # 返回空列表表示确实没有可学课程
+
+            if raw_count == 0 and len(courses) == 0:
+                # 表格没数据，需要重试
+                debug("  表格无数据行，需要重试")
+                return None  # 返回None表示需要重试
 
             console.print(f"课程列表: {len(courses)} 门", style="green")
         except Exception as e:
             console.print(f"获取课程列表失败: {e}", style="yellow")
             import traceback
             traceback.print_exc()
+            return None  # 异常也返回None表示需要重试
 
         return courses
 
@@ -2035,9 +2049,15 @@ class CCBULearner:
                                 await cp.wait_for_timeout(6000)
                             except:
                                 pass
-                        courses = await self.get_courses_from_workshop(cp)
-                        if courses:
-                            break
+                        result = await self.get_courses_from_workshop(cp)
+                        if result is None:
+                            # 需要重试（表格没数据）
+                            continue
+                        courses = result
+                        break  # 有数据（哪怕空），不用重试
+
+                    if courses is None:
+                        courses = []
 
                     if courses:
                         to_learn = [(i, c) for i, c in enumerate(courses)
