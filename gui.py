@@ -404,6 +404,160 @@ class GoalScreen(QWidget):
 # ─── Dashboard Screen ──────────────────────────────────────────────
 
 
+# ─── Mode Selection Screen ─────────────────────────────────────────
+
+
+class ModeScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(120, 60, 120, 60)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignTop)
+
+        title = TitleLabel("选择模式")
+        layout.addWidget(title)
+
+        subtitle = BodyLabel("选择学习方式")
+        subtitle.setForegroundRole(self.palette().PlaceholderText)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(20)
+
+        # Auto mode card
+        auto_card = HeaderCardWidget(self)
+        auto_card.setTitle("🔄 自动模式")
+        auto_card.setBorderRadius(8)
+        a_layout = QVBoxLayout()
+        a_layout.setSpacing(8)
+        a_layout.setContentsMargins(0, 8, 0, 8)
+        a_layout.addWidget(BodyLabel("自动寻找专题班，按学时目标学习"))
+        a_layout.addWidget(CaptionLabel("适合：需要完成学时目标的日常挂机学习"))
+        btn_auto = PrimaryPushButton("  选择自动模式")
+        btn_auto.setIcon(FIF.PLAY)
+        btn_auto.setFixedWidth(200)
+        btn_auto.clicked.connect(lambda: self._select_mode("auto"))
+        a_layout.addWidget(btn_auto)
+        a_layout.addStretch()
+        auto_card.viewLayout.addLayout(a_layout)
+        layout.addWidget(auto_card)
+
+        # Manual mode card
+        manual_card = HeaderCardWidget(self)
+        manual_card.setTitle("🎯 手动模式")
+        manual_card.setBorderRadius(8)
+        m_layout = QVBoxLayout()
+        m_layout.setSpacing(8)
+        m_layout.setContentsMargins(0, 8, 0, 8)
+        m_layout.addWidget(BodyLabel("指定专题班或课程URL，精确学习"))
+        m_layout.addWidget(CaptionLabel("适合：学习特定课程、补学指定内容"))
+        btn_manual = PrimaryPushButton("  选择手动模式")
+        btn_manual.setIcon(FIF.LINK)
+        btn_manual.setFixedWidth(200)
+        btn_manual.clicked.connect(lambda: self._select_mode("manual"))
+        m_layout.addWidget(btn_manual)
+        m_layout.addStretch()
+        manual_card.viewLayout.addLayout(m_layout)
+        layout.addWidget(manual_card)
+
+        layout.addStretch()
+
+    def _select_mode(self, mode):
+        win = self.window()
+        win.cfg_mode = mode
+        if mode == "auto":
+            win.next_screen()  # → goal → tags → dashboard
+        else:
+            win.go_to_manual()  # → manual URL input → dashboard
+
+
+# ─── Manual URL Input Screen ───────────────────────────────────────
+
+
+class ManualScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(16)
+        layout.setAlignment(Qt.AlignTop)
+
+        title = TitleLabel("手动指定课程")
+        layout.addWidget(title)
+
+        subtitle = BodyLabel("输入专题班或课程的URL，每行一个")
+        subtitle.setForegroundRole(self.palette().PlaceholderText)
+        layout.addWidget(subtitle)
+
+        # URL input card
+        input_card = HeaderCardWidget(self)
+        input_card.setTitle("🔗 课程链接")
+        input_card.setBorderRadius(8)
+        i_layout = QVBoxLayout()
+        i_layout.setSpacing(8)
+        i_layout.setContentsMargins(0, 8, 0, 8)
+
+        self.text_urls = PlainTextEdit()
+        self.text_urls.setPlaceholderText(
+            "粘贴URL，每行一个，例如：\n"
+            "https://u.ccb.com/workshop/#/myworkshop/detail?id=xxx\n"
+            "https://u.ccb.com/workshop/#/detail?id=xxx"
+        )
+        self.text_urls.setMinimumHeight(200)
+        i_layout.addWidget(self.text_urls)
+
+        hint = CaptionLabel("支持专题班详情页URL，会自动提取其中的课程")
+        hint.setForegroundRole(self.palette().PlaceholderText)
+        i_layout.addWidget(hint)
+
+        input_card.viewLayout.addLayout(i_layout)
+        layout.addWidget(input_card)
+
+        layout.addStretch()
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        btn_back = PushButton("  返回")
+        btn_back.setIcon(FIF.RETURN)
+        btn_back.setFixedSize(120, 40)
+        btn_back.clicked.connect(lambda: self.window().show_mode_screen())
+        btn_layout.addWidget(btn_back)
+
+        btn_start = PrimaryPushButton("  开始学习")
+        btn_start.setIcon(FIF.PLAY)
+        btn_start.setFixedSize(140, 40)
+        btn_start.clicked.connect(self._on_start)
+        btn_layout.addWidget(btn_start)
+
+        layout.addLayout(btn_layout)
+
+    def _on_start(self):
+        text = self.text_urls.toPlainText().strip()
+        if not text:
+            InfoBar.warning("提示", "请输入至少一个URL", parent=self, position=InfoBarPosition.TOP)
+            return
+
+        urls = [line.strip() for line in text.split("\n") if line.strip() and "ccb.com" in line]
+        if not urls:
+            InfoBar.warning("提示", "未识别到有效的CCB URL", parent=self, position=InfoBarPosition.TOP)
+            return
+
+        win = self.window()
+        win.cfg_manual_urls = urls
+        win.next_screen()  # → dashboard
+
+
+# ─── Dashboard Screen ──────────────────────────────────────────────
+
+
 class DashboardScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -567,6 +721,8 @@ class DashboardScreen(QWidget):
         cfg_goal_type = getattr(win, "cfg_goal_type", "central")
         cfg_goal_hours = getattr(win, "cfg_goal_hours", 0)
         cfg_tags = getattr(win, "cfg_tags", [])
+        cfg_mode = getattr(win, "cfg_mode", "auto")
+        cfg_manual_urls = getattr(win, "cfg_manual_urls", [])
 
         log = lambda msg, style="": thread.log_signal.emit(msg, style)
         progress_cb = lambda data: thread.progress_signal.emit(data)
@@ -588,6 +744,17 @@ class DashboardScreen(QWidget):
             )
             log("登录成功", "green")
 
+            # 手动模式：直接从指定URL学习
+            if cfg_mode == "manual":
+                log(f"手动模式：{len(cfg_manual_urls)} 个URL", "blue")
+                await learner.learn_from_urls(
+                    cfg_manual_urls, cfg_workers,
+                    progress_cb, hours_cb, log
+                )
+                thread.done_signal.emit(0, 0)
+                return
+
+            # 自动模式
             learner.study_goal = cfg_goal_hours
             learner.goal_type = cfg_goal_type
             if cfg_tags:
@@ -864,21 +1031,29 @@ class MainWindow(MSFluentWindow):
         self.cfg_goal_type = "central"
         self.cfg_goal_hours = 0
         self.cfg_tags = []
+        self.cfg_mode = "auto"
+        self.cfg_manual_urls = []
 
         # Screens
         self.screen_config = ConfigScreen(self)
         self.screen_config.setObjectName("config")
         self.screen_login = LoginScreen(self)
         self.screen_login.setObjectName("login")
+        self.screen_mode = ModeScreen(self)
+        self.screen_mode.setObjectName("mode")
         self.screen_goal = GoalScreen(self)
         self.screen_goal.setObjectName("goal")
+        self.screen_manual = ManualScreen(self)
+        self.screen_manual.setObjectName("manual")
         self.screen_dashboard = DashboardScreen(self)
         self.screen_dashboard.setObjectName("dashboard")
 
         # Add sub interfaces with icons
         self.addSubInterface(self.screen_config, FIF.SETTING, "配置")
         self.addSubInterface(self.screen_login, FIF.PEOPLE, "登录")
+        self.addSubInterface(self.screen_mode, FIF.SHOPPING_MODE, "模式")
         self.addSubInterface(self.screen_goal, FIF.FLAG, "目标")
+        self.addSubInterface(self.screen_manual, FIF.LINK, "手动")
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
 
         self._screen_index = 0
@@ -887,7 +1062,7 @@ class MainWindow(MSFluentWindow):
         # 检查是否有保存的配置，有则自动开始
         has_config = self._load_saved_config()
         if has_config:
-            self._screen_index = 3
+            self._screen_index = 5
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
         else:
@@ -932,14 +1107,44 @@ class MainWindow(MSFluentWindow):
         self._drag_pos = None
 
     def next_screen(self):
+        """根据当前界面和模式决定下一个界面"""
         self._screen_index += 1
+
         if self._screen_index == 1:
+            # config → login
             self.switchTo(self.screen_login)
         elif self._screen_index == 2:
-            self.switchTo(self.screen_goal)
+            # login → mode selection
+            self.switchTo(self.screen_mode)
         elif self._screen_index == 3:
+            # mode → goal (auto) or manual (manual)
+            if self.cfg_mode == "auto":
+                self.switchTo(self.screen_goal)
+            else:
+                self.switchTo(self.screen_manual)
+        elif self._screen_index == 4:
+            # goal → tags → dashboard (auto), or manual → dashboard
+            if self.cfg_mode == "auto":
+                # tags handled in goal screen, go to dashboard
+                self.switchTo(self.screen_dashboard)
+                self.screen_dashboard.start_learning()
+            else:
+                self.switchTo(self.screen_dashboard)
+                self.screen_dashboard.start_learning()
+        elif self._screen_index == 5:
+            # auto: tags → dashboard
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
+
+    def go_to_manual(self):
+        """从模式选择跳到手动URL输入"""
+        self._screen_index = 3
+        self.switchTo(self.screen_manual)
+
+    def show_mode_screen(self):
+        """从手动URL输入返回模式选择"""
+        self._screen_index = 2
+        self.switchTo(self.screen_mode)
 
     def show_settings(self):
         """从仪表盘返回设置界面"""

@@ -2535,6 +2535,102 @@ class CCBULearner:
             console.print(f"已完成 {len(completed_ws_ids)}/{len(ws_progress)} 个专题班", style="green")
         return completed_ws_ids
 
+    async def learn_from_urls(self, urls: List[str], workers: int = 1,
+                               progress_callback=None, hours_callback=None, log_callback=None):
+        """手动模式：从指定URL列表学习课程"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        _progress = progress_callback or (lambda d: None)
+        _hours = hours_callback or (lambda d: None)
+
+        page = self.pages[0]
+
+        # 从URL中提取专题班ID
+        workshop_ids = []
+        for url in urls:
+            m = re.search(r'id=([a-f0-9\-]+)', url)
+            if m:
+                ws_id = m.group(1)
+                if ws_id not in workshop_ids:
+                    workshop_ids.append(ws_id)
+
+        if not workshop_ids:
+            _log("未从URL中提取到有效的专题班ID", "red")
+            return
+
+        _log(f"共 {len(workshop_ids)} 个专题班待学习", "blue")
+
+        # 采集每个专题班的课程
+        all_tasks = []
+        ws_locks = {}
+        for ws_id in workshop_ids:
+            ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
+            _log(f"正在采集: {ws_id[:16]}...", "blue")
+
+            # 导航
+            for nav_url in [ws_url, ws_url.replace("/myworkshop/detail", "/detail")]:
+                try:
+                    await page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(5000)
+                except:
+                    pass
+                body = ""
+                try:
+                    body = await page.locator("body").inner_text(timeout=3000)
+                except:
+                    pass
+                if len(body) > 500 and ("创建日期" in body or "课程" in body):
+                    break
+
+            if "报名截止" in body:
+                _log(f"  ⊘ 报名截止，跳过", "yellow")
+                continue
+
+            # 点击课程标签
+            for tab_text in ["课程", "课程列表", "课程目录"]:
+                try:
+                    tab = page.locator(f"text={tab_text}").first
+                    if await tab.count() > 0 and await tab.is_visible():
+                        await tab.click()
+                        await page.wait_for_timeout(3000)
+                        break
+                except:
+                    pass
+
+            # 等待数据加载
+            for _ in range(4):
+                rows = await page.locator("tr.text-center").count()
+                if rows > 0:
+                    break
+                await page.wait_for_timeout(3000)
+
+            # 提取课程
+            courses = await self.get_courses_from_workshop(page)
+            if not courses:
+                _log(f"  ✗ 未获取到课程", "yellow")
+                continue
+
+            to_learn = [(i, c) for i, c in enumerate(courses) if self._is_learnable(c.get('action', ''))]
+            ws_title = body[:50].split("\n")[0].strip() if body else ws_id[:16]
+
+            if not to_learn:
+                _log(f"  ✓ 全部已完成（{len(courses)}门）", "green")
+                continue
+
+            _log(f"  ✓ {len(to_learn)} 门待学（共{len(courses)}门）", "green")
+            ws_locks[ws_id] = asyncio.Lock()
+            for ci, c in to_learn:
+                all_tasks.append((ws_id, ci, c, ws_title))
+
+        if not all_tasks:
+            _log("没有需要学习的课程", "yellow")
+            return
+
+        # 开始学习
+        _log(f"\n开始学习 {len(all_tasks)} 门课程", "bold blue")
+        await self.parallel_learn_courses(
+            all_tasks, ws_locks, None, _progress, _hours, _log
+        )
+
     async def get_available_tags(self, page: Page) -> Dict[str, List[str]]:
         # 从页面提取所有可见标签，按分类分组
         try:
