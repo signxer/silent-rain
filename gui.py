@@ -97,7 +97,7 @@ class ConfigScreen(QWidget):
 
         # Workers card
         workers_card = HeaderCardWidget(self)
-        workers_card.setTitle("工作线程数")
+        workers_card.setTitle("⚡ 工作线程数")
         workers_card.setBorderRadius(8)
         w_layout = QVBoxLayout()
         w_layout.setSpacing(12)
@@ -115,7 +115,7 @@ class ConfigScreen(QWidget):
 
         # Headless card
         headless_card = HeaderCardWidget(self)
-        headless_card.setTitle("浏览器模式")
+        headless_card.setTitle("🌐 浏览器模式")
         headless_card.setBorderRadius(8)
         h_layout = QHBoxLayout()
         h_layout.setSpacing(12)
@@ -201,7 +201,7 @@ class LoginScreen(QWidget):
 
         # Account card
         account_card = HeaderCardWidget(self)
-        account_card.setTitle("账号信息")
+        account_card.setTitle("👤 账号信息")
         account_card.setBorderRadius(8)
         a_layout = QFormLayout()
         a_layout.setSpacing(16)
@@ -319,7 +319,7 @@ class GoalScreen(QWidget):
 
         # Goal type card
         type_card = HeaderCardWidget(self)
-        type_card.setTitle("目标类型")
+        type_card.setTitle("🎯 目标类型")
         type_card.setBorderRadius(8)
         t_layout = QHBoxLayout()
         t_layout.setSpacing(20)
@@ -437,10 +437,10 @@ class DashboardScreen(QWidget):
         hl = QVBoxLayout(hours_card)
         hl.setContentsMargins(14, 10, 14, 10)
         hl.setSpacing(6)
-        hl.addWidget(SubtitleLabel("培训学时"))
-        self.lbl_central = BodyLabel("集中培训: --")
-        self.lbl_online = BodyLabel("网络自学: --")
-        self.lbl_updated = CaptionLabel("更新: --")
+        hl.addWidget(SubtitleLabel("📊 培训学时"))
+        self.lbl_central = BodyLabel("🏢 集中: --")
+        self.lbl_online = BodyLabel("🌐 网络: --")
+        self.lbl_updated = CaptionLabel("🕐 更新: --")
         hl.addWidget(self.lbl_central)
         hl.addWidget(self.lbl_online)
         hl.addWidget(self.lbl_updated)
@@ -452,7 +452,7 @@ class DashboardScreen(QWidget):
         gl = QVBoxLayout(goal_card)
         gl.setContentsMargins(14, 10, 14, 10)
         gl.setSpacing(8)
-        gl.addWidget(SubtitleLabel("学习目标"))
+        gl.addWidget(SubtitleLabel("🎯 学习目标"))
         self.lbl_goal_info = BodyLabel("--")
         gl.addWidget(self.lbl_goal_info)
 
@@ -480,7 +480,7 @@ class DashboardScreen(QWidget):
 
         table_header = QHBoxLayout()
         table_header.setContentsMargins(14, 10, 14, 6)
-        table_header.addWidget(SubtitleLabel("学习进度"))
+        table_header.addWidget(SubtitleLabel("📈 学习进度"))
         table_header.addStretch()
         self.lbl_progress_summary = CaptionLabel("")
         table_header.addWidget(self.lbl_progress_summary)
@@ -512,7 +512,7 @@ class DashboardScreen(QWidget):
 
         log_header = QHBoxLayout()
         log_header.setContentsMargins(14, 10, 14, 6)
-        log_header.addWidget(SubtitleLabel("日志"))
+        log_header.addWidget(SubtitleLabel("📋 日志"))
         log_header.addStretch()
         ll.addLayout(log_header)
 
@@ -786,7 +786,7 @@ class DashboardScreen(QWidget):
 # ─── Main Window ───────────────────────────────────────────────────
 
 
-class MainWindow(FluentWindow):
+class MainWindow(MSFluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCBU-Auto 自动学习")
@@ -809,21 +809,29 @@ class MainWindow(FluentWindow):
         self.screen_goal = GoalScreen(self)
         self.screen_dashboard = DashboardScreen(self)
 
-        # Stack
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self.screen_config)
-        self.stack.addWidget(self.screen_login)
-        self.stack.addWidget(self.screen_goal)
-        self.stack.addWidget(self.screen_dashboard)
+        # Add sub interfaces with icons
+        self.addSubInterface(self.screen_config, FIF.SETTING, "配置")
+        self.addSubInterface(self.screen_login, FIF.PEOPLE, "登录")
+        self.addSubInterface(self.screen_goal, FIF.TARGET_ARROW, "目标")
+        self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
 
         self._screen_index = 0
+        self.navigationInterface.setCurrentWidget(self.screen_config)
 
-        # Hide navigation (we use sequential screens, not side nav)
-        self.navigationInterface.setFixedWidth(0)
+        # Hide navigation initially (show only current screen)
         self.navigationInterface.hide()
 
-        self.stackedWidget.addWidget(self.stack)
-        self.stackedWidget.setCurrentWidget(self.stack)
+    def next_screen(self):
+        self._screen_index += 1
+        screens = [self.screen_config, self.screen_login, self.screen_goal, self.screen_dashboard]
+        if self._screen_index < len(screens):
+            screen = screens[self._screen_index]
+            self.switchTo(screen)
+            self.navigationInterface.setCurrentWidget(screen)
+            if self._screen_index == 3:
+                self.screen_dashboard.start_learning()
+                # Show nav bar on dashboard
+                self.navigationInterface.show()
 
     def next_screen(self):
         self._screen_index += 1
