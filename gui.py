@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import threading
 import sys
 from datetime import datetime
 
@@ -34,6 +35,8 @@ class AsyncThread(QThread):
     hours_signal = Signal(dict)            # study hours
     done_signal = Signal(int, int)         # (success, failed)
     login_done_signal = Signal(bool, str)  # (success, username)
+    tag_request_signal = Signal(dict)      # 请求选择标签，传入tags_by_category
+    tag_result_signal = Signal(list)       # 标签选择结果
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -664,11 +667,15 @@ class DashboardScreen(QWidget):
         self._init_table(main_win.cfg_workers)
         self._set_goal_info(main_win)
 
+        self._tag_event = threading.Event()
+        self._tag_result = []
+
         self._worker = AsyncThread(self._run_learning, self)
         self._worker.log_signal.connect(self._on_log)
         self._worker.progress_signal.connect(self._on_progress)
         self._worker.hours_signal.connect(self._on_hours)
         self._worker.done_signal.connect(self._on_done)
+        self._worker.tag_request_signal.connect(self._on_tag_request)
         self._worker.start()
 
     def _init_table(self, workers):
@@ -739,9 +746,18 @@ class DashboardScreen(QWidget):
                 try:
                     tags_by_category = await learner.get_available_tags(page)
                     if tags_by_category:
-                        log(f"发现 {sum(len(v) for v in tags_by_category.values())} 个标签", "blue")
-                except:
-                    pass
+                        tag_count = sum(len(v) for v in tags_by_category.values())
+                        log(f"发现 {tag_count} 个标签，等待选择...", "blue")
+                        # 请求UI弹出标签选择对话框
+                        self._tag_event.clear()
+                        thread.tag_request_signal.emit(tags_by_category)
+                        # 等待用户选择（在子线程中阻塞等待，不阻塞UI）
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, self._tag_event.wait
+                        )
+                        cfg_tags = getattr(self.window(), "cfg_tags", [])
+                except Exception as e:
+                    log(f"标签加载失败: {e}", "yellow")
 
             if cfg_tags:
                 await learner.filter_by_tags(page)
@@ -896,6 +912,56 @@ class DashboardScreen(QWidget):
     def _on_done(self, success, failed):
         self.lbl_status.setText(f"[green]完成: 成功 {success}, 失败 {failed}[/green]")
         self._on_log("学习流程完成!", "green")
+
+    @Slot(dict)
+    def _on_tag_request(self, tags_by_category):
+        """弹出标签选择对话框（在主线程中运行）。"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择标签")
+        dlg.setMinimumWidth(400)
+        dlg.setMinimumHeight(500)
+
+        layout = QVBoxLayout(dlg)
+
+        lbl = QLabel("选择要学习的标签（可多选，不选则全部学习）")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        all_tags = []
+        for category, tags in tags_by_category.items():
+            for tag in tags:
+                all_tags.append(tag)
+                list_widget.addItem(f"  {category} → {tag}")
+        layout.addWidget(list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Skip)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认选择")
+        buttons.button(QDialogButtonBox.StandardButton.Skip).setText("跳过（全部学习）")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.accept)  # Skip也用accept，通过result区分
+        layout.addWidget(buttons)
+
+        dlg.exec()
+
+        # 获取选择结果
+        selected = []
+        if dlg.result() == QDialog.DialogCode.Accepted:
+            for i in range(list_widget.count()):
+                if list_widget.item(i).isSelected():
+                    selected.append(all_tags[i])
+
+        self._tag_result = selected
+        main_win = self.window()
+        main_win.cfg_tags = selected
+        if selected:
+            self._on_log(f"已选择 {len(selected)} 个标签", "green")
+        else:
+            self._on_log("未选择标签，将学习全部", "yellow")
+        self._tag_event.set()
 
 
 # ─── Main Window ───────────────────────────────────────────────────
