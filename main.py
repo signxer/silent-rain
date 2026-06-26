@@ -1803,6 +1803,17 @@ class CCBULearner:
                     except:
                         pass
 
+                # 点击"课程"标签页（部分专题班默认显示讨论区，需切换到课程列表）
+                for tab_text in ["课程", "课程列表", "课程目录"]:
+                    try:
+                        tab = cp.locator(f"text={tab_text}").first
+                        if await tab.count() > 0 and await tab.is_visible():
+                            await tab.click()
+                            await cp.wait_for_timeout(3000)
+                            break
+                    except:
+                        pass
+
                 # 检查是否需要报名（页面上有"立即报名"按钮）
                 need_enroll = False
                 for kw in ["立即报名", "加入学习", "免费报名"]:
