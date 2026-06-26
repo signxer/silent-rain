@@ -377,11 +377,18 @@ class CCBULearner:
                            progress.get("last_page", 1),
                            progress.get("last_idx", 0))
 
-    async def login(self):
+    async def login(self, page=None, username="", password="", auto_login=True, log_callback=None):
+        """登录。GUI模式传入username/password/auto_login/log_callback。"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        if page is None:
+            page = self.pages[0]
+
+        # GUI模式：直接用传入的凭证登录
+        if username:
+            await self._do_login(page, username, password, auto_login, _log)
+            return
+
         console.print("建行学习自动登录", style="bold blue")
-        
-        # 先检查是否已登录
-        page = self.pages[0]
         if await self.check_login_status(page):
             # 显示当前用户并询问是否切换
             try:
@@ -679,11 +686,83 @@ class CCBULearner:
                 await async_input("请手动在浏览器中完成登录，然后按回车键继续", default="", timeout=600, block=True)
             
             console.print("✓ 登录流程完成!", style="bold green")
-            
+
         except Exception as e:
             console.print("自动登录失败", style="red")
             console.print("将使用手动登录模式", style="yellow")
             await async_input("请在浏览器中完成登录后按回车键继续", default="", timeout=600, block=True)
+
+    async def _do_login(self, page, username, password, auto_login, _log):
+        """GUI模式登录：直接用传入的凭证提交表单。"""
+        if not auto_login:
+            _log("请在浏览器中完成登录...", "blue")
+            await page.goto("https://u.ccb.com/portal/#/study")
+            _log("等待登录完成...", "yellow")
+            # 等待URL不再是登录页
+            for _ in range(120):
+                await asyncio.sleep(1)
+                if "/sys/#/login" not in page.url:
+                    break
+            _log("登录成功", "green")
+            return
+
+        _log("正在导航到登录页面...", "blue")
+        await page.goto("https://u.ccb.com/sys/#/login")
+        await asyncio.sleep(3)
+
+        try:
+            # 输入用户名
+            _log("正在输入用户名...", "blue")
+            await page.evaluate(f"""() => {{
+                const el = document.querySelector('input[placeholder*="账号"]');
+                if (el) {{
+                    el.removeAttribute('maxlength');
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, '{username}');
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }}""")
+            await asyncio.sleep(0.5)
+
+            # 输入密码
+            _log("正在输入密码...", "blue")
+            await page.evaluate(f"""() => {{
+                const el = document.getElementById('inputPwd');
+                if (el) {{
+                    el.removeAttribute('maxlength');
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, '{password}');
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }}""")
+            await asyncio.sleep(0.5)
+
+            # 点击登录
+            _log("正在点击登录按钮...", "blue")
+            login_button = page.get_by_role("button", name="登录")
+            try:
+                await login_button.wait_for(state="enabled", timeout=10000)
+            except:
+                pass
+            await login_button.click()
+
+            # 等待登录完成
+            _log("正在等待登录完成...", "yellow")
+            for i in range(60):
+                await asyncio.sleep(1)
+                if "/sys/#/login" not in page.url:
+                    await page.goto("https://u.ccb.com/portal/#/study",
+                                    wait_until="networkidle", timeout=15000)
+                    await page.wait_for_timeout(3000)
+                    if "/sys/#/login" not in page.url:
+                        _log("登录成功", "green")
+                        return
+            _log("登录超时，请检查浏览器", "red")
+
+        except Exception as e:
+            _log(f"自动登录失败: {e}", "red")
 
     async def get_workshops(self, page: Page) -> List[Dict]:
         """获取专题班列表 - 从.card结构提取所有专题班"""
