@@ -1051,7 +1051,7 @@ class MainWindow(MSFluentWindow):
         # Add sub interfaces with icons
         self.addSubInterface(self.screen_config, FIF.SETTING, "配置")
         self.addSubInterface(self.screen_login, FIF.PEOPLE, "登录")
-        self.addSubInterface(self.screen_mode, FIF.SHOPPING_MODE, "模式")
+        self.addSubInterface(self.screen_mode, FIF.TILES, "模式")
         self.addSubInterface(self.screen_goal, FIF.FLAG, "目标")
         self.addSubInterface(self.screen_manual, FIF.LINK, "手动")
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
