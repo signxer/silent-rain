@@ -1897,34 +1897,33 @@ class CCBULearner:
                     return None
 
                 # 导航到专题班详情页
-                # 先离开当前页，再导航到目标页（强制SPA重新渲染）
+                # 先回列表页重置SPA状态（保持session），再导航到目标
                 ws_url_my = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
                 ws_url_detail = f"https://u.ccb.com/workshop/#/detail?id={ws_id}"
+                list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
 
+                body_text = ""
                 for nav_url in [ws_url_my, ws_url_detail]:
                     try:
-                        # 先导航到空白页重置SPA状态
-                        await cp.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
-                        await cp.wait_for_timeout(500)
-                        # 再导航到目标页
-                        await cp.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
+                        # 先回列表页重置SPA
+                        await cp.goto(list_url, wait_until="domcontentloaded", timeout=15000)
+                        await cp.wait_for_timeout(2000)
+                        # 用JS强制跳转（比goto更可靠地触发SPA路由）
+                        await cp.evaluate(f"window.location.hash = '{nav_url.split('#')[1]}';")
                         await cp.wait_for_timeout(5000)
                     except Exception as e:
                         debug(f"  导航异常: {e}")
 
-                    # 检查页面是否加载了专题班内容
-                    body_text = ""
+                    # 检查是否加载了专题班内容
                     try:
                         body_text = await cp.locator("body").inner_text(timeout=3000)
                     except:
                         pass
-                    # 有"创建日期"或"课程"标签页才算加载成功
-                    has_workshop_content = ("创建日期" in body_text or "报名" in body_text)
-                    if has_workshop_content:
+                    if "创建日期" in body_text or "报名" in body_text:
                         break
-                    # 没加载出来，尝试reload
+                    # 没加载出来，用goto再试一次
                     try:
-                        await cp.reload(wait_until="domcontentloaded", timeout=15000)
+                        await cp.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
                         await cp.wait_for_timeout(5000)
                         body_text = await cp.locator("body").inner_text(timeout=3000)
                         if "创建日期" in body_text or "报名" in body_text:
@@ -2572,12 +2571,13 @@ class CCBULearner:
             ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
             _log(f"正在采集: {ws_id[:16]}...", "blue")
 
-            # 导航（先离开再回来，强制SPA重新渲染）
+            # 导航（先回列表页重置SPA，再导航到目标）
+            list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
             for nav_url in [ws_url, ws_url.replace("/myworkshop/detail", "/detail")]:
                 try:
-                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
-                    await page.wait_for_timeout(500)
-                    await page.goto(nav_url, wait_until="domcontentloaded", timeout=15000)
+                    await page.goto(list_url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(2000)
+                    await page.evaluate(f"window.location.hash = '{nav_url.split('#')[1]}';")
                     await page.wait_for_timeout(5000)
                 except:
                     pass
