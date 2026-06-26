@@ -820,10 +820,10 @@ class MainWindow(MSFluentWindow):
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
 
         self._screen_index = 0
-        self.navigationInterface.setCurrentWidget(self.screen_config)
-
-        # Hide navigation initially (show only current screen)
+        # Hide navigation (sequential flow, not side nav)
         self.navigationInterface.hide()
+        # Show config screen first
+        self.switchTo(self.screen_config)
 
     def next_screen(self):
         self._screen_index += 1
@@ -831,11 +831,8 @@ class MainWindow(MSFluentWindow):
         if self._screen_index < len(screens):
             screen = screens[self._screen_index]
             self.switchTo(screen)
-            self.navigationInterface.setCurrentWidget(screen)
             if self._screen_index == 3:
                 self.screen_dashboard.start_learning()
-                # Show nav bar on dashboard
-                self.navigationInterface.show()
 
     def next_screen(self):
         self._screen_index += 1
