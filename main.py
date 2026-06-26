@@ -1868,16 +1868,23 @@ class CCBULearner:
                     return None
 
                 # 直接导航到专题班详情页（用自己的cp页面，不开新标签页）
-                # 注意: SPA hash路由切换不会触发页面重载，必须reload才能刷新内容
                 ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
                 try:
-                    await cp.goto(ws_url, wait_until="networkidle", timeout=15000)
-                    await cp.reload(wait_until="networkidle", timeout=15000)
-                    await cp.wait_for_timeout(3000)
+                    await cp.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                    await cp.wait_for_timeout(5000)
                 except Exception as e:
                     debug(f"  导航异常: {e}")
+
+                # 检查页面是否加载了内容（不只是header）
+                body_text = ""
+                try:
+                    body_text = await cp.locator("body").inner_text(timeout=3000)
+                except:
+                    pass
+                if len(body_text.strip()) < 50:
+                    # 页面没加载出来，尝试reload
                     try:
-                        await cp.reload(wait_until="networkidle", timeout=20000)
+                        await cp.reload(wait_until="domcontentloaded", timeout=15000)
                         await cp.wait_for_timeout(5000)
                     except:
                         pass
@@ -1937,13 +1944,12 @@ class CCBULearner:
                     if attempt > 0:
                         console.print(f"  第 {attempt+1} 次获取课程...", style="yellow")
                         try:
-                            # 重新导航而非简单reload，确保SPA路由刷新
-                            await cp.goto(ws_url, wait_until="networkidle", timeout=15000)
-                            await cp.wait_for_timeout(3000)
+                            await cp.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                            await cp.wait_for_timeout(5000)
                         except:
                             try:
-                                await cp.reload(wait_until="networkidle", timeout=15000)
-                                await cp.wait_for_timeout(3000)
+                                await cp.reload(wait_until="domcontentloaded", timeout=15000)
+                                await cp.wait_for_timeout(5000)
                             except:
                                 pass
                     courses = await self.get_courses_from_workshop(cp)
