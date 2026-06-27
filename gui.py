@@ -1114,13 +1114,13 @@ class DashboardScreen(QWidget):
         elif remaining < 3600:
             m = int(remaining // 60)
             s = int(remaining % 60)
-            cn = f"{m}分{s}秒" if s else f"{m}分钟"
+            cn = f"{m}分{s}秒" if s else f"{m}分"
         else:
             h = int(remaining // 3600)
             m = int((remaining % 3600) // 60)
-            cn = f"{h}小时{m}分" if m else f"{h}小时"
+            cn = f"{h}时{m}分" if m else f"{h}时"
         finish = datetime.now() + timedelta(seconds=remaining)
-        self.lbl_eta.setText(f"剩余 {cn} · 预计 {finish.strftime('%H:%M')} 完成")
+        self.lbl_eta.setText(f"剩余{cn}·预计{finish.strftime('%H:%M')}完成")
 
     def _on_done(self, success, failed):
         self._eta_timer.stop()
