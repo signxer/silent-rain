@@ -698,7 +698,7 @@ class DashboardScreen(QWidget):
         self.table.setHorizontalHeaderLabels(["课程", "进度", "预计", "状态"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setColumnWidth(1, 80)
-        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(2, 200)
         self.table.setColumnWidth(3, 100)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
         self.table.setSelectionMode(TableWidget.NoSelection)
