@@ -2543,13 +2543,24 @@ class CCBULearner:
             return _format_time(remaining)
 
         def _format_time(seconds):
-            """格式化时间显示"""
+            """格式化为中文时间 + 预计完成时间"""
+            if seconds < 0:
+                return "计算中"
+            # 中文倒计时
             if seconds < 60:
-                return f"{seconds:.0f}s"
+                cn = f"{seconds:.0f}秒"
             elif seconds < 3600:
-                return f"{seconds/60:.1f}m"
+                m = int(seconds // 60)
+                s = int(seconds % 60)
+                cn = f"{m}分{s}秒" if s else f"{m}分钟"
             else:
-                return f"{seconds/3600:.1f}h"
+                h = int(seconds // 3600)
+                m = int((seconds % 3600) // 60)
+                cn = f"{h}小时{m}分" if m else f"{h}小时"
+            # 预计完成时间
+            from datetime import datetime, timedelta
+            finish = datetime.now() + timedelta(seconds=seconds)
+            return f"剩{cn} · {finish.strftime('%H:%M')}完成"
 
         def make_progress_table():
             # 学时信息面板

@@ -7,7 +7,7 @@ import sys
 import threading
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QSize, QTimer
 from PyQt5.QtGui import QColor, QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -578,6 +578,12 @@ class DashboardScreen(QWidget):
         self._tag_event = threading.Event()
         self._learn_start_time = None      # 学习开始时间
         self._progress_history = []         # [(timestamp, pct), ...]
+        self._eta_seconds = None            # 最新预估剩余秒数
+        self._eta_calc_time = None          # 预估计算时的时间戳
+        # 实时倒计时定时器
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._tick_eta)
         self._build_ui()
 
     def _build_ui(self):
@@ -774,6 +780,9 @@ class DashboardScreen(QWidget):
         # 重置 ETA 追踪
         self._learn_start_time = None
         self._progress_history = []
+        self._eta_seconds = None
+        self._eta_calc_time = None
+        self._eta_timer.stop()
         self.lbl_eta.setText("")
 
         win = self.window()
@@ -1056,39 +1065,65 @@ class DashboardScreen(QWidget):
                 self._progress_history = self._progress_history[-20:]
 
             if pct >= 100:
-                self.lbl_eta.setText("预计剩余: 已完成 ✓")
-            elif len(self._progress_history) >= 2:
-                t0, p0 = self._progress_history[0]
-                t_last, p_last = self._progress_history[-1]
-                dt = t_last - t0
-                dp = p_last - p0
-                if dp > 0 and dt > 0:
-                    rate = dp / dt  # pct/秒
-                    remaining_pct = 100 - p_last
-                    eta_sec = remaining_pct / rate
-                    if eta_sec < 60:
-                        eta_str = f"{eta_sec:.0f} 秒"
-                    elif eta_sec < 3600:
-                        eta_str = f"{eta_sec/60:.0f} 分钟"
-                    else:
-                        eta_str = f"{eta_sec/3600:.1f} 小时"
-                    self.lbl_eta.setText(f"预计剩余: {eta_str}")
-                else:
-                    self.lbl_eta.setText("预计剩余: 计算中...")
-            elif pct > 0:
-                elapsed = now - self._learn_start_time
-                eta_sec = elapsed * (100 - pct) / pct
-                if eta_sec < 60:
-                    eta_str = f"{eta_sec:.0f} 秒"
-                elif eta_sec < 3600:
-                    eta_str = f"{eta_sec/60:.0f} 分钟"
-                else:
-                    eta_str = f"{eta_sec/3600:.1f} 小时"
-                self.lbl_eta.setText(f"预计剩余: {eta_str}")
+                self._eta_seconds = None
+                self._eta_timer.stop()
+                self.lbl_eta.setText("✓ 已完成")
             else:
-                self.lbl_eta.setText("")
+                eta_sec = None
+                if len(self._progress_history) >= 2:
+                    t0, p0 = self._progress_history[0]
+                    t_last, p_last = self._progress_history[-1]
+                    dt = t_last - t0
+                    dp = p_last - p0
+                    if dp > 0 and dt > 0:
+                        rate = dp / dt  # pct/秒
+                        eta_sec = (100 - p_last) / rate
+                elif pct > 0:
+                    elapsed = now - self._learn_start_time
+                    eta_sec = elapsed * (100 - pct) / pct
+
+                if eta_sec is not None and eta_sec > 0:
+                    self._eta_seconds = eta_sec
+                    self._eta_calc_time = now
+                    self._update_eta_label()
+                    if not self._eta_timer.isActive():
+                        self._eta_timer.start()
+                else:
+                    self.lbl_eta.setText("计算中...")
+
+    def _tick_eta(self):
+        """每秒刷新倒计时"""
+        if self._eta_seconds is None:
+            self._eta_timer.stop()
+            return
+        self._update_eta_label()
+
+    def _update_eta_label(self):
+        """根据存储的eta_seconds和计算时间，显示实时倒计时"""
+        import time as _time
+        from datetime import datetime, timedelta
+        if self._eta_seconds is None:
+            return
+        remaining = self._eta_seconds - (_time.time() - self._eta_calc_time)
+        if remaining <= 0:
+            self.lbl_eta.setText("即将完成...")
+            return
+        # 中文倒计时
+        if remaining < 60:
+            cn = f"{remaining:.0f}秒"
+        elif remaining < 3600:
+            m = int(remaining // 60)
+            s = int(remaining % 60)
+            cn = f"{m}分{s}秒" if s else f"{m}分钟"
+        else:
+            h = int(remaining // 3600)
+            m = int((remaining % 3600) // 60)
+            cn = f"{h}小时{m}分" if m else f"{h}小时"
+        finish = datetime.now() + timedelta(seconds=remaining)
+        self.lbl_eta.setText(f"剩余 {cn} · 预计 {finish.strftime('%H:%M')} 完成")
 
     def _on_done(self, success, failed):
+        self._eta_timer.stop()
         InfoBar.success("完成", f"学习流程结束，成功 {success} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_tag_request(self, tags_by_category):
