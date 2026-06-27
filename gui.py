@@ -948,7 +948,7 @@ class DashboardScreen(QWidget):
                 log(f"第 {page_num} 页: {len(workshops)} 个专题班", "blue")
                 learner.save_progress(completed_ids, page_num, 0)
                 new_tasks, new_locks = await learner._collect_workshops_courses(
-                    page, workshops, completed_ids
+                    page, workshops, completed_ids, log_callback=log
                 )
                 tasks.extend(new_tasks)
                 ws_locks.update(new_locks)

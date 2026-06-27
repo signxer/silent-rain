@@ -1581,8 +1581,9 @@ class CCBULearner:
 
     _api_lock = None
 
-    async def _get_courses_by_api(self, page: Page, ws_id: str) -> list:
+    async def _get_courses_by_api(self, page: Page, ws_id: str, log_callback=None) -> list:
         """通过专题班详情API直接获取课程列表（429自动重试）"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         if not self._api_lock:
             self._api_lock = asyncio.Lock()
 
@@ -1627,21 +1628,21 @@ class CCBULearner:
                 for retry_wait in [5, 10, 15]:
                     if not (isinstance(result, dict) and result.get("error") == "HTTP 429"):
                         break
-                    console.print(f"  429限流，等{retry_wait}秒重试...", style="yellow")
+                    _log(f"  429限流，等{retry_wait}秒重试...", "yellow")
                     await asyncio.sleep(retry_wait)
                     result = await page.evaluate(fetch_code, api_url)
 
                 await asyncio.sleep(0.5)
 
             if isinstance(result, dict) and result.get("error"):
-                console.print(f"  API失败: {result['error']}", style="red")
+                _log(f"  API失败: {result['error']}", "red")
                 return None
             if not isinstance(result, dict):
-                console.print(f"  API返回异常: {type(result).__name__}", style="red")
+                _log(f"  API返回异常: {type(result).__name__}", "red")
                 return None
             return result
         except Exception as e:
-            console.print(f"  API异常: {e}", style="red")
+            _log(f"  API异常: {e}", "red")
             return None
 
     async def get_courses_from_workshop(self, page: Page, ws_title: str = "") -> List[Dict]:
@@ -2156,15 +2157,16 @@ class CCBULearner:
                     pass
 
     async def _collect_workshops_courses(self, page: Page, workshops: List[Dict],
-                                          completed_ids: set = None) -> tuple:
+                                          completed_ids: set = None, log_callback=None) -> tuple:
         """预收集：并行 enroll + 获取课程列表，跳过已完成的专题班"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         if completed_ids is None:
             completed_ids = set()
 
         to_process = list(workshops)
 
         if completed_ids:
-            console.print(f"  已完成 {len(completed_ids)} 个专题班，将跳过", style="green")
+            _log(f"已完成 {len(completed_ids)} 个专题班，将跳过", "green")
 
         all_tasks = []       # [(ws_id, course_idx, course_info, ws_title), ...]
         ws_locks = {}        # ws_id -> asyncio.Lock
@@ -2178,7 +2180,7 @@ class CCBULearner:
             except:
                 pass
 
-        console.print(f"  使用 {len(collect_pages)} 个页面并行采集", style="blue")
+        _log(f"使用 {len(collect_pages)} 个页面并行采集", "blue")
 
         # 每个采集页都先导航到专题班列表
         async def init_collect_page(cp):
@@ -2210,7 +2212,7 @@ class CCBULearner:
             """单个专题班：每个专题班用新页面，避免SPA状态累积"""
             ws_title = ws['title'][:50]
             async with sem:
-                console.print(f"[采集 {idx+1}/{len(to_process)}] {ws_title}", style="blue")
+                _log(f"[采集 {idx+1}/{len(to_process)}] {ws_title}", "blue")
 
                 # 从 detail_link 提取 workshop ID
                 detail_link = ws.get('detail_link', '')
@@ -2219,12 +2221,12 @@ class CCBULearner:
                 if m:
                     ws_id = m.group(1)
                 if not ws_id:
-                    console.print(f"  ✗ 无法从链接提取ID: {detail_link[:60]}", style="red")
+                    _log(f"  ✗ 无法从链接提取ID: {detail_link[:60]}", "red")
                     return None
 
                 # 检查是否已完成
                 if ws_id in completed_ids:
-                    console.print(f"  ⊘ 已完成，跳过: {ws_title[:30]}", style="green")
+                    _log(f"  ⊘ 已完成，跳过: {ws_title[:30]}", "green")
                     return None
 
                 # 每个专题班创建新页面（避免SPA状态累积导致后面失败）
@@ -2249,7 +2251,7 @@ class CCBULearner:
 
                     # 检查是否报名截止（列表页已过滤，这里兜底）
                     if "报名截止" in body_text or "报名已结束" in body_text:
-                        console.print(f"  ⊘ 报名已截止，跳过: {ws_title[:30]}", style="yellow")
+                        _log(f"  ⊘ 报名已截止，跳过: {ws_title[:30]}", "yellow")
                         return None
 
                     # 点击"课程"标签页
@@ -2285,7 +2287,7 @@ class CCBULearner:
                         try:
                             btn = cp.locator(f"text={kw}").first
                             if await btn.count() > 0 and await btn.is_visible():
-                                console.print(f"  需要报名，点击「{kw}」", style="blue")
+                                _log(f"  需要报名，点击「{kw}」", "blue")
                                 old_url = cp.url
                                 await btn.click()
                                 # 等待页面跳转（URL变化或按钮消失）
@@ -2322,10 +2324,10 @@ class CCBULearner:
                     for api_attempt in range(API_MAX_RETRIES):
                         if api_attempt > 0:
                             wait_sec = api_attempt * 3
-                            console.print(f"  API重试({api_attempt}/{API_MAX_RETRIES})，等{wait_sec}秒...", style="yellow")
+                            _log(f"  API重试({api_attempt}/{API_MAX_RETRIES})，等{wait_sec}秒...", "yellow")
                             await asyncio.sleep(wait_sec)
                         try:
-                            api_result = await self._get_courses_by_api(cp, ws_id)
+                            api_result = await self._get_courses_by_api(cp, ws_id, log_callback=_log)
                             if api_result and isinstance(api_result, dict):
                                 data = api_result.get("contentList", [])
                                 if not data:
@@ -2359,16 +2361,16 @@ class CCBULearner:
                                             "url": detail_url or course_id,
                                         })
                                     if courses:
-                                        console.print(f"  ✓ API获取 {len(courses)} 门课程", style="green")
+                                        _log(f"  ✓ API获取 {len(courses)} 门课程", "green")
                                         break
                                     else:
-                                        console.print(f"  API返回0门课程", style="yellow")
+                                        _log(f"  API返回0门课程", "yellow")
                                 else:
-                                    console.print(f"  API无课程数据", style="yellow")
+                                    _log(f"  API无课程数据", "yellow")
                             else:
-                                console.print(f"  API返回异常", style="yellow")
+                                _log(f"  API返回异常", "yellow")
                         except Exception as e:
-                            console.print(f"  API异常: {e}", style="red")
+                            _log(f"  API异常: {e}", "red")
 
                     if courses is None:
                         courses = []
@@ -2383,9 +2385,9 @@ class CCBULearner:
                                 completed_ids.add(ws_id)
                                 self.mark_workshop_completed(ws_id)
                                 debug(f"  标记已完成: {ws_id}")
-                            console.print(f"  ✓ 全部已完成（共{len(courses)}门）", style="green")
+                            _log(f"  ✓ 全部已完成（共{len(courses)}门）", "green")
                         else:
-                            console.print(f"  ✓ {len(to_learn)} 门待学（共{len(courses)}门）", style="green")
+                            _log(f"  ✓ {len(to_learn)} 门待学（共{len(courses)}门）", "green")
                         return {
                             "ws_id": ws_id,
                             "ws_title": ws_title,
@@ -2393,7 +2395,7 @@ class CCBULearner:
                             "courses": courses
                         }
                     else:
-                        console.print(f"  ✗ 未获取到课程", style="yellow")
+                        _log(f"  ✗ 未获取到课程", "yellow")
                         return None
                 finally:
                     try:
