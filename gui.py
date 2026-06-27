@@ -1053,38 +1053,27 @@ class DashboardScreen(QWidget):
         goal_hours = getattr(win, "cfg_goal_hours", 0)
         if goal_hours > 0:
             cur = data.get(goal_type, 0)
-            pct = min(100, int(cur / goal_hours * 100))
+            pct_f = min(100.0, cur / goal_hours * 100)  # 浮点精度，用于ETA计算
+            pct = int(pct_f)  # 整数，用于显示和进度环
             self.progress_ring.setValue(pct)
             type_name = "集中培训" if goal_type == "central" else "网络自学"
             self.lbl_goal_info.setText(f"{type_name} {cur:.1f}/{goal_hours:.0f} 学时 ({pct}%)")
 
-            # ── ETA 计算 ──
+            # ── ETA 计算（用浮点pct_f避免int截断导致速率失真）──
             now = _time.time()
             if self._learn_start_time is None:
                 self._learn_start_time = now
-            self._progress_history.append((now, pct))
+            self._progress_history.append((now, pct_f))
             # 只保留最近 20 条
             if len(self._progress_history) > 20:
                 self._progress_history = self._progress_history[-20:]
 
-            if pct >= 100:
+            if pct_f >= 100:
                 self._eta_seconds = None
                 self._eta_timer.stop()
                 self.lbl_eta.setText("✓ 已完成")
             else:
-                eta_sec = None
-                if len(self._progress_history) >= 2:
-                    t0, p0 = self._progress_history[0]
-                    t_last, p_last = self._progress_history[-1]
-                    dt = t_last - t0
-                    dp = p_last - p0
-                    if dp > 0 and dt > 0:
-                        rate = dp / dt  # pct/秒
-                        eta_sec = (100 - p_last) / rate
-                elif pct > 0:
-                    elapsed = now - self._learn_start_time
-                    eta_sec = elapsed * (100 - pct) / pct
-
+                eta_sec = self._calc_eta(pct_f, now)
                 if eta_sec is not None and eta_sec > 0:
                     self._eta_seconds = eta_sec
                     self._eta_calc_time = now
@@ -1093,6 +1082,24 @@ class DashboardScreen(QWidget):
                         self._eta_timer.start()
                 else:
                     self.lbl_eta.setText("计算中...")
+
+    def _calc_eta(self, pct_f, now):
+        """计算ETA秒数，用首尾点+平滑过滤"""
+        history = self._progress_history
+        if len(history) < 2:
+            if pct_f > 0 and self._learn_start_time:
+                elapsed = now - self._learn_start_time
+                return elapsed * (100 - pct_f) / pct_f
+            return None
+        # 取首尾两点算平均速率（最稳定）
+        t0, p0 = history[0]
+        t_last, p_last = history[-1]
+        dt = t_last - t0
+        dp = p_last - p0
+        if dp > 0 and dt > 0:
+            rate = dp / dt  # pct/秒
+            return (100 - p_last) / rate
+        return None
 
     def _tick_eta(self):
         """每秒刷新倒计时"""
