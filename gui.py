@@ -971,11 +971,17 @@ class DashboardScreen(QWidget):
                 # 创建独立页面用于采集（不与学习worker冲突）
                 _collect_page = await learner.context.new_page()
 
+                _fetched_page = 0  # 已采集到的页码，防重复采集
+
                 async def fetch_more_courses(queue):
+                    nonlocal _fetched_page
                     if no_more_pages:
                         return 0
                     async with _fetch_lock:
                         if no_more_pages:
+                            return 0
+                        # 队列已有课程（其他worker已采集过），不重复采集
+                        if queue.qsize() > 0:
                             return 0
                         if cfg_goal_hours > 0:
                             try:
@@ -995,17 +1001,20 @@ class DashboardScreen(QWidget):
                             pass
                         moved = await learner.go_to_next_page(_collect_page)
                         if not moved:
+                            no_more_pages = True
                             return 0
                         nonlocal page_num
                         page_num += 1
+                        _fetched_page = page_num
                         await _collect_page.wait_for_timeout(5000)
                         new_ws = await learner.get_workshops(_collect_page)
                         if not new_ws:
+                            no_more_pages = True
                             return 0
                         log(f"自动翻到第 {page_num} 页: {len(new_ws)} 个专题班", "blue")
                         learner.save_progress(completed_ids, page_num, 0)
                         new_t, new_l = await learner._collect_workshops_courses(
-                            _collect_page, new_ws, completed_ids
+                            _collect_page, new_ws, completed_ids, log_callback=log
                         )
                         ws_locks.update(new_l)
                         for t in new_t:
