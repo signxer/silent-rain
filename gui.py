@@ -1610,6 +1610,17 @@ class MainWindow(_BaseWindow):
         self.setMinimumSize(800, 500)
         self._drag_pos = None
 
+        # 设置窗口图标
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        # 创建启动画面
+        from qfluentwidgets import SplashScreen
+        self.splashScreen = SplashScreen(self.windowIcon(), self)
+        self.splashScreen.setIconSize(QSize(128, 128))
+        self.show()
+
         # Config state
         self.cfg_workers = 1
         self.cfg_headless = False
@@ -1623,7 +1634,23 @@ class MainWindow(_BaseWindow):
         self.cfg_mode = "auto"
         self.cfg_manual_urls = []
 
-        # Screens
+        # 创建子界面
+        self._createSubInterfaces()
+
+        # 隐藏启动画面
+        self.splashScreen.finish()
+
+        # 检查是否有保存的配置，有则自动开始
+        has_config = self._load_saved_config()
+        if has_config:
+            self._screen_index = 5
+            self.switchTo(self.screen_dashboard)
+            self.screen_dashboard.start_learning()
+        else:
+            self.switchTo(self.screen_config)
+
+    def _createSubInterfaces(self):
+        """创建所有子界面"""
         self.screen_config = ConfigScreen(self)
         self.screen_config.setObjectName("config")
         self.screen_login = LoginScreen(self)
@@ -1647,15 +1674,6 @@ class MainWindow(_BaseWindow):
 
         self._screen_index = 0
         self.navigationInterface.hide()
-
-        # 检查是否有保存的配置，有则自动开始
-        has_config = self._load_saved_config()
-        if has_config:
-            self._screen_index = 5
-            self.switchTo(self.screen_dashboard)
-            self.screen_dashboard.start_learning()
-        else:
-            self.switchTo(self.screen_config)
 
     def _load_saved_config(self):
         """加载保存的配置，返回是否有完整配置"""
