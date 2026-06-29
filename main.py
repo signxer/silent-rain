@@ -182,7 +182,7 @@ class CCBULearner:
         self.goal_reached = False
         self.user_data = {}
 
-    async def init(self, log_callback=None):
+    async def init(self, log_callback=None, chrome_path=""):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
 
         # 检查 Playwright 浏览器是否已安装
@@ -221,7 +221,13 @@ class CCBULearner:
 
         if self.browser_type == "chrome":
             # 用户选择使用系统 Chrome
-            if sys.platform == "win32":
+            if chrome_path and os.path.exists(chrome_path):
+                # 用户手动指定了路径
+                launch_opts["executablePath"] = chrome_path
+                use_system_chrome = True
+                _log(f"使用指定 Chrome: {chrome_path}", "green")
+            elif sys.platform == "win32":
+                # Windows 自动检测
                 chrome_paths = [
                     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",

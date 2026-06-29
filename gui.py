@@ -141,19 +141,42 @@ class ConfigScreen(QWidget):
         browser_card = HeaderCardWidget(self)
         browser_card.setTitle("浏览器引擎")
         browser_card.setBorderRadius(8)
-        b_layout = QHBoxLayout()
-        b_layout.setSpacing(12)
+        b_layout = QVBoxLayout()
+        b_layout.setSpacing(10)
+        b_layout.setContentsMargins(0, 8, 0, 8)
 
+        # Windows 默认 chrome，其他默认 chromium
+        import platform
+        default_browser = "chrome" if platform.system() == "Windows" else "chromium"
+        saved_browser = self._saved.get("browser", default_browser)
+
+        radio_row = QHBoxLayout()
         self.radio_chrome = RadioButton("本地 Chrome")
         self.radio_chromium = RadioButton("内置 Chromium")
-        saved_browser = self._saved.get("browser", "chromium")
         if saved_browser == "chrome":
             self.radio_chrome.setChecked(True)
         else:
             self.radio_chromium.setChecked(True)
-        b_layout.addWidget(self.radio_chrome)
-        b_layout.addWidget(self.radio_chromium)
-        b_layout.addStretch()
+        radio_row.addWidget(self.radio_chrome)
+        radio_row.addWidget(self.radio_chromium)
+        radio_row.addStretch()
+        b_layout.addLayout(radio_row)
+
+        # Chrome 路径输入（可选）
+        self.chrome_path_widget = QWidget()
+        path_row = QHBoxLayout(self.chrome_path_widget)
+        path_row.setContentsMargins(0, 0, 0, 0)
+        path_row.addWidget(BodyLabel("Chrome路径:"))
+        self.input_chrome_path = LineEdit()
+        self.input_chrome_path.setPlaceholderText("留空则自动检测")
+        self.input_chrome_path.setText(self._saved.get("chrome_path", ""))
+        path_row.addWidget(self.input_chrome_path)
+        b_layout.addWidget(self.chrome_path_widget)
+        self.chrome_path_widget.setVisible(saved_browser == "chrome")
+
+        # 切换时显隐路径输入
+        self.radio_chrome.toggled.connect(lambda checked: self.chrome_path_widget.setVisible(checked))
+
         browser_card.viewLayout.addLayout(b_layout)
         layout.addWidget(browser_card)
 
@@ -174,6 +197,7 @@ class ConfigScreen(QWidget):
         workers = self.spin_workers.value()
         headless = self.switch_headless.isChecked()
         browser = "chrome" if self.radio_chrome.isChecked() else "chromium"
+        chrome_path = self.input_chrome_path.text().strip() if self.radio_chrome.isChecked() else ""
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -182,6 +206,7 @@ class ConfigScreen(QWidget):
             cfg["workers"] = workers
             cfg["headless"] = headless
             cfg["browser"] = browser
+            cfg["chrome_path"] = chrome_path
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
@@ -190,6 +215,7 @@ class ConfigScreen(QWidget):
         win.cfg_workers = workers
         win.cfg_headless = headless
         win.cfg_browser = browser
+        win.cfg_chrome_path = chrome_path
         win.next_screen()
 
 
@@ -953,9 +979,10 @@ class DashboardScreen(QWidget):
 
         try:
             cfg_browser = getattr(win, "cfg_browser", "chromium")
+            cfg_chrome_path = getattr(win, "cfg_chrome_path", "")
             log("正在初始化浏览器...")
             learner = CCBULearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
-            await learner.init(log_callback=log)
+            await learner.init(log_callback=log, chrome_path=cfg_chrome_path)
             log("浏览器初始化完成", "green")
 
             log("正在登录...")
@@ -1697,6 +1724,7 @@ class MainWindow(_BaseWindow):
         self.cfg_workers = 1
         self.cfg_headless = True
         self.cfg_browser = "chromium"  # chromium/chrome
+        self.cfg_chrome_path = ""
         self.cfg_username = ""
         self.cfg_password = ""
         self.cfg_auto_login = True
@@ -1764,6 +1792,7 @@ class MainWindow(_BaseWindow):
             self.cfg_workers = cfg.get("workers", 1)
             self.cfg_headless = cfg.get("headless", True)
             self.cfg_browser = cfg.get("browser", "chromium")
+            self.cfg_chrome_path = cfg.get("chrome_path", "")
             self.cfg_central_goal = cfg.get("central_goal", 0)
             self.cfg_online_goal = cfg.get("online_goal", 0)
             self.cfg_central_mode = cfg.get("central_mode", "target")
