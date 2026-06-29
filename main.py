@@ -208,9 +208,9 @@ class CCBULearner:
                 # PyInstaller 打包的驱动损坏，需要用户先安装 playwright
                 _log("Playwright 驱动异常，请在终端运行以下命令：", "red")
                 if sys.platform == "win32":
-                    _log("  pip install playwright && playwright install chromium", "yellow")
+                    _log("  pip install playwright && python -m playwright install chromium", "yellow")
                 else:
-                    _log("  pip3 install playwright && playwright install chromium", "yellow")
+                    _log("  pip3 install playwright && python3 -m playwright install chromium", "yellow")
                 raise RuntimeError("Playwright driver not found")
             elif "Executable doesn't exist" in err_msg or "Browser" in err_msg:
                 _log("首次运行，正在安装 Chromium 浏览器...", "blue")

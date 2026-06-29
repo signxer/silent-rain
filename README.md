@@ -34,7 +34,7 @@ Mac 用户也可运行 `./setup.sh` 一键安装。
 
 ```bash
 pip3 install playwright
-playwright install chromium
+python3 -m playwright install chromium
 ```
 
 ## 使用
