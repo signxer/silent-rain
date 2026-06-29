@@ -296,24 +296,27 @@ class GoalScreen(QWidget):
         self._build_ui()
 
     def _load_goal(self):
-        self._saved_mode = "none"
         self._saved_central = 0
         self._saved_online = 0
+        self._saved_central_on = False
+        self._saved_online_on = False
         if os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
-                self._saved_mode = cfg.get("goal_mode", "none")
                 self._saved_central = cfg.get("central_goal", 0)
                 self._saved_online = cfg.get("online_goal", 0)
+                self._saved_central_on = self._saved_central > 0
+                self._saved_online_on = self._saved_online > 0
                 # 向后兼容旧格式
-                if self._saved_mode == "none" and cfg.get("study_goal", 0) > 0:
-                    self._saved_mode = "target"
+                if cfg.get("study_goal", 0) > 0:
                     old_goal = cfg["study_goal"]
                     if cfg.get("goal_type") == "central":
                         self._saved_central = old_goal
+                        self._saved_central_on = True
                     else:
                         self._saved_online = old_goal
+                        self._saved_online_on = True
             except:
                 pass
 
@@ -326,90 +329,93 @@ class GoalScreen(QWidget):
         title = TitleLabel("学习目标")
         layout.addWidget(title)
 
-        subtitle = BodyLabel("设定学习目标，程序按「集中培训→网络自学」顺序完成")
+        subtitle = BodyLabel("分别设置集中培训和网络自学的学习目标")
         subtitle.setForegroundRole(self.palette().PlaceholderText)
         layout.addWidget(subtitle)
 
         layout.addSpacing(10)
 
-        # 目标模式卡片
-        mode_card = HeaderCardWidget(self)
-        mode_card.setTitle("学习模式")
-        mode_card.setBorderRadius(8)
-        m_layout = QVBoxLayout()
-        m_layout.setSpacing(8)
-        m_layout.setContentsMargins(0, 8, 0, 8)
+        # 集中培训卡片
+        central_card = HeaderCardWidget(self)
+        central_card.setTitle("集中培训")
+        central_card.setBorderRadius(8)
+        c_layout = QVBoxLayout()
+        c_layout.setSpacing(10)
+        c_layout.setContentsMargins(0, 8, 0, 8)
 
-        self.radio_none = RadioButton("不学习")
-        self.radio_unlimited = RadioButton("无限制学习")
-        self.radio_target = RadioButton("目标总学时")
-        self.radio_remain = RadioButton("差额补修")
+        c_switch_row = QHBoxLayout()
+        c_switch_row.addWidget(BodyLabel("是否学习:"))
+        self.switch_central = SwitchButton()
+        self.switch_central.setChecked(self._saved_central_on)
+        self.switch_central.setOnText("学习")
+        self.switch_central.setOffText("不学习")
+        c_switch_row.addWidget(self.switch_central)
+        c_switch_row.addStretch()
+        c_layout.addLayout(c_switch_row)
 
-        mode_map = {"none": self.radio_none, "unlimited": self.radio_unlimited,
-                    "target": self.radio_target, "remain": self.radio_remain}
-        mode_map.get(self._saved_mode, self.radio_none).setChecked(True)
-
-        for rb in [self.radio_none, self.radio_unlimited, self.radio_target, self.radio_remain]:
-            m_layout.addWidget(rb)
-        mode_card.viewLayout.addLayout(m_layout)
-        layout.addWidget(mode_card)
-
-        # 双目标输入卡片
-        self.goal_card = HeaderCardWidget(self)
-        self.goal_card.setTitle("目标学时")
-        self.goal_card.setBorderRadius(8)
-        g_layout = QVBoxLayout()
-        g_layout.setSpacing(12)
-        g_layout.setContentsMargins(0, 8, 0, 8)
-
-        # 当前学时（登录后才会更新）
-        self.lbl_cur_hours = CaptionLabel("")
-        self.lbl_cur_hours.setStyleSheet("color: #888;")
-        g_layout.addWidget(self.lbl_cur_hours)
-
-        # 集中培训
-        row_c = QHBoxLayout()
-        row_c.addWidget(BodyLabel("集中培训:"))
+        self.central_goal_row = QHBoxLayout()
+        self.central_goal_row.addWidget(BodyLabel("目标学时:"))
         self.spin_central = SpinBox()
         self.spin_central.setRange(0, 9999)
         self.spin_central.setValue(int(self._saved_central))
         self.spin_central.setFixedWidth(150)
-        row_c.addWidget(self.spin_central)
-        row_c.addWidget(BodyLabel("学时"))
-        row_c.addStretch()
-        g_layout.addLayout(row_c)
+        self.central_goal_row.addWidget(self.spin_central)
+        self.central_goal_row.addWidget(BodyLabel("学时"))
+        self.central_goal_row.addStretch()
+        c_layout.addLayout(self.central_goal_row)
 
-        # 网络自学
-        row_o = QHBoxLayout()
-        row_o.addWidget(BodyLabel("网络自学:"))
+        central_card.viewLayout.addLayout(c_layout)
+        layout.addWidget(central_card)
+
+        # 网络自学卡片
+        online_card = HeaderCardWidget(self)
+        online_card.setTitle("网络自学")
+        online_card.setBorderRadius(8)
+        o_layout = QVBoxLayout()
+        o_layout.setSpacing(10)
+        o_layout.setContentsMargins(0, 8, 0, 8)
+
+        o_switch_row = QHBoxLayout()
+        o_switch_row.addWidget(BodyLabel("是否学习:"))
+        self.switch_online = SwitchButton()
+        self.switch_online.setChecked(self._saved_online_on)
+        self.switch_online.setOnText("学习")
+        self.switch_online.setOffText("不学习")
+        o_switch_row.addWidget(self.switch_online)
+        o_switch_row.addStretch()
+        o_layout.addLayout(o_switch_row)
+
+        self.online_goal_row = QHBoxLayout()
+        self.online_goal_row.addWidget(BodyLabel("目标学时:"))
         self.spin_online = SpinBox()
         self.spin_online.setRange(0, 9999)
         self.spin_online.setValue(int(self._saved_online))
         self.spin_online.setFixedWidth(150)
-        row_o.addWidget(self.spin_online)
-        row_o.addWidget(BodyLabel("学时"))
-        row_o.addStretch()
-        g_layout.addLayout(row_o)
+        self.online_goal_row.addWidget(self.spin_online)
+        self.online_goal_row.addWidget(BodyLabel("学时"))
+        self.online_goal_row.addStretch()
+        o_layout.addLayout(self.online_goal_row)
 
-        self.lbl_hint = CaptionLabel("")
-        self.lbl_hint.setStyleSheet("color: #888;")
-        g_layout.addWidget(self.lbl_hint)
+        online_card.viewLayout.addLayout(o_layout)
+        layout.addWidget(online_card)
 
-        self.goal_card.viewLayout.addLayout(g_layout)
-        layout.addWidget(self.goal_card)
-
-        # 模式切换时显隐目标卡片 + 更新提示
-        for rb in [self.radio_none, self.radio_unlimited, self.radio_target, self.radio_remain]:
-            rb.toggled.connect(self._on_mode_changed)
-        self.spin_central.valueChanged.connect(self._update_hint)
-        self.spin_online.valueChanged.connect(self._update_hint)
-        self._on_mode_changed()
+        # 切换时显隐学时输入
+        self.switch_central.checkedChanged.connect(lambda checked: self.central_goal_row.setVisible(checked))
+        self.switch_online.checkedChanged.connect(lambda checked: self.online_goal_row.setVisible(checked))
+        self.central_goal_row.setVisible(self._saved_central_on)
+        self.online_goal_row.setVisible(self._saved_online_on)
 
         layout.addStretch()
 
         # 按钮
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+
+        btn_skip = PushButton("  跳过")
+        btn_skip.setIcon(FIF.CLOSE)
+        btn_skip.setFixedSize(120, 40)
+        btn_skip.clicked.connect(lambda: self._on_done(False, 0, False, 0))
+        btn_layout.addWidget(btn_skip)
 
         btn_next = PrimaryPushButton("  继续")
         btn_next.setIcon(FIF.RIGHT_ARROW)
@@ -419,64 +425,32 @@ class GoalScreen(QWidget):
 
         layout.addLayout(btn_layout)
 
-    def _on_mode_changed(self):
-        show_goals = self.radio_target.isChecked() or self.radio_remain.isChecked()
-        self.goal_card.setVisible(show_goals)
-        self._update_hint()
-
-    def _update_hint(self):
-        if self.radio_none.isChecked():
-            self.lbl_hint.setText("")
-        elif self.radio_unlimited.isChecked():
-            self.lbl_hint.setText("")
-        elif self.radio_target.isChecked():
-            c = self.spin_central.value()
-            o = self.spin_online.value()
-            if c > 0 or o > 0:
-                self.lbl_hint.setText(f"目标: 集中{c} + 网络{o} = 共{c+o}学时")
-            else:
-                self.lbl_hint.setText("至少设定一个目标学时")
-        elif self.radio_remain.isChecked():
-            c = self.spin_central.value()
-            o = self.spin_online.value()
-            if c > 0 or o > 0:
-                self.lbl_hint.setText(f"还需补充: 集中{c} + 网络{o} = 共{c+o}学时")
-            else:
-                self.lbl_hint.setText("至少设定一个差额学时")
-
     def _on_next(self):
-        if self.radio_none.isChecked():
-            mode = "none"
-        elif self.radio_unlimited.isChecked():
-            mode = "unlimited"
-        elif self.radio_target.isChecked():
-            mode = "target"
-        else:
-            mode = "remain"
-        central = self.spin_central.value()
-        online = self.spin_online.value()
-        self._on_done(mode, central, online)
+        central_on = self.switch_central.isChecked()
+        online_on = self.switch_online.isChecked()
+        central = self.spin_central.value() if central_on else 0
+        online = self.spin_online.value() if online_on else 0
+        self._on_done(central_on, central, online_on, online)
 
-    def _on_done(self, goal_mode, central_goal, online_goal):
+    def _on_done(self, central_on, central_goal, online_on, online_goal):
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
-            cfg["goal_mode"] = goal_mode
-            cfg["central_goal"] = central_goal
-            cfg["online_goal"] = online_goal
+            cfg["central_goal"] = central_goal if central_on else 0
+            cfg["online_goal"] = online_goal if online_on else 0
             # 清理旧字段
             cfg.pop("study_goal", None)
             cfg.pop("goal_type", None)
+            cfg.pop("goal_mode", None)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
             pass
         win = self.window()
-        win.cfg_goal_mode = goal_mode
-        win.cfg_central_goal = central_goal
-        win.cfg_online_goal = online_goal
+        win.cfg_central_goal = central_goal if central_on else 0
+        win.cfg_online_goal = online_goal if online_on else 0
         win.next_screen()
 
 
@@ -908,19 +882,18 @@ class DashboardScreen(QWidget):
                 return
             log("登录成功", "green")
 
-            # 获取配置
-            cfg_goal_mode = getattr(win, "cfg_goal_mode", "none")
+            # 获取配置（新格式：central_goal/online_goal，0表示不学习）
             cfg_central_goal = getattr(win, "cfg_central_goal", 0)
             cfg_online_goal = getattr(win, "cfg_online_goal", 0)
 
-            if cfg_goal_mode == "none":
+            if cfg_central_goal <= 0 and cfg_online_goal <= 0:
                 log("未设定学习目标，退出", "yellow")
                 thread.done_signal.emit(0, 0)
                 return
 
             # 登录后立即检查学时
             cur_hours = {"central": 0, "online": 0}
-            if cfg_goal_mode in ("target", "remain"):
+            if cfg_central_goal > 0 or cfg_online_goal > 0:
                 log("正在检查当前学时...", "blue")
                 try:
                     _h = await learner._get_study_hours(learner.pages[0])
@@ -928,10 +901,9 @@ class DashboardScreen(QWidget):
                     log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
                     hours_cb(_h)
 
-                    # target模式：计算实际差额
-                    if cfg_goal_mode == "target":
-                        cfg_central_goal = max(0, cfg_central_goal - cur_hours["central"])
-                        cfg_online_goal = max(0, cfg_online_goal - cur_hours["online"])
+                    # 计算实际差额
+                    cfg_central_goal = max(0, cfg_central_goal - cur_hours["central"])
+                    cfg_online_goal = max(0, cfg_online_goal - cur_hours["online"])
 
                     # 检查是否都已完成
                     if cfg_central_goal <= 0 and cfg_online_goal <= 0:
@@ -943,14 +915,15 @@ class DashboardScreen(QWidget):
 
             # 构建阶段列表：先集中培训，再网络自学
             phases = []
-            if cfg_goal_mode == "unlimited":
-                phases.append(("central", 0))  # 0表示不限制
-                phases.append(("online", 0))
-            else:
-                if cfg_central_goal > 0:
-                    phases.append(("central", cfg_central_goal))
-                if cfg_online_goal > 0:
-                    phases.append(("online", cfg_online_goal))
+            if cfg_central_goal > 0:
+                phases.append(("central", cfg_central_goal))
+            if cfg_online_goal > 0:
+                phases.append(("online", cfg_online_goal))
+
+            if not phases:
+                log("未设定学习目标，退出", "yellow")
+                thread.done_signal.emit(0, 0)
+                return
 
             # 手动模式：直接从指定URL学习
             if cfg_mode == "manual":
@@ -1690,12 +1663,10 @@ class MainWindow(_BaseWindow):
                 return False
             self.cfg_workers = cfg.get("workers", 1)
             self.cfg_headless = cfg.get("headless", False)
-            self.cfg_goal_mode = cfg.get("goal_mode", "none")
             self.cfg_central_goal = cfg.get("central_goal", 0)
             self.cfg_online_goal = cfg.get("online_goal", 0)
             # 向后兼容旧格式
-            if self.cfg_goal_mode == "none" and cfg.get("study_goal", 0) > 0:
-                self.cfg_goal_mode = "target"
+            if cfg.get("study_goal", 0) > 0:
                 if cfg.get("goal_type") == "central":
                     self.cfg_central_goal = cfg["study_goal"]
                 else:
