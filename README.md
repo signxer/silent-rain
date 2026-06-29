@@ -30,6 +30,14 @@ Mac 用户也可运行 `./setup.sh` 一键安装。
 
 从 [Releases](https://github.com/signxer/CCBU-Auto/releases) 下载对应平台的可执行文件。
 
+**macOS 用户**：首次打开可能提示"已损坏"，需要在终端执行：
+
+```bash
+xattr -cr /path/to/CCBU-Auto.app
+```
+
+或右键 → 打开 → 仍然打开。
+
 **首次运行前**需要先安装 Playwright 浏览器引擎：
 
 ```bash
