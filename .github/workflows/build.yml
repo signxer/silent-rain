@@ -1,8 +1,7 @@
-name: Build
+name: Build & Release
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -24,19 +23,23 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build CLI EXE
-        run: pyinstaller -F --icon=icon.ico --add-data="icon.png;." --name=CCBU-Auto main.py
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Build GUI EXE
-        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --name=CCBU-Auto-GUI gui.py
+        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --name=CCBU-Auto gui.py
+
+      - name: Rename
+        shell: bash
+        run: mv dist/CCBU-Auto.exe "dist/润物细无声-${{ steps.version.outputs.VERSION }}-Windows.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CCBU-Auto-Windows
-          path: |
-            dist/CCBU-Auto.exe
-            dist/CCBU-Auto-GUI.exe
+          name: windows
+          path: dist/*.exe
 
   # ── macOS ──
   build-macos:
@@ -55,6 +58,10 @@ jobs:
           pip3 install -r requirements.txt
           pip3 install pyinstaller
 
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       - name: Create icon.icns
         run: |
           mkdir -p icon.iconset
@@ -72,8 +79,7 @@ jobs:
           rm -rf icon.iconset
 
       - name: Build GUI .app
-        run: |
-          pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --name="润物细无声" gui.py
+        run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --name="润物细无声" gui.py
 
       - name: Create DMG
         run: |
@@ -83,38 +89,31 @@ jobs:
           hdiutil create -volname "润物细无声" \
             -srcfolder dmg-dist \
             -ov -format UDZO \
-            "dist/润物细无声.dmg"
+            "dist/润物细无声-${{ steps.version.outputs.VERSION }}-macOS.dmg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CCBU-Auto-macOS
-          path: |
-            dist/润物细无声.dmg
-            dist/润物细无声.app
+          name: macos
+          path: dist/*.dmg
 
   # ── Release ──
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
-      - name: Download Windows artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: CCBU-Auto-Windows
-          path: dist-windows
+          path: artifacts
 
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: CCBU-Auto-macOS
-          path: dist-macos
+      - name: List files
+        run: find artifacts -type f
 
-      - name: Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist-windows/CCBU-Auto.exe
-            dist-windows/CCBU-Auto-GUI.exe
-            dist-macos/润物细无声.dmg
+          generate_release_notes: true
+          files: artifacts/**/*
