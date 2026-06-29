@@ -185,8 +185,7 @@ class CCBULearner:
     async def init(self, log_callback=None, chrome_path=""):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
 
-        # PyInstaller 打包后，设置 PLAYWRIGHT_BROWSERS_PATH=0 让 Playwright
-        # 在可执行文件同目录下查找浏览器（打包时已用此变量安装浏览器到本地）
+        # PyInstaller 打包后，让 Playwright 在可执行文件目录查找浏览器
         if getattr(sys, 'frozen', False):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 
