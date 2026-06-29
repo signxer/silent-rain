@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build
 
 on:
   push:
@@ -7,7 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ── Windows ──
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,15 +33,88 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CCBU-Auto
+          name: CCBU-Auto-Windows
           path: |
             dist/CCBU-Auto.exe
             dist/CCBU-Auto-GUI.exe
 
+  # ── macOS ──
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
+          pip3 install pyinstaller
+
+      - name: Create icon.icns
+        run: |
+          mkdir -p icon.iconset
+          sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32 icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64 icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256 icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512 icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512 icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o icon.icns
+          rm -rf icon.iconset
+
+      - name: Build GUI .app
+        run: |
+          pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --name="润物细无声" gui.py
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg-dist
+          cp -r "dist/润物细无声.app" dmg-dist/
+          ln -sf /Applications dmg-dist/Applications
+          hdiutil create -volname "润物细无声" \
+            -srcfolder dmg-dist \
+            -ov -format UDZO \
+            "dist/润物细无声.dmg"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCBU-Auto-macOS
+          path: |
+            dist/润物细无声.dmg
+            dist/润物细无声.app
+
+  # ── Release ──
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: CCBU-Auto-Windows
+          path: dist-windows
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: CCBU-Auto-macOS
+          path: dist-macos
+
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/CCBU-Auto.exe
-            dist/CCBU-Auto-GUI.exe
+            dist-windows/CCBU-Auto.exe
+            dist-windows/CCBU-Auto-GUI.exe
+            dist-macos/润物细无声.dmg
