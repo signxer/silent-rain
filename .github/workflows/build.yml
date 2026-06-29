@@ -83,46 +83,35 @@ jobs:
           iconutil -c icns icon.iconset -o icon.icns
           rm -rf icon.iconset
 
-      - name: Create macOS bundle
+      - name: Install Playwright browsers locally
         run: |
-          mkdir -p CCBU-Auto.app/Contents/MacOS
-          mkdir -p CCBU-Auto.app/Contents/Resources
-          cp gui.py main.py requirements.txt 启动器.py icon.png CCBU-Auto.app/Contents/Resources/
+          export PLAYWRIGHT_BROWSERS_PATH=0
+          python3 -m playwright install chromium
 
-          # 启动脚本：用 open -a Terminal 在终端中运行，用户能看到输出和错误
-          cat > CCBU-Auto.app/Contents/MacOS/CCBU-Auto << 'EOF'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
-          open -a Terminal "$DIR/启动器.py"
-          EOF
-          chmod +x CCBU-Auto.app/Contents/MacOS/CCBU-Auto
-
-          # 同时放一个可双击的 .command 文件
-          cat > CCBU-Auto.app/Contents/Resources/start.command << 'EOF'
-          #!/bin/bash
-          cd "$(dirname "$0")"
-          python3 启动器.py
-          read -p "按回车关闭..."
-          EOF
-          chmod +x CCBU-Auto.app/Contents/Resources/start.command
-
-          cat > CCBU-Auto.app/Contents/Info.plist << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key><string>CCBU-Auto</string>
-            <key>CFBundleIconFile</key><string>icon</string>
-            <key>CFBundleName</key><string>CCBU-Auto</string>
-            <key>CFBundleIdentifier</key><string>com.ccbu.auto</string>
-            <key>CFBundleVersion</key><string>1.0</string>
-          </dict>
-          </plist>
-          EOF
+      - name: Build GUI .app
+        run: |
+          export PLAYWRIGHT_BROWSERS_PATH=0
+          pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --name=CCBU-Auto gui.py
 
       - name: Create DMG
         run: |
           mkdir -p dmg-dist dist
+          # 创建 .app 包装
+          mkdir -p CCBU-Auto.app/Contents/MacOS
+          mkdir -p CCBU-Auto.app/Contents/Resources
+          cp dist/CCBU-Auto CCBU-Auto.app/Contents/MacOS/
+          cp icon.png CCBU-Auto.app/Contents/Resources/
+          cat > CCBU-Auto.app/Contents/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>CCBU-Auto</string>
+          <key>CFBundleIconFile</key><string>icon</string>
+          <key>CFBundleName</key><string>CCBU-Auto</string>
+          <key>CFBundleIdentifier</key><string>com.ccbu.auto</string>
+          <key>CFBundleVersion</key><string>1.0</string>
+          </dict></plist>
+          EOF
           cp -r CCBU-Auto.app dmg-dist/
           ln -sf /Applications dmg-dist/Applications
           hdiutil create -volname CCBU-Auto -srcfolder dmg-dist -ov -format UDZO dist/CCBU-Auto-${{ steps.version.outputs.VERSION }}-macOS.dmg
