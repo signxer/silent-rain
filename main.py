@@ -235,7 +235,6 @@ class CCBULearner:
         _kill_playwright_chrome()
 
         self.playwright = await async_playwright().start()
-        import sys
         launch_opts = {"headless": self.headless}
         use_system_chrome = False
 
