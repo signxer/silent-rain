@@ -26,6 +26,17 @@ playwright install chromium
 
 Mac 用户也可运行 `./setup.sh` 一键安装。
 
+### 下载打包版本
+
+从 [Releases](https://github.com/signxer/CCBU-Auto/releases) 下载对应平台的可执行文件。
+
+**首次运行前**需要先安装 Playwright 浏览器引擎：
+
+```bash
+pip3 install playwright
+playwright install chromium
+```
+
 ## 使用
 
 ### GUI 界面（推荐）

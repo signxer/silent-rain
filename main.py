@@ -185,15 +185,35 @@ class CCBULearner:
     async def init(self, log_callback=None, chrome_path=""):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
 
+        # PyInstaller 打包后，Playwright 内嵌的驱动会损坏
+        # 需要指向系统安装的 Playwright 浏览器目录
+        if getattr(sys, 'frozen', False):
+            import platform as _plat
+            if _plat.system() == "Darwin":
+                _browser_cache = os.path.expanduser("~/Library/Caches/ms-playwright")
+            elif _plat.system() == "Windows":
+                _browser_cache = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+            else:
+                _browser_cache = os.path.expanduser("~/.cache/ms-playwright")
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _browser_cache
+
         # 检查 Playwright 浏览器是否已安装
         try:
             self.playwright = await async_playwright().start()
-            # 尝试启动一次来检测浏览器是否存在
             test_browser = await self.playwright.chromium.launch(headless=True)
             await test_browser.close()
         except Exception as e:
-            if "Executable doesn't exist" in str(e) or "Browser" in str(e):
-                _log("首次运行，正在安装 Chromium 浏览器（约 200MB）...", "blue")
+            err_msg = str(e)
+            if "Connection closed" in err_msg or "driver" in err_msg.lower():
+                # PyInstaller 打包的驱动损坏，需要用户先安装 playwright
+                _log("Playwright 驱动异常，请在终端运行以下命令：", "red")
+                if sys.platform == "win32":
+                    _log("  pip install playwright && playwright install chromium", "yellow")
+                else:
+                    _log("  pip3 install playwright && playwright install chromium", "yellow")
+                raise RuntimeError("Playwright driver not found")
+            elif "Executable doesn't exist" in err_msg or "Browser" in err_msg:
+                _log("首次运行，正在安装 Chromium 浏览器...", "blue")
                 import subprocess
                 try:
                     proc = await asyncio.create_subprocess_exec(
