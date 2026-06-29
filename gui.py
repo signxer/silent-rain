@@ -104,18 +104,26 @@ class ConfigScreen(QWidget):
         workers_card = HeaderCardWidget(self)
         workers_card.setTitle("工作线程数")
         workers_card.setBorderRadius(8)
-        w_layout = QVBoxLayout()
+        w_layout = QHBoxLayout()
         w_layout.setSpacing(12)
+        w_layout.setContentsMargins(0, 8, 0, 8)
 
         self.spin_workers = SpinBox()
         self.spin_workers.setRange(1, 20)
         self.spin_workers.setValue(self._saved.get("workers", 1))
-        self.spin_workers.setFixedWidth(200)
-        w_label = BodyLabel("同时学习的课程数量，建议 3-10")
-        w_label.setForegroundRole(self.palette().PlaceholderText)
+        self.spin_workers.setFixedWidth(120)
         w_layout.addWidget(self.spin_workers)
-        w_layout.addWidget(w_label)
-        workers_card.viewLayout.addLayout(w_layout)
+        w_layout.addWidget(BodyLabel("个线程"))
+        w_layout.addStretch()
+
+        w_hint = CaptionLabel("同时学习的课程数量，建议 3-10")
+        w_hint.setForegroundRole(self.palette().PlaceholderText)
+
+        w_container = QVBoxLayout()
+        w_container.setSpacing(4)
+        w_container.addLayout(w_layout)
+        w_container.addWidget(w_hint)
+        workers_card.viewLayout.addLayout(w_container)
         layout.addWidget(workers_card)
 
         # Headless card
@@ -142,7 +150,7 @@ class ConfigScreen(QWidget):
         browser_card.setTitle("浏览器引擎")
         browser_card.setBorderRadius(8)
         b_layout = QVBoxLayout()
-        b_layout.setSpacing(10)
+        b_layout.setSpacing(8)
         b_layout.setContentsMargins(0, 8, 0, 8)
 
         # Windows 默认 chrome，其他默认 chromium
@@ -150,27 +158,27 @@ class ConfigScreen(QWidget):
         default_browser = "chrome" if platform.system() == "Windows" else "chromium"
         saved_browser = self._saved.get("browser", default_browser)
 
-        radio_row = QHBoxLayout()
         self.radio_chrome = RadioButton("本地 Chrome")
         self.radio_chromium = RadioButton("内置 Chromium")
         if saved_browser == "chrome":
             self.radio_chrome.setChecked(True)
         else:
             self.radio_chromium.setChecked(True)
-        radio_row.addWidget(self.radio_chrome)
-        radio_row.addWidget(self.radio_chromium)
-        radio_row.addStretch()
-        b_layout.addLayout(radio_row)
+        b_layout.addWidget(self.radio_chrome)
+        b_layout.addWidget(self.radio_chromium)
 
         # Chrome 路径输入（可选）
         self.chrome_path_widget = QWidget()
-        path_row = QHBoxLayout(self.chrome_path_widget)
-        path_row.setContentsMargins(0, 0, 0, 0)
-        path_row.addWidget(BodyLabel("Chrome路径:"))
+        path_layout = QHBoxLayout(self.chrome_path_widget)
+        path_layout.setContentsMargins(24, 4, 0, 0)
+        path_layout.setSpacing(8)
+        path_layout.addWidget(BodyLabel("路径:"))
         self.input_chrome_path = LineEdit()
-        self.input_chrome_path.setPlaceholderText("留空则自动检测")
+        self.input_chrome_path.setPlaceholderText("留空自动检测")
         self.input_chrome_path.setText(self._saved.get("chrome_path", ""))
-        path_row.addWidget(self.input_chrome_path)
+        self.input_chrome_path.setFixedWidth(280)
+        path_layout.addWidget(self.input_chrome_path)
+        path_layout.addStretch()
         b_layout.addWidget(self.chrome_path_widget)
         self.chrome_path_widget.setVisible(saved_browser == "chrome")
 
