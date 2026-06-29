@@ -825,6 +825,23 @@ class DashboardScreen(QWidget):
                 return
             log("登录成功", "green")
 
+            # 登录后立即检查学时，已完成则直接退出
+            if cfg_goal_hours > 0:
+                log("正在检查当前学时...", "blue")
+                try:
+                    _h = await learner._get_study_hours(learner.pages[0])
+                    _cur = _h.get(cfg_goal_type, 0)
+                    type_name = "集中培训" if cfg_goal_type == "central" else "网络自学"
+                    log(f"当前{type_name}: {_cur:.1f}/{cfg_goal_hours:.0f} 学时", "blue")
+                    # 推送学时到GUI
+                    hours_cb(_h)
+                    if _cur >= cfg_goal_hours:
+                        log(f"已达到学习目标 ({_cur:.1f} ≥ {cfg_goal_hours:.0f})，无需学习", "bold green")
+                        thread.done_signal.emit(0, 0)
+                        return
+                except Exception as e:
+                    log(f"学时检查失败(继续学习): {e}", "yellow")
+
             # 手动模式：直接从指定URL学习
             if cfg_mode == "manual":
                 log(f"手动模式：{len(cfg_manual_urls)} 个URL", "blue")
