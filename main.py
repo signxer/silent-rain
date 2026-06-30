@@ -2848,6 +2848,8 @@ class CCBULearner:
                                 completed_ws_ids.add(ws_id)
                                 self.mark_workshop_completed(ws_id)
                         update_status(w_id, status="✓ 完成", progress="100%")
+                        if log_callback:
+                            log_callback(f"[线程{w_id+1}] 完成: {title}", "green")
 
                     # 7) 完成一门课后更新学时
                     try:
@@ -2932,6 +2934,8 @@ class CCBULearner:
                         study_hours_info.update(_info)
                         if hours_callback:
                             hours_callback(_info)
+                        if log_callback:
+                            log_callback(f"学时更新: 集中{_info['central']:.1f} 网络{_info['online']:.1f}", "blue")
                         # 定时检查目标学时（避免因平台统计延迟导致多学）
                         if self.study_goal > 0:
                             _cur = _h.get(self.goal_type, 0)
