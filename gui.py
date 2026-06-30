@@ -8,9 +8,9 @@ import sys
 import threading
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QSize, QTimer, QEventLoop
-from PyQt5.QtGui import QColor, QFont, QIcon
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QEventLoop
+from PySide6.QtGui import QColor, QFont, QIcon
+from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QSpacerItem,
@@ -196,7 +196,7 @@ class ConfigScreen(QWidget):
         layout.addLayout(btn_layout)
 
     def _browse_chrome(self):
-        from PyQt5.QtWidgets import QFileDialog
+        from PySide6.QtWidgets import QFileDialog
         import platform
         if platform.system() == "Windows":
             default_dir = r"C:\Program Files\Google\Chrome\Application"
@@ -1447,7 +1447,7 @@ class DashboardScreen(QWidget):
         InfoBar.success("完成", f"学习流程结束，成功 {success} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_tag_request(self, tags_by_category):
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QWidget
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QWidget
 
         # 加载上次选择
         saved_tags = set()
@@ -1559,8 +1559,8 @@ class DashboardScreen(QWidget):
 
     def _on_tag_confirm(self, saved_tags, tags_by_category):
         """有已保存标签时，询问用户：使用已保存 / 重新选择 / 跳过"""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
-        from PyQt5.QtCore import QTimer
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
+        from PySide6.QtCore import QTimer
 
         TIMEOUT = 10  # 秒
 
@@ -1644,8 +1644,8 @@ class DashboardScreen(QWidget):
 
     def _on_page_confirm(self, last_page):
         """询问是否从上次保存的页码继续"""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
-        from PyQt5.QtCore import QTimer
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
+        from PySide6.QtCore import QTimer
 
         TIMEOUT = 10
 
@@ -1708,7 +1708,7 @@ class DashboardScreen(QWidget):
 # ─── Main Window ───────────────────────────────────────────────────
 
 if sys.platform == "darwin":
-    from PyQt5.QtWidgets import QMainWindow, QStackedWidget
+    from PySide6.QtWidgets import QMainWindow, QStackedWidget
 
     class _BaseWindow(QMainWindow):
         """macOS原生窗口：交通灯在左侧，不使用无边框方案"""
@@ -1931,7 +1931,7 @@ def main():
     app = QApplication(sys.argv)
 
     # 平台适配字体
-    from PyQt5.QtGui import QFont
+    from PySide6.QtGui import QFont
     if platform.system() == "Darwin":
         font_family = "PingFang SC"
     elif platform.system() == "Windows":
