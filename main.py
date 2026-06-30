@@ -2925,7 +2925,8 @@ class CCBULearner:
                 if now - last_hours_check >= HOURS_CHECK_INTERVAL:
                     last_hours_check = now
                     try:
-                        _h = await self._get_study_hours(hours_page)
+                        _h = await asyncio.wait_for(
+                            self._get_study_hours(hours_page), timeout=30)
                         _info = {
                             "central": _h.get("central", 0),
                             "online": _h.get("online", 0),
