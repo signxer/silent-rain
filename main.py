@@ -2885,7 +2885,7 @@ class CCBULearner:
         from rich.live import Live
         # 启动前先查询一次学时
         try:
-            _h = await self._get_study_hours(self.pages[0])
+            _h = await self._get_study_hours(hours_page)
             _info = {
                 "central": _h.get("central", 0),
                 "online": _h.get("online", 0),
@@ -2896,6 +2896,12 @@ class CCBULearner:
                 hours_callback(_info)
         except:
             pass
+
+        # 创建独立页面用于定时查询学时（不与worker冲突）
+        try:
+            hours_page = await self.context.new_page()
+        except:
+            hours_page = self.pages[0]
 
         # 启动所有 worker
         tasks = []
@@ -2917,7 +2923,7 @@ class CCBULearner:
                 if now - last_hours_check >= HOURS_CHECK_INTERVAL:
                     last_hours_check = now
                     try:
-                        _h = await self._get_study_hours(self.pages[0])
+                        _h = await self._get_study_hours(hours_page)
                         _info = {
                             "central": _h.get("central", 0),
                             "online": _h.get("online", 0),
