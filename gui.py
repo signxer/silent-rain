@@ -1239,14 +1239,16 @@ class DashboardScreen(QWidget):
                     _fetched_page = 0
 
                     async def fetch_more_courses(queue):
-                        nonlocal _fetched_page
+                        nonlocal _fetched_page, no_more_pages
                         if no_more_pages:
+                            log("无更多页，停止采集", "yellow")
                             return 0
                         async with _fetch_lock:
                             if no_more_pages:
                                 return 0
                             if queue.qsize() > 0:
                                 return 0
+                            log("课程池空了，自动翻页采集...", "blue")
                             # 检查当前阶段目标是否已达成
                             if phase_goal_hours > 0 and hours_page:
                                 try:
@@ -1265,6 +1267,7 @@ class DashboardScreen(QWidget):
                                 pass
                             moved = await learner.go_to_next_page(_collect_page)
                             if not moved:
+                                log("已到最后一页", "yellow")
                                 no_more_pages = True
                                 return 0
                             nonlocal page_num
