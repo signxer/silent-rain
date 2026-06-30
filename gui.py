@@ -1925,10 +1925,12 @@ def main():
     multiprocessing.freeze_support()
     # 抑制 Qt 字体警告
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
-    # 全局禁用 Segoe UI 等不存在的字体回退
-    os.environ["QT_FONT_DPI"] = "96"
+    # macOS 高DPI支持
+    if platform.system() == "Darwin":
+        os.environ.pop("QT_FONT_DPI", None)
 
     app = QApplication(sys.argv)
+    app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     # 平台适配字体
     from PySide6.QtGui import QFont
