@@ -70,7 +70,7 @@ class AsyncThread(QThread):
 
 # ─── Version & Update Check ────────────────────────────────────────
 
-CURRENT_VERSION = "1.4.1"
+CURRENT_VERSION = "1.4.2"
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 
 
