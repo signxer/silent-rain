@@ -26,11 +26,13 @@ jobs:
       - name: Get version
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          echo "${GITHUB_REF_NAME#v}" > VERSION
 
       - name: Build GUI EXE
         shell: bash
-        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --name=Moisten gui.py
+        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;VERSION;." --name=Moisten gui.py
 
       - name: Rename
         shell: bash
@@ -61,7 +63,9 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          echo "${GITHUB_REF_NAME#v}" > VERSION
 
       - name: Create icon.icns
         run: |
@@ -92,7 +96,7 @@ jobs:
           "
 
       - name: Build GUI .app
-        run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --name=Moisten gui.py
+        run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --add-data="VERSION:." --name=Moisten gui.py
 
       - name: Create DMG
         run: |

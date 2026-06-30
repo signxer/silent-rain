@@ -70,7 +70,19 @@ class AsyncThread(QThread):
 
 # ─── Version & Update Check ────────────────────────────────────────
 
-CURRENT_VERSION = "1.4.2"
+def _get_version():
+    """获取版本号：环境变量 > VERSION文件 > 默认"""
+    # 构建时通过环境变量注入
+    v = os.environ.get("MOISTEN_VERSION", "")
+    if v:
+        return v.lstrip("v")
+    # 从VERSION文件读取
+    vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    if os.path.exists(vf):
+        return open(vf).read().strip().lstrip("v")
+    return "dev"
+
+CURRENT_VERSION = _get_version()
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 
 
