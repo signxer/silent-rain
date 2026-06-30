@@ -202,26 +202,27 @@ class CCBULearner:
                     _log("  pip3 install playwright && python3 -m playwright install chromium", "yellow")
             raise
 
-        # 检测浏览器是否可用
-        try:
-            test_browser = await self.playwright.chromium.launch(headless=True)
-            await test_browser.close()
-        except Exception as e:
-            err_msg = str(e)
-            if "Executable doesn't exist" in err_msg or "Browser" in err_msg:
-                if getattr(sys, 'frozen', False):
-                    # 打包版：不能自动安装，提示用户手动操作
-                    _log("未找到 Chromium 浏览器，请在终端运行：", "red")
-                    if sys.platform == "win32":
-                        _log("  pip install playwright && python -m playwright install chromium", "yellow")
+        # 检测内置 Chromium 是否可用（仅在使用内置 Chromium 时检测）
+        if self.browser_type != "chrome":
+            try:
+                test_browser = await self.playwright.chromium.launch(headless=True)
+                await test_browser.close()
+            except Exception as e:
+                err_msg = str(e)
+                if "Executable doesn't exist" in err_msg or "Browser" in err_msg:
+                    if getattr(sys, 'frozen', False):
+                        _log("未找到 Chromium 浏览器，请在终端运行：", "red")
+                        if sys.platform == "win32":
+                            _log("  pip install playwright && python -m playwright install chromium", "yellow")
+                        else:
+                            _log("  pip3 install playwright && python3 -m playwright install chromium", "yellow")
+                        raise RuntimeError("Chromium not installed")
                     else:
-                        _log("  pip3 install playwright && python3 -m playwright install chromium", "yellow")
-                    raise RuntimeError("Chromium not installed")
+                        _log("首次运行，正在安装 Chromium 浏览器...", "blue")
+                        import subprocess
+                        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
                 else:
-                    # 源码运行：自动安装
-                    _log("首次运行，正在安装 Chromium 浏览器...", "blue")
-                    import subprocess
-                    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+                    raise
             else:
                 raise
 
