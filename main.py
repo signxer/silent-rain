@@ -70,11 +70,11 @@ if getattr(sys, 'frozen', False):
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-STORAGE_STATE_PATH = os.path.join(_BASE_DIR, "ccbu_session.json")
-USER_CREDENTIALS_PATH = os.path.join(_BASE_DIR, "ccbu_credentials.json")
-TAGS_STATE_PATH = os.path.join(_BASE_DIR, "ccbu_tags.json")
-CONFIG_PATH = os.path.join(_BASE_DIR, "ccbu_config.json")
-PROGRESS_PATH = os.path.join(_BASE_DIR, "ccbu_progress.json")
+STORAGE_STATE_PATH = os.path.join(_BASE_DIR, "moisten_session.json")
+USER_CREDENTIALS_PATH = os.path.join(_BASE_DIR, "moisten_credentials.json")
+TAGS_STATE_PATH = os.path.join(_BASE_DIR, "moisten_tags.json")
+CONFIG_PATH = os.path.join(_BASE_DIR, "moisten_config.json")
+PROGRESS_PATH = os.path.join(_BASE_DIR, "moisten_progress.json")
 
 
 def safe_print(text, style=None):

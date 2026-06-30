@@ -1,9 +1,11 @@
 # 运行时数据
-ccbu_session.json
-ccbu_credentials.json
-ccbu_config.json
-ccbu_progress.json
-ccbu_tags.json
+moisten_session.json
+moisten_credentials.json
+moisten_config.json
+moisten_progress.json
+moisten_tags.json
+moisten_debug.log
+ccbu_*.json
 ccbu_debug.log
 
 # Python
