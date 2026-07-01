@@ -155,14 +155,20 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           VER="${TAG#v}"
-          # 读取CHANGELOG中当前版本的更新内容
-          NOTES=""
-          if [ -f CHANGELOG.md ]; then
-            NOTES=$(awk "/^## ${VER}/{found=1; next} /^## [0-9]/{found=0} found" CHANGELOG.md)
+          # 从git commits自动生成更新日志
+          PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1)
+          if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TAG" ]; then
+            NOTES=$(git log ${PREV_TAG}..${TAG} --pretty=format:"- %s" --no-merges | head -20)
+          else
+            NOTES=$(git log --pretty=format:"- %s" --no-merges -10)
           fi
-          if [ -z "$NOTES" ]; then
-            NOTES="详见更新日志"
-          fi
+          # 更新CHANGELOG.md
+          echo -e "\n## ${VER}\n${NOTES}\n$(cat CHANGELOG.md)" > CHANGELOG.md
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || git commit -m "docs: CHANGELOG ${VER}"
+          git push || true
           # 创建release
           gh release create "${TAG}" \
             --repo signxer/Moisten \
