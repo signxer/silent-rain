@@ -1293,11 +1293,11 @@ class DashboardScreen(QWidget):
                             if queue.qsize() > 0:
                                 return 0
                             log("课程池空了，自动翻页采集...", "blue")
-                            # 检查目标是否已达成
-                            if phase_goal_hours > 0 and hours_page:
+                            # 检查目标是否已达成（用绝对目标值比较）
+                            if learner.study_goal > 0 and hours_page:
                                 try:
                                     _h = await learner._get_study_hours(hours_page)
-                                    if _h.get(phase_goal_type, 0) >= phase_goal_hours:
+                                    if _h.get(phase_goal_type, 0) >= learner.study_goal:
                                         log(f"✓ {type_name}目标已达成!", "bold green")
                                         return 0
                                 except:
