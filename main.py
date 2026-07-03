@@ -1744,6 +1744,12 @@ class AutoLearner:
         # 从表格提取全部课程信息（不含URL，URL由collector动态采集）
         courses = []
         try:
+            # 检查页面是否在正确的URL上
+            current_url = page.url
+            if "workshop" not in current_url and "detail" not in current_url:
+                debug(f"  页面不在专题班详情页: {current_url}")
+                return []
+
             debug("正在获取课程列表...")
             # 等待表格tbody有数据行（API异步加载）
             for _wait in range(6):
@@ -1908,8 +1914,17 @@ class AutoLearner:
                            wait_until="domcontentloaded", timeout=20000)
             await _page.wait_for_timeout(8000)
             text = await _page.locator("body").inner_text(timeout=5000)
+            # 读取完毕立即关闭，不等finally
+            try:
+                await _page.close()
+                _page = None
+            except:
+                pass
         except Exception as _ex:
             debug(f"学习中心加载失败: {_ex}")
+            if _page:
+                try: await _page.close()
+                except: pass
             return {"central": 0, "online": 0, "total": 0}
         finally:
             if _page:
