@@ -1334,8 +1334,9 @@ class DashboardScreen(QWidget):
                         async with _fetch_lock:
                             if no_more_pages:
                                 return 0
+                            # 队列有其他worker补充的课程，不算空
                             if queue.qsize() > 0:
-                                return 0
+                                return queue.qsize()
                             log("课程池空了，自动翻页采集...", "blue")
                             # 检查目标是否已达成（用绝对目标值比较）
                             if learner.study_goal > 0:
