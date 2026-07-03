@@ -1965,6 +1965,13 @@ class MainWindow(_BaseWindow):
                     creds = json.load(f)
                 self.cfg_username = creds.get("username", "")
                 self.cfg_password = creds.get("password", "")
+                # 解密密码
+                if self.cfg_password:
+                    try:
+                        from main import CCBULearner
+                        self.cfg_password = CCBULearner._xor_decrypt(self.cfg_password)
+                    except:
+                        pass
             return bool(self.cfg_username)
         except:
             return False
