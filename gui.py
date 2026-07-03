@@ -1892,6 +1892,16 @@ else:
 
 
 class MainWindow(_BaseWindow):
+    def closeEvent(self, event):
+        """关闭窗口时二次确认"""
+        dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
+        dlg.cancelButton.setText("取消")
+        dlg.yesButton.setText("退出")
+        if dlg.exec():
+            event.accept()
+        else:
+            event.ignore()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("润物 Moisten")
