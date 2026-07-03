@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QSpacerItem,
     QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
+    QLabel,
 )
 
 from qfluentwidgets import (
