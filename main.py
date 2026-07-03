@@ -617,17 +617,21 @@ class CCBULearner:
             }}""")
             await asyncio.sleep(0.5)
             
-            # 点击登录按钮
+            # 点击登录按钮（用JS点击，headless更可靠）
             console.print("正在点击登录按钮...", style="blue")
-            login_button = page.get_by_role("button", name="登录")
-            
-            # 等待登录按钮可点击
-            try:
-                await login_button.wait_for(state="enabled", timeout=10000)
-            except:
-                pass
-            
-            await login_button.click()
+            await asyncio.sleep(1)
+            await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button');
+                for (const btn of btns) {
+                    if (btn.innerText && btn.innerText.includes('登录')) {
+                        btn.click();
+                        return;
+                    }
+                }
+                // 兜底：找type=submit的按钮
+                const submit = document.querySelector('button[type="submit"]');
+                if (submit) submit.click();
+            }""")
             
             # 等待登录成功后保存凭证
             if not use_saved:
