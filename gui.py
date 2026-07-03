@@ -1098,18 +1098,12 @@ class DashboardScreen(QWidget):
                 thread.done_signal.emit(0, 0)
                 return
 
-            # 创建独立页面用于学时查询（不能用主页面，否则会污染导航状态）
-            try:
-                hours_page = await learner.context.new_page()
-            except:
-                hours_page = None
-
             # 登录后立即检查学时
             cur_hours = {"central": 0, "online": 0}
-            if (cfg_central_goal > 0 or cfg_online_goal > 0) and hours_page:
+            if cfg_central_goal > 0 or cfg_online_goal > 0:
                 log("正在检查当前学时...", "blue")
                 try:
-                    _h = await learner._get_study_hours(hours_page)
+                    _h = await learner._get_study_hours()
                     cur_hours = {"central": _h.get("central", 0), "online": _h.get("online", 0)}
                     log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
                     hours_cb(_h)
@@ -1279,7 +1273,7 @@ class DashboardScreen(QWidget):
                 # study_goal 是绝对目标值（当前学时 + 还需学时）
                 # phase_goal_hours 是"还需"的值，需要加上当前学时
                 try:
-                    _cur = (await learner._get_study_hours(hours_page)).get(phase_goal_type, 0) if hours_page else 0
+                    _cur = (await learner._get_study_hours()).get(phase_goal_type, 0)
                     learner.study_goal = _cur + phase_goal_hours
                 except:
                     learner.study_goal = phase_goal_hours
@@ -1344,9 +1338,9 @@ class DashboardScreen(QWidget):
                                 return 0
                             log("课程池空了，自动翻页采集...", "blue")
                             # 检查目标是否已达成（用绝对目标值比较）
-                            if learner.study_goal > 0 and hours_page:
+                            if learner.study_goal > 0:
                                 try:
-                                    _h = await learner._get_study_hours(hours_page)
+                                    _h = await learner._get_study_hours()
                                     if _h.get(phase_goal_type, 0) >= learner.study_goal:
                                         log(f"✓ {type_name}目标已达成!", "bold green")
                                         return 0

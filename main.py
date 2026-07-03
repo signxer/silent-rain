@@ -1891,16 +1891,24 @@ class CCBULearner:
                      style="bold blue")
 
 
-    async def _get_study_hours(self, page) -> dict:
-        # 从学习中心获取今年的培训学时
+    async def _get_study_hours(self, page=None) -> dict:
+        # 从学习中心获取今年的培训学时（每次创建新页面，避免被关闭）
+        _page = None
         try:
-            await page.goto("https://u.ccb.com/portal/#/studyCenter",
+            _page = await self.context.new_page()
+            await _page.goto("https://u.ccb.com/portal/#/studyCenter",
                            wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(8000)
-            text = await page.locator("body").inner_text(timeout=5000)
+            await _page.wait_for_timeout(8000)
+            text = await _page.locator("body").inner_text(timeout=5000)
         except Exception as _ex:
             debug(f"学习中心加载失败: {_ex}")
             return {"central": 0, "online": 0, "total": 0}
+        finally:
+            if _page:
+                try:
+                    await _page.close()
+                except:
+                    pass
         
         import re as _re
         central = 0.0
