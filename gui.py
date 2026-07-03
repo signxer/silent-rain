@@ -617,32 +617,7 @@ class GoalScreen(QWidget):
         self._on_done(central_on, central, central_mode, online_on, online, online_mode)
 
     def _on_done(self, central_on, central_goal, central_mode, online_on, online_goal, online_mode):
-        # 差额模式：立即算出绝对目标，存为target模式，避免重启后重复叠加
-        # 需要查询当前学时来计算
-        try:
-            from main import AutoLearner
-            tmp = AutoLearner(headless=True, workers=1)
-            # 同步获取学时（简化处理，用已保存的值或0）
-            cfg_old = {}
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    cfg_old = json.load(f)
-            cur_central = cfg_old.get("_last_central_hours", 0)
-            cur_online = cfg_old.get("_last_online_hours", 0)
-
-            if central_on and central_mode == "remain" and central_goal > 0:
-                central_goal = cur_central + central_goal
-                central_mode = "target"
-            if online_on and online_mode == "remain" and online_goal > 0:
-                online_goal = cur_online + online_goal
-                online_mode = "target"
-        except:
-            # 出错时强制转为target模式，避免remain模式重启后重复叠加
-            if central_mode == "remain":
-                central_mode = "target"
-            if online_mode == "remain":
-                online_mode = "target"
-
+        # 直接保存原始值，差额模式在仪表盘登录后获取学时时再算绝对目标
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -1118,7 +1093,18 @@ class DashboardScreen(QWidget):
                 try:
                     _h = await learner._get_study_hours()
                     cur_hours = {"central": _h.get("central", 0), "online": _h.get("online", 0)}
-                    log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
+                    # 如果获取失败（返回0），尝试用配置中保存的值
+                    if cur_hours["central"] == 0 and cur_hours["online"] == 0:
+                        cfg_old = {}
+                        if os.path.exists(CONFIG_PATH):
+                            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                                cfg_old = json.load(f)
+                        cur_hours["central"] = cfg_old.get("_last_central_hours", 0)
+                        cur_hours["online"] = cfg_old.get("_last_online_hours", 0)
+                        if cur_hours["central"] > 0 or cur_hours["online"] > 0:
+                            log(f"使用上次记录: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "yellow")
+                    else:
+                        log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
                     hours_cb(_h)
 
                     # 保存当前学时到配置（供差额模式计算绝对目标用）
