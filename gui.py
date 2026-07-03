@@ -605,6 +605,32 @@ class GoalScreen(QWidget):
         self._on_done(central_on, central, central_mode, online_on, online, online_mode)
 
     def _on_done(self, central_on, central_goal, central_mode, online_on, online_goal, online_mode):
+        # 差额模式：立即算出绝对目标，存为target模式，避免重启后重复叠加
+        # 需要查询当前学时来计算
+        try:
+            from main import CCBULearner
+            tmp = CCBULearner(headless=True, workers=1)
+            # 同步获取学时（简化处理，用已保存的值或0）
+            cfg_old = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg_old = json.load(f)
+            cur_central = cfg_old.get("_last_central_hours", 0)
+            cur_online = cfg_old.get("_last_online_hours", 0)
+
+            if central_on and central_mode == "remain" and central_goal > 0:
+                central_goal = cur_central + central_goal
+                central_mode = "target"
+            if online_on and online_mode == "remain" and online_goal > 0:
+                online_goal = cur_online + online_goal
+                online_mode = "target"
+        except:
+            # 出错时强制转为target模式，避免remain模式重启后重复叠加
+            if central_mode == "remain":
+                central_mode = "target"
+            if online_mode == "remain":
+                online_mode = "target"
+
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -1087,6 +1113,19 @@ class DashboardScreen(QWidget):
                     cur_hours = {"central": _h.get("central", 0), "online": _h.get("online", 0)}
                     log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
                     hours_cb(_h)
+
+                    # 保存当前学时到配置（供差额模式计算绝对目标用）
+                    try:
+                        cfg_save = {}
+                        if os.path.exists(CONFIG_PATH):
+                            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                                cfg_save = json.load(f)
+                        cfg_save["_last_central_hours"] = cur_hours["central"]
+                        cfg_save["_last_online_hours"] = cur_hours["online"]
+                        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                            json.dump(cfg_save, f, ensure_ascii=False, indent=2)
+                    except:
+                        pass
 
                     # 统一转成"还需学习多少"：
                     # target模式：总目标 - 已有 = 还需
