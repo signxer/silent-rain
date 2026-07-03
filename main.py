@@ -2338,7 +2338,15 @@ class AutoLearner:
                 except:
                     pass
                 try:
-                    # 直接goto导航到专题班详情页
+                    # 先访问主站加载token到localStorage（API需要）
+                    try:
+                        await cp.goto("https://u.ccb.com/portal/#/study",
+                                      wait_until="domcontentloaded", timeout=15000)
+                        await cp.wait_for_timeout(3000)
+                    except:
+                        pass
+
+                    # 导航到专题班详情页
                     ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
                     try:
                         await cp.goto(ws_url, wait_until="domcontentloaded", timeout=20000)
