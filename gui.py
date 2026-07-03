@@ -87,22 +87,33 @@ CURRENT_VERSION = _get_version()
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 
 
+RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/silent-rain/main/releases.json"
+REPO_NAME = "signxer/silent-rain"
+
+
 def check_for_update():
-    """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志)"""
+    """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志, 下载URL)"""
     try:
         req = urllib.request.Request(
-            "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json",
+            RELEASES_JSON_URL,
             headers={"User-Agent": "Moisten"}
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         latest = data.get("tag", "").lstrip("v")
         notes = data.get("notes", "")
+        # 构建下载URL
+        download_urls = {}
+        for asset in data.get("assets", []):
+            name = asset.get("name", "")
+            fname = asset.get("file", "")
+            if fname:
+                download_urls[name] = f"https://github.com/{REPO_NAME}/releases/download/{data.get('tag', '')}/{fname}"
         if latest and latest != CURRENT_VERSION:
-            return latest, True, notes
+            return latest, True, notes, download_urls
     except:
         pass
-    return CURRENT_VERSION, False, ""
+    return CURRENT_VERSION, False, "", {}
 
 
 # ─── Config Screen ─────────────────────────────────────────────────
@@ -1918,7 +1929,7 @@ class MainWindow(_BaseWindow):
     def _check_update(self):
         """检查是否有新版本"""
         try:
-            latest, needs_update, notes = check_for_update()
+            latest, needs_update, notes, download_urls = check_for_update()
             if needs_update:
                 msg = f"当前版本: v{CURRENT_VERSION}\n最新版本: v{latest}"
                 if notes:
@@ -1929,12 +1940,98 @@ class MainWindow(_BaseWindow):
                     self
                 )
                 dlg.cancelButton.setText("稍后")
-                dlg.yesButton.setText("前往下载")
+                dlg.yesButton.setText("立即更新")
                 if dlg.exec():
-                    import webbrowser
-                    webbrowser.open(DOWNLOAD_URL)
+                    self._do_update(download_urls)
         except:
             pass
+
+    def _do_update(self, download_urls):
+        """下载新版本并替换自己"""
+        import platform as _plat
+        from PySide6.QtWidgets import QProgressDialog
+
+        # 选择对应平台的下载链接
+        if _plat.system() == "Windows":
+            url = download_urls.get("Windows", "")
+        else:
+            url = download_urls.get("macOS", "")
+
+        if not url:
+            InfoBar.warning("提示", "未找到对应平台的下载链接", parent=self, position=InfoBarPosition.TOP)
+            import webbrowser
+            webbrowser.open(DOWNLOAD_URL)
+            return
+
+        # 下载进度对话框
+        progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        progress.setWindowTitle("更新中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def do_download():
+            try:
+                import tempfile
+                filename = url.split("/")[-1]
+                download_path = os.path.join(tempfile.gettempdir(), filename)
+
+                req = urllib.request.Request(url, headers={"User-Agent": "Moisten"})
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    total = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    with open(download_path, "wb") as f:
+                        while True:
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = int(downloaded / total * 100)
+                                # 信号更新进度（跨线程）
+                                from PySide6.QtCore import QMetaObject, Q_ARG
+                                QMetaObject.invokeMethod(progress, "setValue", Qt.QueuedConnection, Q_ARG(int, pct))
+
+                # 下载完成，替换自己
+                self._apply_update(download_path)
+
+            except Exception as e:
+                InfoBar.error("更新失败", str(e), parent=self, position=InfoBarPosition.TOP)
+            finally:
+                progress.close()
+
+        import threading
+        threading.Thread(target=do_download, daemon=True).start()
+
+    def _apply_update(self, download_path):
+        """用下载的文件替换自己"""
+        import platform as _plat
+        import shutil
+        import subprocess
+
+        if _plat.system() == "Windows":
+            # Windows: 重命名当前exe，复制新的，重启
+            current = sys.executable
+            if current.endswith(".exe"):
+                old_path = current + ".old"
+                try:
+                    os.rename(current, old_path)
+                    shutil.copy2(download_path, current)
+                    InfoBar.success("更新完成", "重启生效", parent=self, position=InfoBarPosition.TOP)
+                    # 启动新版本
+                    subprocess.Popen([current])
+                    sys.exit(0)
+                except Exception as e:
+                    # 回滚
+                    if os.path.exists(old_path):
+                        os.rename(old_path, current)
+                    InfoBar.error("更新失败", str(e), parent=self, position=InfoBarPosition.TOP)
+            else:
+                # 源码运行，打开下载目录
+                os.system(f'open "{os.path.dirname(download_path)}"')
+        else:
+            # macOS: 打开DMG让用户拖拽安装
+            os.system(f'open "{download_path}"')
 
     def _load_saved_config(self):
         """加载保存的配置，返回是否有完整配置"""
