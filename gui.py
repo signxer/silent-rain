@@ -87,7 +87,7 @@ CURRENT_VERSION = _get_version()
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 
 
-RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/silent-rain/main/releases.json"
+RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json"
 REPO_NAME = "signxer/silent-rain"
 
 
