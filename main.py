@@ -5,6 +5,7 @@ import os
 import platform
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -50,7 +51,6 @@ class StopLearning(Exception):
 
 def _kill_playwright_chrome():
     """清理Playwright残留的Chrome进程（不影响用户自己的浏览器）"""
-    import subprocess
     try:
         if sys.platform == "win32":
             # 用PowerShell只杀带--remote-debugging的Chrome（Playwright启动的）
@@ -198,6 +198,7 @@ class AutoLearner:
         self.goal_type = 'central'  # 目标类型: central=集中培训 online=网络自学
         self.last_stats = (0, 0)  # 最近一次学习任务的 (成功数, 失败数)，供 GUI 显示
         self._stop_event = threading.Event()  # GUI 变更配置时置位，学习引擎协作式停止
+        self._progress_lock = threading.RLock()  # 进度文件并发读写锁（可重入）
         self.user_data = {}
 
     async def init(self, log_callback=None, chrome_path="", download_callback=None):
@@ -296,7 +297,25 @@ class AutoLearner:
             if use_system_chrome:
                 console.print("系统Chrome启动失败，改用内置Chromium", style="yellow")
                 launch_opts.pop("channel", None)
-                self.browser = await self.playwright.chromium.launch(**launch_opts)
+                try:
+                    self.browser = await self.playwright.chromium.launch(**launch_opts)
+                except Exception as e2:
+                    err2 = str(e2)
+                    if "Executable doesn't exist" in err2 or "Browser" in err2:
+                        # 内置 Chromium 未安装：下载后重试（与浏览器探测分支同一流程）
+                        _log("未找到内置 Chromium 浏览器，正在下载（首次使用约需几分钟）...", "yellow")
+                        if download_callback:
+                            download_callback(True)
+                        ok = self._download_chromium(_log)
+                        if download_callback:
+                            download_callback(False)
+                        if not ok:
+                            _log("Chromium 下载失败，请检查网络后重试，或改用系统 Chrome 浏览器", "red")
+                            raise RuntimeError("Chromium download failed")
+                        _log("Chromium 下载完成", "green")
+                        self.browser = await self.playwright.chromium.launch(**launch_opts)
+                    else:
+                        raise
             else:
                 raise
         
@@ -326,14 +345,19 @@ class AutoLearner:
         两者都装到 Playwright 默认缓存路径，运行时即可找到。"""
         _log = _log or (lambda msg, style="": console.print(msg, style=style))
         try:
-            import subprocess
             if getattr(sys, 'frozen', False):
                 from playwright._impl._driver import compute_driver_executable, get_driver_env
                 node, cli = compute_driver_executable()
-                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env())
+                # 30 分钟上限：网络挂起时不至于永久阻塞 GUI
+                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env(),
+                                   timeout=1800)
             else:
-                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                                   timeout=1800)
             return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            debug("下载 Chromium 超时")
+            return False
         except Exception as e:
             debug(f"下载 Chromium 失败: {e}")
             return False
@@ -509,36 +533,42 @@ class AutoLearner:
 
     def load_progress(self) -> dict:
         """加载学习进度（已完成的专题班ID集合）"""
-        try:
-            if os.path.exists(PROGRESS_PATH):
-                with open(PROGRESS_PATH, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                return data
-        except:
-            pass
-        return {"completed_ws_ids": [], "last_page": 1, "last_idx": 0}
+        with self._progress_lock:
+            try:
+                if os.path.exists(PROGRESS_PATH):
+                    with open(PROGRESS_PATH, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    return data
+            except:
+                pass
+            return {"completed_ws_ids": [], "last_page": 1, "last_idx": 0}
 
     def save_progress(self, completed_ws_ids: set, last_page: int = 1, last_idx: int = 0):
-        """保存学习进度"""
-        try:
-            with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "completed_ws_ids": list(completed_ws_ids),
-                    "last_page": last_page,
-                    "last_idx": last_idx,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            debug(f"保存进度失败: {e}")
+        """保存学习进度（带锁，避免多 worker 并发写互相覆盖）"""
+        with self._progress_lock:
+            try:
+                with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        "completed_ws_ids": list(completed_ws_ids),
+                        "last_page": last_page,
+                        "last_idx": last_idx,
+                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                debug(f"保存进度失败: {e}")
 
     def mark_workshop_completed(self, ws_id: str):
-        """标记单个专题班完成，立即落盘"""
-        progress = self.load_progress()
-        completed = set(progress.get("completed_ws_ids", []))
-        completed.add(ws_id)
-        self.save_progress(completed,
-                           progress.get("last_page", 1),
-                           progress.get("last_idx", 0))
+        """标记单个专题班完成，立即落盘（带锁）"""
+        with self._progress_lock:
+            try:
+                progress = self.load_progress()
+                completed = set(progress.get("completed_ws_ids", []))
+                completed.add(ws_id)
+                self.save_progress(completed,
+                                   progress.get("last_page", 1),
+                                   progress.get("last_idx", 0))
+            except Exception as e:
+                debug(f"标记完成失败: {e}")
 
     async def login(self, page=None, username="", password="", auto_login=True, log_callback=None):
         """登录。GUI模式传入username/password/auto_login/log_callback。"""
@@ -2054,6 +2084,8 @@ class AutoLearner:
                 except:
                     pass
                 for _ in range(120):
+                    if self._stop_event.is_set():  # 停止学习时立即退出等待
+                        break
                     await asyncio.sleep(2)
                     try:
                         check_body = await page.locator("body").inner_text(timeout=2000)
@@ -2934,6 +2966,12 @@ class AutoLearner:
                         pass
 
                 except asyncio.CancelledError:
+                    # 被取消（GUI停止/重启）：关闭弹窗页再退出，避免泄漏
+                    if course_page and not course_page.is_closed():
+                        try:
+                            await course_page.close()
+                        except:
+                            pass
                     raise
                 except Exception as e:
                     debug(f"[工作线程 {w_id+1}] 未捕获异常:\n{traceback.format_exc()}")
@@ -3396,18 +3434,18 @@ class AutoLearner:
         return selected_tags
 
     async def get_study_hours(self) -> float:
-        page = self.pages[0]
+        """查看当前学时（CLI hours 命令）"""
         try:
-            await page.goto("https://u.ccb.com/portal/#/studyCenter")
-            await asyncio.sleep(5)
-            
-            body_text = await page.locator("body").inner_text()
-            console.print("学习中心页面内容预览: " + body_text[:300], style="blue")
-            
+            h = await self._get_study_hours(self.pages[0])
+            central = h.get("central", 0)
+            online = h.get("online", 0)
+            console.print(f"集中培训: {central:.1f} 学时", style="bold blue")
+            console.print(f"网络自学: {online:.1f} 学时", style="bold blue")
+            console.print(f"总计: {central + online:.1f} 学时", style="green")
+            return central + online
         except Exception as e:
-            console.print("获取学时失败", style="red")
-        
-        return 0.0
+            console.print(f"获取学时失败: {e}", style="red")
+            return 0.0
 
 
 @click.group(invoke_without_command=True)

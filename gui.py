@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
 )
 
 from qfluentwidgets import (
-    FluentWindow, MSFluentWindow,
-    NavigationItemPosition, FluentIcon as FIF,
+    MSFluentWindow,
+    FluentIcon as FIF,
     CardWidget, HeaderCardWidget, SimpleCardWidget,
     PrimaryPushButton, PushButton, ToolButton,
     LineEdit, SpinBox, SwitchButton,
@@ -30,11 +30,11 @@ from qfluentwidgets import (
     SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
     TitleLabel, IconWidget,
     InfoBar, InfoBarPosition,
-    MessageBox, Dialog,
+    Dialog,
     setTheme, Theme,
 )
 
-from main import AutoLearner, CONFIG_PATH, PROGRESS_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH
+from main import AutoLearner, CONFIG_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH
 
 
 # ─── Async Thread ──────────────────────────────────────────────────
@@ -97,6 +97,14 @@ RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/rele
 REPO_NAME = "signxer/silent-rain"
 
 
+def _ver_tuple(v):
+    """版本号转数字元组用于比较（1.10.0 > 1.7.0）"""
+    parts = []
+    for p in str(v).replace("-", ".").split("."):
+        parts.append(int(p) if p.isdigit() else 0)
+    return tuple(parts)
+
+
 def check_for_update():
     """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志, 下载URL)"""
     data = None
@@ -118,7 +126,8 @@ def check_for_update():
             fname = asset.get("file", "")
             if fname:
                 download_urls[name] = f"https://github.com/{REPO_NAME}/releases/download/{data.get('tag', '')}/{fname}"
-        if latest and latest != CURRENT_VERSION:
+        # 数字比较：仅当线上版本严格更新才提示（避免 dev 版本被提示降级）
+        if latest and _ver_tuple(latest) > _ver_tuple(CURRENT_VERSION):
             return latest, True, notes, download_urls
     return CURRENT_VERSION, False, "", {}
 
@@ -163,14 +172,16 @@ class ConfigScreen(QWidget):
         workers_card.setBorderRadius(8)
         w_layout = QHBoxLayout()
         w_layout.setSpacing(12)
-        w_layout.setContentsMargins(0, 8, 0, 8)
+        w_layout.setContentsMargins(4, 10, 4, 10)
 
         self.spin_workers = SpinBox()
         self.spin_workers.setRange(1, 20)
         self.spin_workers.setValue(self._saved.get("workers", 5))
         self.spin_workers.setFixedWidth(120)
         w_layout.addWidget(self.spin_workers)
+        w_layout.addSpacing(4)
         w_layout.addWidget(BodyLabel("个线程"))
+        w_layout.addSpacing(16)
         w_hint = CaptionLabel("建议 3-10")
         w_hint.setStyleSheet("color: #888;")
         w_layout.addWidget(w_hint)
@@ -183,8 +194,14 @@ class ConfigScreen(QWidget):
         browser_card.setTitle("浏览器设置")
         browser_card.setBorderRadius(8)
         card_layout = QVBoxLayout()
-        card_layout.setSpacing(10)
-        card_layout.setContentsMargins(0, 8, 0, 8)
+        card_layout.setSpacing(14)
+        card_layout.setContentsMargins(4, 10, 4, 10)
+
+        # 行标签统一宽度，让控件纵向对齐（避免文字挤在一起）
+        def _row_label(text):
+            lbl = BodyLabel(text)
+            lbl.setFixedWidth(92)
+            return lbl
 
         # Row 1: Headless
         row1 = QHBoxLayout()
@@ -193,7 +210,7 @@ class ConfigScreen(QWidget):
         self.switch_headless.setChecked(self._saved.get("headless", True))
         self.switch_headless.setOnText("后台运行")
         self.switch_headless.setOffText("显示浏览器")
-        row1.addWidget(BodyLabel("无头模式:"))
+        row1.addWidget(_row_label("无头模式"))
         row1.addWidget(self.switch_headless)
         row1.addStretch()
         card_layout.addLayout(row1)
@@ -208,22 +225,24 @@ class ConfigScreen(QWidget):
         self.switch_browser.setChecked(saved_browser == "chrome")
         self.switch_browser.setOnText("本地 Chrome")
         self.switch_browser.setOffText("内置 Chromium")
-        row2.addWidget(BodyLabel("浏览器引擎:"))
+        row2.addWidget(_row_label("浏览器引擎"))
         row2.addWidget(self.switch_browser)
         row2.addStretch()
         card_layout.addLayout(row2)
 
-        # 内置 Chromium 提示：首次使用自动下载
-        browser_hint = CaptionLabel("内置 Chromium 首次使用会自动下载（约200MB）；本地 Chrome 无需下载")
+        # 内置 Chromium 提示：首次使用自动下载（缩进与行对齐，避免拥挤）
+        browser_hint = CaptionLabel("  内置 Chromium 首次使用会自动下载（约200MB）；本地 Chrome 无需下载")
         browser_hint.setStyleSheet("color: #888;")
+        browser_hint.setWordWrap(True)
         card_layout.addWidget(browser_hint)
+        card_layout.addSpacing(2)
 
         # Row 3: Chrome path (only when using local Chrome)
         self.chrome_path_widget = QWidget()
         path_row = QHBoxLayout(self.chrome_path_widget)
         path_row.setContentsMargins(0, 0, 0, 0)
         path_row.setSpacing(8)
-        path_row.addWidget(BodyLabel("Chrome路径:"))
+        path_row.addWidget(_row_label("Chrome路径"))
         self.input_chrome_path = LineEdit()
         self.input_chrome_path.setPlaceholderText("留空自动检测")
         self.input_chrome_path.setText(self._saved.get("chrome_path", ""))
@@ -880,6 +899,9 @@ class ManualScreen(QWidget):
 
 
 class DashboardScreen(QWidget):
+    update_check_signal = Signal(object)  # (latest, needs_update, notes, download_urls)
+    update_check_fail_signal = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tag_event = threading.Event()
@@ -891,6 +913,8 @@ class DashboardScreen(QWidget):
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
         self._eta_timer.timeout.connect(self._tick_eta)
+        self.update_check_signal.connect(self._on_update_check_result)
+        self.update_check_fail_signal.connect(self._on_update_check_fail)
         self._build_ui()
 
     def _build_ui(self):
@@ -1150,6 +1174,7 @@ class DashboardScreen(QWidget):
         # 重置 ETA 追踪（在 GUI 线程执行，worker 不跨线程操作 Qt 对象）
         thread.eta_reset_signal.emit()
 
+        learner = None
         win = thread.win  # GUI线程捕获的窗口引用，避免跨线程 window()
         # 清除上一轮的固定绝对目标（差额模式下进度环使用）
         win.cfg_central_abs_goal = 0
@@ -1239,7 +1264,7 @@ class DashboardScreen(QWidget):
                     else:
                         log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
                     hours_cb({
-                        "central": _h.get("central", 0), "online": _h.get("online", 0),
+                        "central": cur_hours["central"], "online": cur_hours["online"],
                         "updated": datetime.now().strftime("%H:%M:%S"),
                     })
 
@@ -1318,8 +1343,10 @@ class DashboardScreen(QWidget):
                     if "立即登录" in body or "密码登录" in body or "统一认证" in body:
                         log("Session过期，请在浏览器中重新登录...", "red")
                         await page.goto("https://u.ccb.com/portal/#/study", wait_until="domcontentloaded", timeout=15000)
-                        # 等待用户手动登录
+                        # 等待用户手动登录（停止/退出时立即跳出）
                         for _ in range(120):
+                            if thread._stop_event.is_set():
+                                break
                             await asyncio.sleep(2)
                             try:
                                 check_body = await page.locator("body").inner_text(timeout=2000)
@@ -1618,6 +1645,15 @@ class DashboardScreen(QWidget):
             import traceback
             log(traceback.format_exc(), "red")
             thread.done_signal.emit(0, 0)
+        finally:
+            # 关键：必须在 worker 自己的事件循环内优雅关闭浏览器并保存会话。
+            # GUI 线程跨循环调用 learner.close() 会因 "Event loop is closed" 全部失败，
+            # 导致会话从不保存、浏览器只能靠 pkill 强杀（见体检 A1/A2）。
+            if learner:
+                try:
+                    await learner.close()
+                except Exception:
+                    pass
 
     # ── Slots ──
 
@@ -1812,9 +1848,19 @@ class DashboardScreen(QWidget):
             InfoBar.success("完成", "学习流程结束", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _check_update_manual(self):
-        """手动检查更新"""
+        """手动检查更新（后台线程，避免阻塞GUI）"""
+        InfoBar.info("检查更新", "正在检查更新...", parent=self, position=InfoBarPosition.TOP_RIGHT)
+        def _run():
+            try:
+                self.update_check_signal.emit(check_for_update())
+            except Exception as e:
+                self.update_check_signal.emit((CURRENT_VERSION, False, "", {}))
+                self.update_check_fail_signal.emit(str(e))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_update_check_result(self, result):
+        latest, needs_update, notes, download_urls = result
         try:
-            latest, needs_update, notes, download_urls = check_for_update()
             if needs_update:
                 msg = f"当前版本: v{CURRENT_VERSION}\n最新版本: v{latest}"
                 if notes:
@@ -1826,8 +1872,11 @@ class DashboardScreen(QWidget):
                     self.window()._do_update(download_urls)
             else:
                 InfoBar.success("检查更新", f"已是最新版本 v{CURRENT_VERSION}", parent=self, position=InfoBarPosition.TOP_RIGHT)
-        except Exception as e:
-            InfoBar.error("检查失败", str(e), parent=self, position=InfoBarPosition.TOP_RIGHT)
+        except Exception:
+            pass
+
+    def _on_update_check_fail(self, err):
+        InfoBar.error("检查失败", str(err), parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_tag_request(self, tags_by_category):
 
@@ -2114,6 +2163,8 @@ else:
 
 
 class MainWindow(_BaseWindow):
+    update_check_signal = Signal(object)  # (latest, needs_update, notes, download_urls)
+
     def closeEvent(self, event):
         """关闭窗口时二次确认并清理资源"""
         dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
@@ -2180,7 +2231,8 @@ class MainWindow(_BaseWindow):
         # 隐藏启动画面
         self.splashScreen.finish()
 
-        # 检查更新（非阻塞）
+        # 检查更新（非阻塞，后台线程 + 信号）
+        self.update_check_signal.connect(self._on_update_result)
         QTimer.singleShot(2000, self._check_update)
 
         # 检查是否有保存的配置，有则自动开始
@@ -2223,9 +2275,17 @@ class MainWindow(_BaseWindow):
         self.navigationInterface.hide()
 
     def _check_update(self):
-        """检查是否有新版本"""
+        """检查是否有新版本（后台线程，避免阻塞GUI）"""
+        def _run():
+            try:
+                self.update_check_signal.emit(check_for_update())
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_update_result(self, result):
+        latest, needs_update, notes, download_urls = result
         try:
-            latest, needs_update, notes, download_urls = check_for_update()
             if needs_update:
                 msg = f"当前版本: v{CURRENT_VERSION}\n最新版本: v{latest}"
                 if notes:
@@ -2291,8 +2351,10 @@ class MainWindow(_BaseWindow):
         from PySide6.QtCore import QObject as _QObject
         class _UpdateBridge(_QObject):
             apply = Signal(str)
+            fail = Signal(str)
         _bridge = _UpdateBridge()
         _bridge.apply.connect(self._apply_update)
+        _bridge.fail.connect(lambda err: InfoBar.error("更新失败", err, parent=self, position=InfoBarPosition.TOP))
 
         def do_download():
             try:
@@ -2335,7 +2397,8 @@ class MainWindow(_BaseWindow):
 
             except Exception as e:
                 QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
-                InfoBar.error("更新失败", str(e), parent=self, position=InfoBarPosition.TOP)
+                # 经信号切回 GUI 线程弹提示（下载线程不允许创建 Qt 控件）
+                _bridge.fail.emit(str(e))
 
         btn_cancel.clicked.connect(lambda: (cancel_flag.__setitem__(0, True), dlg.reject()))
         dlg.show()
