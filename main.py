@@ -50,6 +50,43 @@ def _default_browsers_path() -> str:
         return os.path.join(os.path.expanduser("~/.cache"), "ms-playwright")
 
 
+def _dir_file_sizes(root: str) -> dict:
+    """目录内所有文件 {绝对路径: 字节数}（下载进度监控基线）"""
+    sizes = {}
+    try:
+        for _r, _dirs, files in os.walk(root):
+            for f in files:
+                p = os.path.join(_r, f)
+                try:
+                    sizes[p] = os.path.getsize(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return sizes
+
+
+def _dir_growth_bytes(root: str, baseline: dict) -> int:
+    """相对基线的增长字节数 = 新增文件 + 已变大文件（用于统计下载量）"""
+    total = 0
+    try:
+        for _r, _dirs, files in os.walk(root):
+            for f in files:
+                p = os.path.join(_r, f)
+                try:
+                    sz = os.path.getsize(p)
+                except Exception:
+                    continue
+                base = baseline.get(p)
+                if base is None:
+                    total += sz          # 新增文件（下载中的 zip/解压产物）
+                elif sz > base:
+                    total += sz - base   # 增长部分
+    except Exception:
+        pass
+    return total
+
+
 class GoalReached(Exception):
     """学习目标已达成，通知上层清理退出"""
     pass
@@ -210,6 +247,9 @@ class AutoLearner:
         self.last_stats = (0, 0)  # 最近一次学习任务的 (成功数, 失败数)，供 GUI 显示
         self._stop_event = threading.Event()  # GUI 变更配置时置位，学习引擎协作式停止
         self._progress_lock = threading.RLock()  # 进度文件并发读写锁（可重入）
+        self._hours_cache = {"value": None, "ts": 0.0}  # 学时查询 TTL 缓存
+        self._hours_ttl = 60.0  # 学时缓存有效期（秒）
+        self._hours_lock = None  # 懒创建 asyncio.Lock（避免在 __init__ 绑定事件循环）
         self.user_data = {}
 
     async def init(self, log_callback=None, chrome_path="", download_callback=None):
@@ -252,7 +292,7 @@ class AutoLearner:
                     _log("未找到内置 Chromium 浏览器，正在下载（首次使用约需几分钟）...", "yellow")
                     if download_callback:
                         download_callback(True)
-                    ok = self._download_chromium(_log)
+                    ok = await self._download_chromium(_log, download_callback)
                     if download_callback:
                         download_callback(False)
                     if not ok:
@@ -324,7 +364,7 @@ class AutoLearner:
                         _log("未找到内置 Chromium 浏览器，正在下载（首次使用约需几分钟）...", "yellow")
                         if download_callback:
                             download_callback(True)
-                        ok = self._download_chromium(_log)
+                        ok = await self._download_chromium(_log, download_callback)
                         if download_callback:
                             download_callback(False)
                         if not ok:
@@ -357,11 +397,23 @@ class AutoLearner:
             page = await self.context.new_page()
             self.pages.append(page)
 
-    def _download_chromium(self, _log=None) -> bool:
-        """下载内置 Chromium 浏览器到系统缓存目录。
-        源码版用 python -m playwright；冻结版用打包自带的 Playwright 驱动（node + cli.js），
-        两者都装到 Playwright 默认缓存路径，运行时即可找到。"""
+    async def _download_chromium(self, _log=None, download_callback=None) -> bool:
+        """下载内置 Chromium 浏览器到系统缓存目录（B1：真实进度反馈）。
+
+        源码版用 python -m playwright；冻结版用打包自带的 Playwright 驱动（node + cli.js）。
+        Playwright 安装 CLI 在非终端下不输出百分比，这里改为监控缓存目录的
+        "新文件+增长文件"字节数，给出真实的"已下载 MB · 速度"反馈。
+        download_callback: True=开始, str=进度文本, False=结束。
+        """
         _log = _log or (lambda msg, style="": console.print(msg, style=style))
+
+        def report(status):
+            if download_callback:
+                try:
+                    download_callback(status)
+                except Exception:
+                    pass
+
         try:
             if getattr(sys, 'frozen', False):
                 from playwright._impl._driver import compute_driver_executable, get_driver_env
@@ -370,16 +422,41 @@ class AutoLearner:
                 # 关键：冻结版必须与运行时查找路径一致（标准用户缓存），
                 # 否则会装进临时 _MEI 目录（每次启动丢失）
                 env.setdefault("PLAYWRIGHT_BROWSERS_PATH", _default_browsers_path())
-                # 30 分钟上限：网络挂起时不至于永久阻塞 GUI
-                r = subprocess.run([node, cli, "install", "chromium"], env=env,
-                                   timeout=1800)
+                proc = subprocess.Popen([node, cli, "install", "chromium"], env=env,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
-                                   timeout=1800)
-            return r.returncode == 0
-        except subprocess.TimeoutExpired:
-            debug("下载 Chromium 超时")
-            return False
+                proc = subprocess.Popen([sys.executable, "-m", "playwright", "install", "chromium"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 监控下载进度：缓存目录内新增/增长文件字节数
+            reg = _default_browsers_path()
+            baseline = _dir_file_sizes(reg)
+            start_ts = time.time()
+            last_report = ""
+            timeout_deadline = time.time() + 1800  # 30 分钟上限
+            while proc.poll() is None:
+                if time.time() > timeout_deadline:
+                    proc.kill()
+                    debug("下载 Chromium 超时")
+                    return False
+                growth = _dir_growth_bytes(reg, baseline)
+                if growth > 0:
+                    mb = growth / 1024 / 1024
+                    speed = mb / max(1, time.time() - start_ts)
+                    txt = f"已下载 {mb:.0f} MB · {speed:.1f} MB/s"
+                    if txt != last_report:
+                        last_report = txt
+                        report(txt)
+                await asyncio.sleep(1)
+            return proc.returncode == 0
+        except asyncio.CancelledError:
+            # 停止学习时终止下载进程
+            if 'proc' in locals() and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             debug(f"下载 Chromium 失败: {e}")
             return False
@@ -591,6 +668,27 @@ class AutoLearner:
                                    progress.get("last_idx", 0))
             except Exception as e:
                 debug(f"标记完成失败: {e}")
+
+    def mark_course_completed(self, title: str):
+        """网络自学断点续学：记录已学课程标题，立即落盘（带锁）"""
+        with self._progress_lock:
+            try:
+                progress = self.load_progress()
+                done = set(progress.get("completed_course_titles", []))
+                done.add(title)
+                progress["completed_course_titles"] = sorted(done)
+                progress["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(progress, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                debug(f"标记课程完成失败: {e}")
+
+    def load_completed_course_titles(self) -> set:
+        """读取已学课程标题集合（网络自学断点续学用）"""
+        try:
+            return set(self.load_progress().get("completed_course_titles", []))
+        except Exception:
+            return set()
 
     async def login(self, page=None, username="", password="", auto_login=True, log_callback=None):
         """登录。GUI模式传入username/password/auto_login/log_callback。"""
@@ -1508,7 +1606,8 @@ class AutoLearner:
 
 
     async def _check_video_progress(self, page: Page) -> float:
-        # 检查当前课程的播放进度（服务器认证的进度）
+        # 检查当前课程的播放进度：
+        # 1) 平台显示的百分比（服务器认证）；2) 兜底：本地 video.currentTime/duration
         try:
             pct = await page.evaluate('''() => {
                 const el = document.querySelector('.el-progress__text');
@@ -1516,6 +1615,11 @@ class AutoLearner:
                     const t = el.innerText.trim().replace('%', '');
                     const n = parseFloat(t);
                     if (!isNaN(n)) return n;
+                }
+                // 兜底：本地播放进度（平台不显示进度条时仍可检测卡住/完成）
+                const v = document.querySelector('video');
+                if (v && v.duration > 0 && isFinite(v.currentTime)) {
+                    return Math.min(100, v.currentTime / v.duration * 100);
                 }
                 return -1;
             }''')
@@ -1527,6 +1631,7 @@ class AutoLearner:
 
     async def find_and_play_video(self, page: Page, worker_id: int, progress_callback=None, course_type=""):
         # 查找并播放视频，监控进度到100%
+        # O4：3 分钟进度无变化判定卡住，提前放弃（替代最长 20 分钟空转）
         try:
             debug(f"[工作线程 {worker_id+1}] 正在查找视频元素...")
 
@@ -1560,6 +1665,14 @@ class AutoLearner:
                 if any(k in ctype for k in ["图书", "book", "document", "doc", "pdf", "图文"]):
                     debug(f"[工作线程 {worker_id+1}] 图书类课程，视为完成")
                     return True
+                # 无播放器但页面显示已完成（如已学过、图文类）→ 视为完成
+                try:
+                    body_text = await page.locator("body").inner_text(timeout=3000)
+                    if any(k in body_text for k in ["已学习", "已完成", "学习完成", "已看完"]):
+                        debug(f"[工作线程 {worker_id+1}] 页面显示已学习，视为完成")
+                        return True
+                except:
+                    pass
                 debug(f"[工作线程 {worker_id+1}] 未找到视频")
                 return False
 
@@ -1568,6 +1681,10 @@ class AutoLearner:
 
             await self._set_lowest_quality(page)
 
+            # O4：进度停滞检测 —— 连续 STALL_CHECKS 次（约3分钟）进度无变化则放弃
+            STALL_CHECKS = 18  # 18 × 10s ≈ 3 分钟
+            last_pct = -1.0
+            stall_count = 0
             for check in range(120):
                 if self._stop_event.is_set():  # 用户变更配置，立即停止
                     return False
@@ -1580,6 +1697,20 @@ class AutoLearner:
                         progress_callback(progress)
                     if progress >= 100:
                         return True
+                    if progress != last_pct:
+                        last_pct = progress
+                        stall_count = 0
+                    else:
+                        stall_count += 1
+                        if stall_count >= STALL_CHECKS:
+                            debug(f"[工作线程 {worker_id+1}] 进度停滞({progress:.0f}%)约3分钟，放弃")
+                            return False
+                else:
+                    # 无任何进度信息：同样按停滞处理，避免空转20分钟
+                    stall_count += 1
+                    if stall_count >= STALL_CHECKS:
+                        debug(f"[工作线程 {worker_id+1}] 无法获取进度约3分钟，放弃")
+                        return False
 
             return True
         except Exception as e:
@@ -1822,7 +1953,29 @@ class AutoLearner:
 
         return courses
 
-    async def _get_study_hours(self, page=None) -> dict:
+    async def _get_study_hours(self, page=None, force=False) -> dict:
+        """获取学时（O1 节流）：60 秒 TTL 缓存 + 并发单飞。
+
+        - 未过期直接返回缓存值（每门课后不再各自打学习中心）；
+        - force=True 强制刷新（供定时刷新线程用）；
+        - 并发调用合并为一次真实查询。
+        """
+        now = time.time()
+        cache = self._hours_cache
+        if not force and cache["value"] is not None and now - cache["ts"] < self._hours_ttl:
+            return cache["value"]
+        if self._hours_lock is None:
+            self._hours_lock = asyncio.Lock()
+        async with self._hours_lock:
+            # 二次检查：等待锁期间可能已被其他调用刷新
+            if not force and cache["value"] is not None and now - cache["ts"] < self._hours_ttl:
+                return cache["value"]
+            value = await self._fetch_study_hours(page)
+            cache["value"] = value
+            cache["ts"] = time.time()
+            return value
+
+    async def _fetch_study_hours(self, page=None) -> dict:
         # 从学习中心获取今年的培训学时。
         # 优先复用调用方传入的页面（避免每门课后新建页面造成的并发/429压力），
         # 页面为空或已关闭时才临时新建。
@@ -2035,7 +2188,9 @@ class AutoLearner:
                                 break
                         except:
                             pass
-                    await self.find_and_play_video(cp, wid)
+                    play_ok = await self.find_and_play_video(cp, wid)
+                    if not play_ok:
+                        console.print(f"视频未完成: {c['title'][:30]}", style="yellow")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -2126,6 +2281,10 @@ class AutoLearner:
             pass
 
         # 分页采集课程标题（记录所在页码，供worker定位）
+        # O3 断点续学：跳过已学过的课程
+        done_titles = self.load_completed_course_titles()
+        if done_titles:
+            _log(f"已有 {len(done_titles)} 门课程学过，将跳过", "blue")
         courses = []          # [{"page": int, "title": str}, ...]
         seen_titles = set()
         MAX_PAGES = 20
@@ -2144,7 +2303,7 @@ class AutoLearner:
                     t = (await cards.nth(i).get_attribute("title") or "").strip()
                 except:
                     t = ""
-                if t and t not in seen_titles:
+                if t and t not in seen_titles and t[:60] not in done_titles:
                     seen_titles.add(t)
                     courses.append({"page": pg, "title": t[:60]})
                     added += 1
@@ -2232,16 +2391,18 @@ class AutoLearner:
                                     break
                             except:
                                 pass
-                        # 4) 播放视频
+                        # 4) 播放视频（检查返回值：失败走重试）
                         _progress({"wid": wid, "course": ctitle[:40], "progress": "0%", "eta": "-", "status": "学习中"})
                         def on_progress(pct):
                             _progress({"wid": wid, "course": ctitle[:40],
                                        "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
-                        await self.find_and_play_video(cp, wid, on_progress)
+                        ok = await self.find_and_play_video(cp, wid, on_progress)
                         try:
                             await cp.close()
                         except:
                             pass
+                        if not ok:
+                            raise RuntimeError("视频未完成（未找到播放器或进度停滞）")
                         done_ok = True
                         break
                     except asyncio.CancelledError:
@@ -2263,26 +2424,31 @@ class AutoLearner:
 
                 if done_ok:
                     ok_count[0] += 1
+                    # O3 断点续学：记录已学课程，中断后重跑自动跳过
+                    try:
+                        self.mark_course_completed(ctitle)
+                    except Exception:
+                        pass
                     _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-", "status": "✓ 完成"})
                     _log(f"[线程{wid+1}] 完成: {ctitle}", "green")
                 else:
                     fail_count[0] += 1
 
-                # 5) 完成一门课后查询学时，检查目标
-                try:
-                    h = await self._get_study_hours(wp)
-                    _hours({"central": h.get("central", 0), "online": h.get("online", 0),
-                            "updated": datetime.now().strftime("%H:%M:%S")})
-                    if self.study_goal > 0:
+                # 5) 完成一门课后检查目标（O1 节流：60s TTL 缓存合并并发查询）
+                if self.study_goal > 0:
+                    try:
+                        h = await self._get_study_hours(wp)
+                        _hours({"central": h.get("central", 0), "online": h.get("online", 0),
+                                "updated": datetime.now().strftime("%H:%M:%S")})
                         cur = h.get(self.goal_type, 0)
                         _log(f"网络自学进度: {cur:.1f}/{self.study_goal} 学时", "blue")
                         if cur >= self.study_goal:
                             _log(f"✓ 网络自学目标已达成!", "bold green")
                             raise GoalReached()
-                except GoalReached:
-                    raise
-                except Exception:
-                    pass
+                    except GoalReached:
+                        raise
+                    except Exception:
+                        pass
 
         tasks = []
         for wid in range(nw):
@@ -2925,12 +3091,24 @@ class AutoLearner:
                         except:
                             pass
 
-                    # 4) 播放视频（传入进度回调和课程类型）
+                    # 4) 播放视频（传入进度回调和课程类型；检查返回值，失败走重试）
                     update_status(w_id, status="学习中", progress="0%")
                     def on_progress(pct):
                         update_status(w_id, progress=f"{pct:.0f}%", status="学习中")
-                    await self.find_and_play_video(course_page, w_id, on_progress,
-                                                   course_type=course.get('type', ''))
+                    play_ok = await self.find_and_play_video(course_page, w_id, on_progress,
+                                                             course_type=course.get('type', ''))
+                    if not play_ok:
+                        debug(f"[工作线程 {w_id+1}] 视频未完成: {title}")
+                        try:
+                            await course_page.close()
+                        except:
+                            pass
+                        if retry_task(ws_id, cidx, course, ws_title, retry, w_id):
+                            continue
+                        update_status(w_id, status="播放失败")
+                        async with lock_stat:
+                            failed[0] += 1
+                        continue
 
                     # 用户变更配置：放弃当前任务，不再计数
                     if self._stop_event.is_set():
@@ -2968,24 +3146,24 @@ class AutoLearner:
                         if log_callback:
                             log_callback(f"[线程{w_id+1}] 完成: {title}", "green")
 
-                    # 7) 完成一门课后更新学时
-                    try:
-                        _h = await self._get_study_hours(page)
-                        study_hours_info.update({
-                            "central": _h.get("central", 0),
-                            "online": _h.get("online", 0),
-                            "updated": datetime.now().strftime("%H:%M:%S")
-                        })
-                        # 检查是否达标
-                        if self.study_goal > 0:
+                    # 7) 完成一门课后检查目标（O1 节流：仅在需要查目标时查询，
+                    #    且 60s TTL 缓存合并并发，不再每门课都打学习中心）
+                    if self.study_goal > 0:
+                        try:
+                            _h = await self._get_study_hours(page)
+                            study_hours_info.update({
+                                "central": _h.get("central", 0),
+                                "online": _h.get("online", 0),
+                                "updated": datetime.now().strftime("%H:%M:%S")
+                            })
                             _cur = _h.get(self.goal_type, 0)
                             if _cur >= self.study_goal:
                                 update_status(w_id, status="目标达成!")
                                 raise GoalReached()
-                    except GoalReached:
-                        raise
-                    except Exception:
-                        pass
+                        except GoalReached:
+                            raise
+                        except Exception:
+                            pass
 
                 except asyncio.CancelledError:
                     # 被取消（GUI停止/重启）：关闭弹窗页再退出，避免泄漏
@@ -3018,10 +3196,10 @@ class AutoLearner:
         except:
             hours_page = None
 
-        # 启动前先查询一次学时
+        # 启动前先查询一次学时（force：预热缓存）
         if hours_page:
             try:
-                _h = await self._get_study_hours(hours_page)
+                _h = await self._get_study_hours(hours_page, force=True)
                 _info = {
                     "central": _h.get("central", 0),
                     "online": _h.get("online", 0),
@@ -3054,12 +3232,12 @@ class AutoLearner:
                     raise StopLearning()
                 now = time.time()
 
-                # 定时采集总体学习进度（两种模式统一处理）
+                # 定时采集总体学习进度（两种模式统一处理；force 刷新共享缓存）
                 if now - last_hours_check >= HOURS_CHECK_INTERVAL and hours_page:
                     last_hours_check = now
                     try:
                         _h = await asyncio.wait_for(
-                            self._get_study_hours(hours_page), timeout=30)
+                            self._get_study_hours(hours_page, force=True), timeout=30)
                         _info = {
                             "central": _h.get("central", 0),
                             "online": _h.get("online", 0),
@@ -3216,26 +3394,31 @@ class AutoLearner:
                     def on_progress(pct):
                         _progress({"wid": wid, "course": title,
                                    "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
-                    await self.find_and_play_video(wp, wid, on_progress)
-                    _progress({"wid": wid, "course": title, "progress": "100%", "eta": "-", "status": "✓ 完成"})
-                    _log(f"[线程{wid+1}] 完成: {title}", "green")
+                    play_ok = await self.find_and_play_video(wp, wid, on_progress)
+                    if play_ok:
+                        _progress({"wid": wid, "course": title, "progress": "100%", "eta": "-", "status": "✓ 完成"})
+                        _log(f"[线程{wid+1}] 完成: {title}", "green")
+                    else:
+                        _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "未完成"})
+                        _log(f"[线程{wid+1}] 未完成: {title}", "yellow")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     _log(f"[线程{wid+1}] 课程失败: {title} - {e}", "red")
                     _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "异常"})
-                # 检查学习目标
-                try:
-                    h = await self._get_study_hours(wp)
-                    _hours({"central": h.get("central", 0), "online": h.get("online", 0),
-                            "updated": datetime.now().strftime("%H:%M:%S")})
-                    if self.study_goal > 0 and h.get(self.goal_type, 0) >= self.study_goal:
-                        _log("✓ 学习目标已达成!", "bold green")
-                        raise GoalReached()
-                except GoalReached:
-                    raise
-                except Exception:
-                    pass
+                # 检查学习目标（O1 节流：TTL 缓存）
+                if self.study_goal > 0:
+                    try:
+                        h = await self._get_study_hours(wp)
+                        _hours({"central": h.get("central", 0), "online": h.get("online", 0),
+                                "updated": datetime.now().strftime("%H:%M:%S")})
+                        if h.get(self.goal_type, 0) >= self.study_goal:
+                            _log("✓ 学习目标已达成!", "bold green")
+                            raise GoalReached()
+                    except GoalReached:
+                        raise
+                    except Exception:
+                        pass
 
         tasks = []
         for wid in range(nw):

@@ -49,7 +49,7 @@ class AsyncThread(QThread):
     tag_confirm_signal = Signal(list, dict)  # (saved_tags, tags_by_category)
     page_confirm_signal = Signal(int)  # last_page
     eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
-    browser_download_signal = Signal(bool)  # True=开始下载Chromium，False=下载结束
+    browser_download_signal = Signal(object)  # True=开始, str=进度文本, False=下载结束
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -1834,35 +1834,45 @@ class DashboardScreen(QWidget):
         self._eta_timer.stop()
         self.lbl_eta.setText("")
 
-    def _on_browser_download(self, start):
-        """Chromium 下载进度提示：模态等待框，下载完成前阻止继续使用"""
-        if start:
+    def _on_browser_download(self, status):
+        """Chromium 下载进度提示：模态等待框，下载完成前阻止继续使用。
+        status: True=开始, str=进度文本, False=下载结束"""
+        if status is True:
             try:
                 from PySide6.QtWidgets import QDialog, QVBoxLayout
                 from qfluentwidgets import ProgressBar, SubtitleLabel, BodyLabel
                 dlg = QDialog(self.window())
                 dlg.setWindowTitle("正在下载内置 Chromium")
                 dlg.setModal(True)
-                dlg.setMinimumWidth(420)
+                dlg.setMinimumWidth(440)
                 lay = QVBoxLayout(dlg)
                 lay.setContentsMargins(24, 20, 24, 20)
                 lay.setSpacing(12)
                 lay.addWidget(SubtitleLabel("首次使用内置 Chromium，正在下载浏览器..."))
                 bar = ProgressBar()
-                bar.setRange(0, 0)  # 不确定进度（忙碌指示）
+                bar.setRange(0, 0)  # 忙碌指示（无真实百分比，用字节反馈）
                 lay.addWidget(bar)
-                lay.addWidget(BodyLabel("约 200MB，视网速需要几分钟，请勿关闭窗口"))
+                self._download_status_lbl = BodyLabel("准备下载...")
+                lay.addWidget(self._download_status_lbl)
                 self._download_dlg = dlg
                 # exec() 进入嵌套事件循环：worker 线程继续下载，完成信号到达后自动关闭
                 dlg.exec()
                 self._download_dlg = None
             except Exception:
                 self._download_dlg = None
-        else:
+        elif status is False:
             dlg = getattr(self, "_download_dlg", None)
             if dlg:
                 dlg.accept()
                 self._download_dlg = None
+        else:
+            # 进度文本（如 "已下载 42 MB · 12.3 MB/s"）
+            lbl = getattr(self, "_download_status_lbl", None)
+            if lbl:
+                try:
+                    lbl.setText(str(status))
+                except Exception:
+                    pass
 
     def _on_done(self, success, failed):
         self._eta_timer.stop()
