@@ -2434,7 +2434,20 @@ class MainWindow(_BaseWindow):
             from PySide6.QtCore import QMetaObject, Q_ARG
             try:
                 filename = url.split("/")[-1]
+                # Windows 同目录更新：优先下载到 exe 所在目录（可直接启动新版本，
+                # 无需临时目录 + bat 覆盖正在运行的 exe）；目录不可写则退回临时目录
                 download_path = os.path.join(_tf.gettempdir(), filename)
+                current = sys.executable
+                if sys.platform == "win32" and current.lower().endswith(".exe"):
+                    install_dir = os.path.dirname(os.path.abspath(current))
+                    try:
+                        probe = os.path.join(install_dir, ".moisten_write_test")
+                        with open(probe, "w") as f:
+                            f.write("")
+                        os.remove(probe)
+                        download_path = os.path.join(install_dir, "Moisten.new.exe")
+                    except Exception:
+                        pass  # 目录不可写（如 Program Files），退回临时目录+bat方案
 
                 # 候选下载源：直连优先；直连失败再走代理
                 candidates = [url]
@@ -2507,7 +2520,7 @@ class MainWindow(_BaseWindow):
         threading.Thread(target=do_download, daemon=True).start()
 
     def _apply_update(self, download_path):
-        """用下载的文件替换自己（通过外部脚本）"""
+        """用下载的文件替换自己（通过外部脚本 / 同目录直接启动新版本）"""
         import platform as _plat
         import subprocess
         import tempfile
@@ -2516,7 +2529,21 @@ class MainWindow(_BaseWindow):
         current = sys.executable
 
         if _plat.system() == "Windows" and current.endswith(".exe"):
-            # 写一个bat脚本：等主程序退出 → 备份旧版 → 替换 → 重启
+            same_dir = (os.path.dirname(os.path.abspath(download_path))
+                        == os.path.dirname(os.path.abspath(current)))
+            if same_dir:
+                # 同目录更新（推荐）：直接启动新 exe，由新实例启动时删除旧版并改回规范名，
+                # 完全绕开"覆盖正在运行的 exe"与临时目录替换问题
+                subprocess.Popen(
+                    [download_path, "--post-update-old", current],
+                    cwd=os.path.dirname(os.path.abspath(current)),
+                    creationflags=0x08000000,
+                )
+                InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
+                QTimer.singleShot(300, sys.exit)
+                return
+
+            # 兜底（安装目录不可写）：bat 等主程序退出 → 备份旧版 → 替换 → 重启
             bat_path = os.path.join(tempfile.gettempdir(), "moisten_update.bat")
             with open(bat_path, "w") as f:
                 f.write(f"""@echo off
@@ -2539,32 +2566,17 @@ del "%~f0"
             QTimer.singleShot(500, sys.exit)
 
         elif _plat.system() == "Darwin":
-            # macOS: 写一个shell脚本
-            app_path = None
-            if current.endswith("/Moisten") or "/Contents/MacOS/" in current:
-                # 从.app bundle运行，找到.app路径
-                app_path = current.split("/Contents/MacOS/")[0]
-
-            if app_path:
-                sh_path = os.path.join(tempfile.gettempdir(), "moisten_update.sh")
-                with open(sh_path, "w") as f:
-                    f.write(f"""#!/bin/bash
-echo "正在更新..."
-sleep 2
-cp -f "{download_path}" "{app_path}/Contents/MacOS/Moisten"
-rm -f "{download_path}"
-open "{app_path}"
-rm -f "{sh_path}"
-""")
-                os.chmod(sh_path, 0o755)
-                subprocess.Popen(["/bin/bash", sh_path])
-                InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
-                QTimer.singleShot(500, sys.exit)
-            else:
-                # 源码运行，打开下载目录
-                os.system(f'open "{os.path.dirname(download_path)}"')
+            # macOS 发布物是 .dmg，不能直接覆盖二进制（会导致应用损坏），
+            # 打开下载页由用户手动替换 .app
+            import webbrowser
+            webbrowser.open(DOWNLOAD_URL)
+            InfoBar.info("更新", "请下载新版本 DMG 并手动替换应用", parent=self, position=InfoBarPosition.TOP)
         else:
-            os.system(f'open "{os.path.dirname(download_path)}"')
+            # 源码运行，打开下载目录
+            try:
+                os.system(f'open "{os.path.dirname(download_path)}"')
+            except Exception:
+                pass
 
     def _load_saved_config(self):
         """加载保存的配置，返回是否有完整配置"""
@@ -2693,9 +2705,49 @@ def _get_resource_path(filename):
     return os.path.join(base, filename)
 
 
+def _handle_self_update():
+    """新版本启动时清理旧版（Windows 同目录更新方案）。
+
+    旧版启动新 exe（Moisten.new.exe --post-update-old <旧exe路径>）后退出；
+    新实例在后台线程等待旧进程释放文件锁 → 删除旧 exe → 把自己改回规范名，
+    之后快捷方式/下次启动仍指向 Moisten.exe。
+    """
+    try:
+        if "--post-update-old" not in sys.argv:
+            return
+        i = sys.argv.index("--post-update-old")
+        if i + 1 >= len(sys.argv):
+            return
+        old_path = os.path.abspath(sys.argv[i + 1])
+        del sys.argv[i:i + 2]  # 从 argv 移除，避免传给 Qt
+        current = os.path.abspath(sys.executable)
+        if old_path == current or not old_path.lower().endswith(".exe"):
+            return
+
+        def _cleanup():
+            import time as _t
+            for _ in range(60):  # 最多等 60 秒（旧进程约 300ms 后退出）
+                try:
+                    if os.path.exists(old_path):
+                        os.remove(old_path)  # 删除旧版（旧进程已退出，文件已解锁）
+                    # 把自己改回规范名（Windows 允许重命名运行中的 exe）
+                    if os.path.basename(current) != os.path.basename(old_path):
+                        os.rename(current, old_path)
+                    return
+                except OSError:
+                    _t.sleep(1)
+                except Exception:
+                    return
+
+        threading.Thread(target=_cleanup, daemon=True).start()
+    except Exception:
+        pass
+
+
 def main():
     # 打包为 windowed 模式（-w）时没有控制台，启动期致命错误必须弹窗可见
     try:
+        _handle_self_update()
         _main()
     except Exception as e:
         import traceback
