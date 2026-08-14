@@ -1,5 +1,15 @@
 # 更新日志
 
+## 1.7.3
+- chore: VERSION 1.7.3
+- ui: 修复模式选择卡片排版（内容贴分割线、按钮留底边距、卡片不拉伸）；浏览器设置行间距加大
+- chore: VERSION 1.7.2
+- docs: CHANGELOG 1.7.2
+- fix(自动更新): 下载完整性校验（大小+可执行文件头）+重试，阻止损坏文件替换exe导致重启Failed to start python interpreter；替换前备份旧版
+- chore: VERSION 1.7.1
+- docs: CHANGELOG 1.7.1
+# 更新日志
+
 ## 1.7.2
 - fix(自动更新): 下载完整性校验（大小+可执行文件头）+重试，阻止损坏文件替换exe导致重启Failed to start python interpreter；替换前备份旧版
 # 更新日志
