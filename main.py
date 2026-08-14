@@ -200,8 +200,10 @@ class AutoLearner:
         self._stop_event = threading.Event()  # GUI 变更配置时置位，学习引擎协作式停止
         self.user_data = {}
 
-    async def init(self, log_callback=None, chrome_path=""):
+    async def init(self, log_callback=None, chrome_path="", download_callback=None):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        # download_callback(start: bool)：下载 Chromium 前回调 True、完成后回调 False，
+        # 供 GUI 显示等待进度（GUI 侧通过信号转回主线程）
 
         # 不打包浏览器：Chromium 使用 Playwright 默认缓存目录
         # （macOS: ~/Library/Caches/ms-playwright，Windows: %LOCALAPPDATA%\ms-playwright），
@@ -229,30 +231,17 @@ class AutoLearner:
                 err_msg = str(e)
                 if "Executable doesn't exist" in err_msg or "Browser" in err_msg:
                     _log("未找到内置 Chromium 浏览器，正在下载（首次使用约需几分钟）...", "yellow")
-                    if not self._download_chromium(_log):
+                    if download_callback:
+                        download_callback(True)
+                    ok = self._download_chromium(_log)
+                    if download_callback:
+                        download_callback(False)
+                    if not ok:
                         _log("Chromium 下载失败，请检查网络后重试，或改用系统 Chrome 浏览器", "red")
                         raise RuntimeError("Chromium download failed")
                     _log("Chromium 下载完成", "green")
                 else:
                     raise
-
-    def _download_chromium(self, _log=None) -> bool:
-        """下载内置 Chromium 浏览器到系统缓存目录。
-        源码版用 python -m playwright；冻结版用打包自带的 Playwright 驱动（node + cli.js），
-        两者都装到 Playwright 默认缓存路径，运行时即可找到。"""
-        _log = _log or (lambda msg, style="": console.print(msg, style=style))
-        try:
-            import subprocess
-            if getattr(sys, 'frozen', False):
-                from playwright._impl._driver import compute_driver_executable, get_driver_env
-                node, cli = compute_driver_executable()
-                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env())
-            else:
-                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
-            return r.returncode == 0
-        except Exception as e:
-            debug(f"下载 Chromium 失败: {e}")
-            return False
 
         # 清理Playwright残留的chromium进程（不影响用户自己的浏览器）
         _kill_playwright_chrome()
@@ -330,6 +319,24 @@ class AutoLearner:
         for i in range(self.workers):
             page = await self.context.new_page()
             self.pages.append(page)
+
+    def _download_chromium(self, _log=None) -> bool:
+        """下载内置 Chromium 浏览器到系统缓存目录。
+        源码版用 python -m playwright；冻结版用打包自带的 Playwright 驱动（node + cli.js），
+        两者都装到 Playwright 默认缓存路径，运行时即可找到。"""
+        _log = _log or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            import subprocess
+            if getattr(sys, 'frozen', False):
+                from playwright._impl._driver import compute_driver_executable, get_driver_env
+                node, cli = compute_driver_executable()
+                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env())
+            else:
+                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+            return r.returncode == 0
+        except Exception as e:
+            debug(f"下载 Chromium 失败: {e}")
+            return False
 
     async def close(self):
         # 先保存会话状态（必须在 context 关闭之前，否则 storage_state 必然失败，

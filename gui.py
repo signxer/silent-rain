@@ -49,6 +49,7 @@ class AsyncThread(QThread):
     tag_confirm_signal = Signal(list, dict)  # (saved_tags, tags_by_category)
     page_confirm_signal = Signal(int)  # last_page
     eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
+    browser_download_signal = Signal(bool)  # True=开始下载Chromium，False=下载结束
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -166,7 +167,7 @@ class ConfigScreen(QWidget):
 
         self.spin_workers = SpinBox()
         self.spin_workers.setRange(1, 20)
-        self.spin_workers.setValue(self._saved.get("workers", 1))
+        self.spin_workers.setValue(self._saved.get("workers", 5))
         self.spin_workers.setFixedWidth(120)
         w_layout.addWidget(self.spin_workers)
         w_layout.addWidget(BodyLabel("个线程"))
@@ -198,7 +199,7 @@ class ConfigScreen(QWidget):
         card_layout.addLayout(row1)
 
         # Row 2: Browser engine
-        default_browser = "chrome" if platform.system() == "Windows" else "chromium"
+        default_browser = "chrome"  # 默认使用系统 Chrome
         saved_browser = self._saved.get("browser", default_browser)
 
         row2 = QHBoxLayout()
@@ -1109,6 +1110,7 @@ class DashboardScreen(QWidget):
         self._worker.tag_confirm_signal.connect(self._on_tag_confirm)
         self._worker.page_confirm_signal.connect(self._on_page_confirm)
         self._worker.eta_reset_signal.connect(self._on_eta_reset)
+        self._worker.browser_download_signal.connect(self._on_browser_download)
         self._worker.start()
 
     def _init_table(self, workers):
@@ -1166,12 +1168,15 @@ class DashboardScreen(QWidget):
         hours_cb = lambda data: thread.hours_signal.emit(data)
 
         try:
-            cfg_browser = getattr(win, "cfg_browser", "chromium")
+            cfg_browser = getattr(win, "cfg_browser", "chrome")  # 默认系统 Chrome
             cfg_chrome_path = getattr(win, "cfg_chrome_path", "")
             log("正在初始化浏览器...")
             learner = AutoLearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
             self._learner = learner  # 保存引用用于退出时清理
-            await learner.init(log_callback=log, chrome_path=cfg_chrome_path)
+            await learner.init(
+                log_callback=log, chrome_path=cfg_chrome_path,
+                download_callback=lambda s: thread.browser_download_signal.emit(s),
+            )
             log("浏览器初始化完成", "green")
 
             log("正在登录...")
@@ -1769,6 +1774,36 @@ class DashboardScreen(QWidget):
         self._eta_timer.stop()
         self.lbl_eta.setText("")
 
+    def _on_browser_download(self, start):
+        """Chromium 下载进度提示：模态等待框，下载完成前阻止继续使用"""
+        if start:
+            try:
+                from PySide6.QtWidgets import QDialog, QVBoxLayout
+                from qfluentwidgets import ProgressBar, SubtitleLabel, BodyLabel
+                dlg = QDialog(self.window())
+                dlg.setWindowTitle("正在下载内置 Chromium")
+                dlg.setModal(True)
+                dlg.setMinimumWidth(420)
+                lay = QVBoxLayout(dlg)
+                lay.setContentsMargins(24, 20, 24, 20)
+                lay.setSpacing(12)
+                lay.addWidget(SubtitleLabel("首次使用内置 Chromium，正在下载浏览器..."))
+                bar = ProgressBar()
+                bar.setRange(0, 0)  # 不确定进度（忙碌指示）
+                lay.addWidget(bar)
+                lay.addWidget(BodyLabel("约 200MB，视网速需要几分钟，请勿关闭窗口"))
+                self._download_dlg = dlg
+                # exec() 进入嵌套事件循环：worker 线程继续下载，完成信号到达后自动关闭
+                dlg.exec()
+                self._download_dlg = None
+            except Exception:
+                self._download_dlg = None
+        else:
+            dlg = getattr(self, "_download_dlg", None)
+            if dlg:
+                dlg.accept()
+                self._download_dlg = None
+
     def _on_done(self, success, failed):
         self._eta_timer.stop()
         if success or failed:
@@ -2126,9 +2161,9 @@ class MainWindow(_BaseWindow):
         self.show()
 
         # Config state
-        self.cfg_workers = 1
+        self.cfg_workers = 5
         self.cfg_headless = True
-        self.cfg_browser = "chrome" if platform.system() == "Windows" else "chromium"
+        self.cfg_browser = "chrome"  # 默认使用系统 Chrome
         self.cfg_chrome_path = ""
         self.cfg_username = ""
         self.cfg_password = ""
@@ -2375,9 +2410,9 @@ rm -f "{sh_path}"
                 cfg = json.load(f)
             if "workers" not in cfg:
                 return False
-            self.cfg_workers = cfg.get("workers", 1)
+            self.cfg_workers = cfg.get("workers", 5)
             self.cfg_headless = cfg.get("headless", True)
-            default_browser = "chrome" if platform.system() == "Windows" else "chromium"
+            default_browser = "chrome"  # 默认使用系统 Chrome
             self.cfg_browser = cfg.get("browser", default_browser)
             self.cfg_chrome_path = cfg.get("chrome_path", "")
             self.cfg_central_goal = cfg.get("central_goal", 0)
