@@ -1681,17 +1681,24 @@ class AutoLearner:
 
             await self._set_lowest_quality(page)
 
-            # O4：进度停滞检测 —— 连续 STALL_CHECKS 次（约3分钟）进度无变化则放弃
+            # O4：进度停滞检测 —— 约3分钟无进展 → 刷新页面重试播放；
+            # 多次刷新仍卡住才放弃（替代原来最长20分钟空转）。
+            # "无进展" = 平台百分比 与 本地播放时间 都未变化（避免误判平台显示滞后）
             STALL_CHECKS = 18  # 18 × 10s ≈ 3 分钟
+            MAX_REFRESHES = 3  # 卡住后最多刷新重试次数
+            refresh_count = 0
             last_pct = -1.0
+            last_local_time = -1.0
             stall_count = 0
-            for check in range(120):
+            for check in range(120 * (MAX_REFRESHES + 1)):
                 if self._stop_event.is_set():  # 用户变更配置，立即停止
                     return False
                 await asyncio.sleep(10)
                 # 每次检查进度时，确保视频还在播放
                 await self._ensure_video_playing(page)
                 progress = await self._check_video_progress(page)
+                local_time = await self._check_video_time(page)
+                advanced = False
                 if isinstance(progress, (int, float)) and progress >= 0:
                     if progress_callback:
                         progress_callback(progress)
@@ -1699,22 +1706,85 @@ class AutoLearner:
                         return True
                     if progress != last_pct:
                         last_pct = progress
+                        advanced = True
+                if local_time >= 0 and local_time != last_local_time:
+                    last_local_time = local_time
+                    advanced = True
+                if advanced:
+                    stall_count = 0
+                    continue
+                # 平台%与本地时间都没动 → 停滞
+                stall_count += 1
+                if stall_count >= STALL_CHECKS:
+                    if refresh_count < MAX_REFRESHES:
+                        refresh_count += 1
+                        debug(f"[工作线程 {worker_id+1}] 视频停滞约3分钟，第{refresh_count}次刷新重试")
+                        if not await self._refresh_video_page(page, worker_id):
+                            return False
+                        last_pct = -1.0
+                        last_local_time = -1.0
                         stall_count = 0
                     else:
-                        stall_count += 1
-                        if stall_count >= STALL_CHECKS:
-                            debug(f"[工作线程 {worker_id+1}] 进度停滞({progress:.0f}%)约3分钟，放弃")
-                            return False
-                else:
-                    # 无任何进度信息：同样按停滞处理，避免空转20分钟
-                    stall_count += 1
-                    if stall_count >= STALL_CHECKS:
-                        debug(f"[工作线程 {worker_id+1}] 无法获取进度约3分钟，放弃")
+                        debug(f"[工作线程 {worker_id+1}] 视频停滞，{MAX_REFRESHES}次刷新后仍卡住，放弃")
                         return False
 
             return True
         except Exception as e:
             debug(f"[工作线程 {worker_id+1}] 视频播放异常: {e}")
+            return False
+
+    async def _check_video_time(self, page: Page) -> float:
+        """读取本地视频 currentTime（停滞检测用：平台%滞后时仍能判断在播）"""
+        try:
+            t = await page.evaluate("""() => {
+                const v = document.querySelector('video');
+                if (v && isFinite(v.currentTime)) return v.currentTime;
+                return -1;
+            }""")
+            if isinstance(t, (int, float)) and t >= 0:
+                return float(t)
+        except:
+            pass
+        return -1
+
+    async def _refresh_video_page(self, page: Page, worker_id: int) -> bool:
+        """刷新课程页并重新进入播放（卡住时重试），返回是否恢复成功"""
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(5000)
+            # 刷新后播放器状态丢失，重新点击学习按钮
+            for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
+                try:
+                    sb = page.locator(f"text={kw}").first
+                    if await sb.count() > 0:
+                        await sb.click()
+                        await page.wait_for_timeout(5000)
+                        break
+                except:
+                    pass
+            # 等待视频元素重新出现
+            video_selectors = ["video", "audio", "[class*='video']", "[class*='audio']", ".prism-player"]
+            video_found = False
+            for _wait in range(2):
+                for sel in video_selectors:
+                    try:
+                        if await page.query_selector(sel):
+                            video_found = True
+                            break
+                    except:
+                        pass
+                if video_found:
+                    break
+                await page.wait_for_timeout(3000)
+            if not video_found:
+                debug(f"[工作线程 {worker_id+1}] 刷新后未找到视频元素")
+                return False
+            await self._ensure_video_playing(page)
+            await self._set_lowest_quality(page)
+            debug(f"[工作线程 {worker_id+1}] 刷新后视频已恢复")
+            return True
+        except Exception as e:
+            debug(f"[工作线程 {worker_id+1}] 刷新播放页失败: {e}")
             return False
 
     async def _ensure_video_playing(self, page: Page):
