@@ -9,13 +9,16 @@ import sys
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QEventLoop
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QSize, QTimer, QEventLoop,
+    QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve,
+)
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QScrollArea,
-    QDialog, QLabel,
+    QDialog, QLabel, QGraphicsOpacityEffect,
 )
 
 from qfluentwidgets import (
@@ -74,7 +77,49 @@ class AsyncThread(QThread):
             loop.close()
 
 
+class _Sparkline(QWidget):
+    """迷你趋势图：绘制学习学时随时间的变化曲线"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._points = []
+
+    def set_data(self, points):
+        self._points = list(points)
+        self.update()
+
+    def paintEvent(self, e):
+        if len(self._points) < 1:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if w < 10 or h < 10:
+            return
+        lo, hi = min(self._points), max(self._points)
+        span = (hi - lo) or 1.0
+        n = len(self._points)
+        p.setPen(QPen(QColor("#3b82c4"), 1.5))
+        path = QPainterPath()
+        for i, v in enumerate(self._points):
+            x = i / max(1, n - 1) * (w - 6) + 3
+            y = h - 3 - (v - lo) / span * (h - 6)
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        p.drawPath(path)
+        # 最后一个点高亮
+        lx = (n - 1) / max(1, n - 1) * (w - 6) + 3
+        ly = h - 3 - (self._points[-1] - lo) / span * (h - 6)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#3b82c4"))
+        p.drawEllipse(int(lx) - 2, int(ly) - 2, 5, 5)
+        p.end()
+
+
 # ─── Version & Update Check ────────────────────────────────────────
+
 
 def _get_version():
     """获取版本号：环境变量 > VERSION文件 > 默认"""
@@ -147,6 +192,84 @@ def check_for_update():
         if latest and _ver_tuple(latest) > _ver_tuple(CURRENT_VERSION):
             return latest, True, notes, download_urls
     return CURRENT_VERSION, False, "", {}
+
+
+# ─── Welcome Screen（首启体验）────────────────────────────────────
+
+
+class WelcomeScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+        self._animate_entrance()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(60, 50, 60, 50)
+        layout.setSpacing(16)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self.lbl_icon = IconWidget(FIF.EDUCATION, self)
+        self.lbl_icon.setFixedSize(72, 72)
+        layout.addWidget(self.lbl_icon, 0, Qt.AlignHCenter)
+
+        self.lbl_title = TitleLabel("润物 Moisten")
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_title)
+
+        self.lbl_sub = BodyLabel("建行大学自动学习工具 · 随风潜入夜，润物细无声")
+        self.lbl_sub.setStyleSheet("color: #888;")
+        self.lbl_sub.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_sub)
+
+        layout.addSpacing(16)
+
+        # 特性卡片
+        self._feat_cards = []
+        feats = [
+            ("自动模式", "按学时目标自动寻找课程学习，支持标签筛选与断点续学"),
+            ("手动模式", "粘贴指定课程或专题班 URL，精确学习"),
+            ("智能稳定", "视频卡住自动刷新重试 · 变更配置即停旧任务 · 学时查询节流"),
+        ]
+        for title, desc in feats:
+            card = HeaderCardWidget(self)
+            card.setBorderRadius(10)
+            card.setFixedWidth(440)
+            card.setTitle(title)
+            card.viewLayout.setContentsMargins(20, 8, 20, 12)
+            lb = BodyLabel(desc)
+            lb.setFixedHeight(28)
+            card.viewLayout.addWidget(lb)
+            layout.addWidget(card, 0, Qt.AlignHCenter)
+            self._feat_cards.append(card)
+
+        layout.addSpacing(16)
+
+        self.btn_start = PrimaryPushButton("  开始使用")
+        self.btn_start.setIcon(FIF.RIGHT_ARROW)
+        self.btn_start.setFixedSize(200, 40)
+        self.btn_start.clicked.connect(lambda: self.window().next_screen())
+        layout.addWidget(self.btn_start, 0, Qt.AlignHCenter)
+
+    def _animate_entrance(self):
+        """交错入场：图标→标题→副标题→特性卡片→按钮，逐项淡入"""
+        widgets = [self.lbl_icon, self.lbl_title, self.lbl_sub,
+                   *self._feat_cards, self.btn_start]
+        group = QSequentialAnimationGroup(self)
+        for i, w in enumerate(widgets):
+            effect = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(effect)
+            effect.setOpacity(0.0)
+            anim = QPropertyAnimation(effect, b"opacity", w)
+            anim.setDuration(260)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            group.addAnimation(anim)
+            if i < len(widgets) - 1:
+                group.addAnimation(QPauseAnimation(70, group))
+        self._entrance_group = group
+        group.start()
 
 
 # ─── Config Screen ─────────────────────────────────────────────────
@@ -980,6 +1103,8 @@ class DashboardScreen(QWidget):
         self._progress_history = []         # [(timestamp, pct), ...]
         self._eta_seconds = None            # 最新预估剩余秒数
         self._eta_calc_time = None          # 预估计算时的时间戳
+        self._session_start_total = None    # 本次会话起始总学时（用于"本次已学"）
+        self._hours_history = []            # 学时趋势点 [(timestamp, total), ...]
         # 实时倒计时定时器
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
@@ -1049,6 +1174,13 @@ class DashboardScreen(QWidget):
         hl.addWidget(self.lbl_central)
         hl.addWidget(self.lbl_online)
         hl.addWidget(self.lbl_updated)
+        # 本次会话已学 + 学时趋势
+        self.lbl_session = CaptionLabel("本次已学: -- 学时")
+        self.lbl_session.setStyleSheet("color: #3b82c4;")
+        hl.addWidget(self.lbl_session)
+        self.sparkline = _Sparkline()
+        self.sparkline.setFixedHeight(34)
+        hl.addWidget(self.sparkline)
         info_row.addWidget(hours_card, 1)
 
         goal_card = SimpleCardWidget(self)
@@ -1785,6 +1917,18 @@ class DashboardScreen(QWidget):
             sc = "#c99700"      # 提示 → 黄
         self.table.setItem(wid, 3, _item(status, sc))
 
+    def _animate_ring(self, target):
+        """进度环数值平滑动画（OutCubic，400ms）"""
+        try:
+            anim = QPropertyAnimation(self.progress_ring, b"value", self)
+            anim.setDuration(400)
+            anim.setStartValue(self.progress_ring.value())
+            anim.setEndValue(int(target))
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start(QPropertyAnimation.DeleteWhenStopped)
+        except Exception:
+            self.progress_ring.setValue(int(target))
+
     def _on_hours(self, data):
         import time as _time
         # 学时数值着色（集中蓝 / 网络绿），一眼可读
@@ -1793,6 +1937,25 @@ class DashboardScreen(QWidget):
         self.lbl_online.setText(
             f'<span style="color:#2e9e5b;">网络自学</span>: {data.get("online", 0):.1f} 学时')
         self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
+
+        # 本次已学 + 学时趋势
+        total = data.get("central", 0) + data.get("online", 0)
+        if self._session_start_total is None:
+            self._session_start_total = total
+        try:
+            learned = max(0.0, total - self._session_start_total)
+            self.lbl_session.setText(f"本次已学: {learned:.1f} 学时")
+            now = _time.time()
+            self._hours_history.append((now, total))
+            if len(self._hours_history) > 120:
+                self._hours_history = self._hours_history[-120:]
+            # 趋势图：最近若干点（至少2个点才画线）
+            if len(self._hours_history) >= 2:
+                pts = [p[1] for p in self._hours_history[-40:]]
+                self.sparkline.set_data(pts)
+        except Exception:
+            pass
+
         win = self.window()
 
         # 手动模式：无学时目标，显示手动信息而不是"不学习"
@@ -1832,7 +1995,7 @@ class DashboardScreen(QWidget):
             cur = o_cur
             label = "网络自学"
         else:
-            self.progress_ring.setValue(100)
+            self._animate_ring(100)
             self.progress_ring.setCustomBarColor("#2e9e5b", "#2e9e5b")  # 完成变绿
             self.lbl_goal_info.setText(f"✓ 全部完成 集中{c_cur:.1f} 网络{o_cur:.1f}")
             self._eta_seconds = None
@@ -1840,10 +2003,10 @@ class DashboardScreen(QWidget):
             self.lbl_eta.setText("✓ 已完成")
             return
 
-        # 计算进度
+        # 计算进度（环值平滑动画）
         pct_f = min(100.0, cur / goal * 100) if goal > 0 else 0
         pct = int(pct_f)
-        self.progress_ring.setValue(pct)
+        self._animate_ring(pct)
         remaining = max(0, goal - cur)
         self.lbl_goal_info.setText(f"{label} {cur:.1f}/{goal:.0f}学时 剩{remaining:.1f}")
 
@@ -2317,6 +2480,24 @@ else:
 class MainWindow(_BaseWindow):
     update_check_signal = Signal(object)  # (latest, needs_update, notes, download_urls)
 
+    def switchTo(self, widget):
+        """切换到指定页面，附带轻微淡入（仪表盘除外，避免实时刷新闪烁）"""
+        super().switchTo(widget)
+        try:
+            if isinstance(widget, DashboardScreen):
+                return
+            effect = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(effect)
+            effect.setOpacity(0.55)
+            anim = QPropertyAnimation(effect, b"opacity", widget)
+            anim.setDuration(160)
+            anim.setStartValue(0.55)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start(QPropertyAnimation.DeleteWhenStopped)
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         """关闭窗口时二次确认并清理资源"""
         dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
@@ -2394,8 +2575,14 @@ class MainWindow(_BaseWindow):
             self._screen_index = 5
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
-        else:
+        elif os.path.exists(CONFIG_PATH):
+            # 返回用户但未保存账号 → 直接到配置页
+            self._screen_index = 1
             self.switchTo(self.screen_config)
+        else:
+            # 首次使用 → 欢迎页
+            self._screen_index = 0
+            self.switchTo(self.screen_welcome)
 
     def _createSubInterfaces(self):
         """创建所有子界面"""
@@ -2403,6 +2590,8 @@ class MainWindow(_BaseWindow):
         loop = QEventLoop(self)
         QTimer.singleShot(1500, loop.quit)
         loop.exec()
+        self.screen_welcome = WelcomeScreen(self)
+        self.screen_welcome.setObjectName("welcome")
         self.screen_config = ConfigScreen(self)
         self.screen_config.setObjectName("config")
         self.screen_login = LoginScreen(self)
@@ -2417,6 +2606,7 @@ class MainWindow(_BaseWindow):
         self.screen_dashboard.setObjectName("dashboard")
 
         # Add sub interfaces with icons
+        self.addSubInterface(self.screen_welcome, FIF.HOME, "欢迎")
         self.addSubInterface(self.screen_config, FIF.SETTING, "配置")
         self.addSubInterface(self.screen_login, FIF.PEOPLE, "登录")
         self.addSubInterface(self.screen_mode, FIF.TILES, "模式")
@@ -2734,48 +2924,43 @@ del "%~f0"
         self._drag_pos = None
 
     def next_screen(self):
-        """根据当前界面和模式决定下一个界面"""
+        """根据当前界面和模式决定下一个界面
+        索引：0欢迎 1配置 2登录 3模式 4目标/手动 5仪表盘"""
         self._screen_index += 1
 
         if self._screen_index == 1:
-            # config → login
-            self.switchTo(self.screen_login)
+            # 欢迎 → 配置
+            self.switchTo(self.screen_config)
         elif self._screen_index == 2:
-            # login → mode selection
-            self.switchTo(self.screen_mode)
+            # 配置 → 登录
+            self.switchTo(self.screen_login)
         elif self._screen_index == 3:
-            # mode → goal (auto) or manual (manual)
+            # 登录 → 模式
+            self.switchTo(self.screen_mode)
+        elif self._screen_index == 4:
+            # 模式 → 目标(自动) 或 手动URL(手动)
             if self.cfg_mode == "auto":
                 self.switchTo(self.screen_goal)
             else:
                 self.switchTo(self.screen_manual)
-        elif self._screen_index == 4:
-            # goal → tags → dashboard (auto), or manual → dashboard
-            if self.cfg_mode == "auto":
-                # tags handled in goal screen, go to dashboard
-                self.switchTo(self.screen_dashboard)
-                self.screen_dashboard.start_learning()
-            else:
-                self.switchTo(self.screen_dashboard)
-                self.screen_dashboard.start_learning()
         elif self._screen_index == 5:
-            # 启动时恢复配置自动进入仪表盘
+            # 目标/手动 → 仪表盘，或启动时恢复配置自动进入
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
 
     def go_to_manual(self):
         """从模式选择跳到手动URL输入"""
-        self._screen_index = 3
+        self._screen_index = 4
         self.switchTo(self.screen_manual)
 
     def show_mode_screen(self):
         """从手动URL输入返回模式选择"""
-        self._screen_index = 2
+        self._screen_index = 3
         self.switchTo(self.screen_mode)
 
     def show_settings(self):
         """从仪表盘返回设置界面"""
-        self._screen_index = 0
+        self._screen_index = 1
         self.switchTo(self.screen_config)
 
 
