@@ -10,7 +10,7 @@ import threading
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QEventLoop
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
@@ -820,6 +820,20 @@ class ModeScreen(QWidget):
 
     def _select_mode(self, mode):
         win = self.window()
+        # 切换会清空另一模式配置（目标学时/URL），先确认，避免误触丢失数据
+        if mode == "auto":
+            other = "手动模式"
+            loss = "手动URL列表"
+        else:
+            other = "自动模式"
+            loss = "集中培训/网络自学的目标学时"
+        dlg = Dialog("切换模式",
+                     f"切换到{'自动模式' if mode == 'auto' else '手动模式'}将清空{other}的{loss}，确定继续？",
+                     win)
+        dlg.cancelButton.setText("取消")
+        dlg.yesButton.setText("确定")
+        if not dlg.exec():
+            return
         win.cfg_mode = mode
         # 互斥：选择一种模式即清空另一种模式的配置，避免两套设置混在一起
         try:
@@ -1149,6 +1163,12 @@ class DashboardScreen(QWidget):
 
     def start_learning(self):
         # 已有学习线程在运行：先停止旧任务并关闭其浏览器，再用新配置重新开始
+        # 重置进度环状态（颜色恢复主题色、数值清零）
+        self.progress_ring.setValue(0)
+        try:
+            self.progress_ring.setCustomBarColor("#0078d4", "#60cdff")
+        except Exception:
+            pass
         old_worker = getattr(self, "_worker", None)
         if old_worker and old_worker.isRunning():
             self._on_log("检测到学习中，正在停止旧任务...", "yellow")
@@ -1720,23 +1740,58 @@ class DashboardScreen(QWidget):
 
     # ── Slots ──
 
+    # 日志/状态颜色（浅色主题可读）
+    _LOG_COLORS = {
+        "red": "#d64545",
+        "yellow": "#c99700",
+        "green": "#2e9e5b",
+        "bold green": "#23814a",
+        "blue": "#3b82c4",
+        "bold blue": "#2563a8",
+    }
+
     def _on_log(self, msg, style):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_view.appendPlainText(f"[{ts}] {msg}")
+        color = self._LOG_COLORS.get(str(style).lower(), "")
+        safe = str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if color:
+            self.log_view.appendHtml(f'<span style="color:{color};">[{ts}] {safe}</span>')
+        else:
+            self.log_view.appendHtml(f"[{ts}] {safe}")
 
     def _on_progress(self, data):
         wid = data.get("wid", 0)
         if wid >= self.table.rowCount():
             return
-        self.table.setItem(wid, 0, QTableWidgetItem(str(data.get("course", "-"))[:40]))
-        self.table.setItem(wid, 1, QTableWidgetItem(str(data.get("progress", "-"))))
-        self.table.setItem(wid, 2, QTableWidgetItem(str(data.get("eta", "-"))))
-        self.table.setItem(wid, 3, QTableWidgetItem(str(data.get("status", "-"))))
+
+        def _item(text, color=None):
+            it = QTableWidgetItem(str(text)[:40])
+            if color:
+                it.setForeground(QColor(color))
+            return it
+
+        self.table.setItem(wid, 0, _item(data.get("course", "-")))
+        self.table.setItem(wid, 1, _item(data.get("progress", "-")))
+        self.table.setItem(wid, 2, _item(data.get("eta", "-")))
+        status = str(data.get("status", "-"))
+        sc = None
+        if any(k in status for k in ("完成", "目标达成")):
+            sc = "#2e9e5b"      # 成功 → 绿
+        elif any(k in status for k in ("异常", "失败", "放弃", "超时")):
+            sc = "#d64545"      # 失败 → 红
+        elif any(k in status for k in ("学习", "加载", "查找")):
+            sc = "#3b82c4"      # 进行中 → 蓝
+        elif any(k in status for k in ("重试", "未找到", "无按钮", "跳过", "退出")):
+            sc = "#c99700"      # 提示 → 黄
+        self.table.setItem(wid, 3, _item(status, sc))
 
     def _on_hours(self, data):
         import time as _time
-        self.lbl_central.setText(f"集中培训: {data.get('central', 0):.1f} 学时")
-        self.lbl_online.setText(f"网络自学: {data.get('online', 0):.1f} 学时")
+        # 学时数值着色（集中蓝 / 网络绿），一眼可读
+        self.lbl_central.setText(
+            f'<span style="color:#3b82c4;">集中培训</span>: {data.get("central", 0):.1f} 学时')
+        self.lbl_online.setText(
+            f'<span style="color:#2e9e5b;">网络自学</span>: {data.get("online", 0):.1f} 学时')
         self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
         win = self.window()
 
@@ -1778,6 +1833,7 @@ class DashboardScreen(QWidget):
             label = "网络自学"
         else:
             self.progress_ring.setValue(100)
+            self.progress_ring.setCustomBarColor("#2e9e5b", "#2e9e5b")  # 完成变绿
             self.lbl_goal_info.setText(f"✓ 全部完成 集中{c_cur:.1f} 网络{o_cur:.1f}")
             self._eta_seconds = None
             self._eta_timer.stop()
@@ -1914,6 +1970,11 @@ class DashboardScreen(QWidget):
 
     def _on_done(self, success, failed):
         self._eta_timer.stop()
+        # 表格标题栏显示汇总
+        if success or failed:
+            self.lbl_progress_summary.setText(f"成功 {success} · 失败 {failed}")
+        else:
+            self.lbl_progress_summary.setText("")
         if success or failed:
             InfoBar.success("完成", f"学习流程结束，成功 {success} 门，失败 {failed} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
         else:
