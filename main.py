@@ -2150,6 +2150,215 @@ class AutoLearner:
         await asyncio.gather(*tasks)
         console.print("课程模式学习完成", style="bold green")
 
+    async def learn_course_list(self, list_url: str = "https://u.ccb.com/course/#/list/1",
+                                log_callback=None, progress_callback=None, hours_callback=None):
+        """网络自学：从课程列表页 /course/#/list/1 采集课程并学习（GUI自动模式使用）。
+
+        与专题班流程不同：网络自学直接从课程列表页点开课程播放，
+        而不是进入专题班再找课程。学习目标由 self.goal_type / self.study_goal 控制。
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        _progress = progress_callback or (lambda d: None)
+        _hours = hours_callback or (lambda d: None)
+
+        page = self.pages[0]
+        _log(f"网络自学: 从课程列表加载 {list_url}", "blue")
+        try:
+            await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(5000)
+        except Exception as e:
+            _log(f"课程列表加载失败: {e}", "red")
+            return
+
+        # 检查登录态，Session过期则等待用户重新登录
+        try:
+            body = await page.locator("body").inner_text(timeout=3000)
+            if "立即登录" in body or "密码登录" in body or "统一认证" in body:
+                _log("Session过期，请在浏览器中重新登录...", "red")
+                try:
+                    await page.goto("https://u.ccb.com/portal/#/study",
+                                    wait_until="domcontentloaded", timeout=15000)
+                except:
+                    pass
+                for _ in range(120):
+                    await asyncio.sleep(2)
+                    try:
+                        check_body = await page.locator("body").inner_text(timeout=2000)
+                        if "立即登录" not in check_body and "密码登录" not in check_body:
+                            break
+                    except:
+                        pass
+                _log("登录成功，继续加载...", "green")
+                try:
+                    await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                    await page.wait_for_timeout(5000)
+                except:
+                    return
+        except:
+            pass
+
+        # 分页采集课程标题（记录所在页码，供worker定位）
+        courses = []          # [{"page": int, "title": str}, ...]
+        seen_titles = set()
+        MAX_PAGES = 20
+        for pg in range(1, MAX_PAGES + 1):
+            try:
+                await page.wait_for_selector("a.p-cursor[title]", timeout=15000)
+            except:
+                break
+            cards = page.locator("a.p-cursor[title]")
+            cnt = await cards.count()
+            if cnt == 0:
+                break
+            added = 0
+            for i in range(cnt):
+                try:
+                    t = (await cards.nth(i).get_attribute("title") or "").strip()
+                except:
+                    t = ""
+                if t and t not in seen_titles:
+                    seen_titles.add(t)
+                    courses.append({"page": pg, "title": t[:60]})
+                    added += 1
+            _log(f"课程列表 第 {pg} 页: {cnt} 门（新增 {added}）", "blue")
+            if pg >= MAX_PAGES:
+                break
+            # 翻到下一页
+            try:
+                nxt = page.locator("[class*=page-next]:not([class*=page_disabled])")
+                if await nxt.count() == 0:
+                    break
+                await nxt.first.click()
+                await page.wait_for_timeout(4000)
+            except:
+                break
+
+        if not courses:
+            _log("课程列表未获取到课程", "yellow")
+            return
+        _log(f"共采集 {len(courses)} 门课程", "bold blue")
+
+        nw = min(self.workers, len(courses))
+        _log(f"使用 {nw} 个线程学习 {len(courses)} 门课程", "bold blue")
+
+        async def cworker(wid: int, wp: Page, tasks: List[dict]):
+            for task in tasks:
+                cpage, ctitle = task["page"], task["title"]
+                _log(f"[线程{wid+1}] {ctitle}", "blue")
+                _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "加载中"})
+                done_ok = False
+                for attempt in range(1, 3):  # 每门课程最多重试1次
+                    cp = None
+                    try:
+                        # 1) 回到列表页并翻到目标页码
+                        await wp.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                        await wp.wait_for_timeout(3000)
+                        await wp.wait_for_selector("a.p-cursor[title]", timeout=15000)
+                        for _ in range(cpage - 1):
+                            nxt = wp.locator("[class*=page-next]:not([class*=page_disabled])")
+                            if await nxt.count() == 0:
+                                break
+                            await nxt.first.click()
+                            await wp.wait_for_timeout(2500)
+                        # 2) 按标题找到课程链接并点击（弹新窗口）
+                        links = wp.locator("a.p-cursor[title]")
+                        ln = await links.count()
+                        link = None
+                        for i in range(ln):
+                            try:
+                                t = (await links.nth(i).get_attribute("title") or "").strip()
+                            except:
+                                t = ""
+                            if t and ctitle in t:
+                                link = links.nth(i)
+                                break
+                        if link is None:
+                            _log(f"[线程{wid+1}] 未找到课程: {ctitle}", "yellow")
+                            _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "未找到"})
+                            break
+                        try:
+                            async with wp.expect_event("popup", timeout=20000) as pi:
+                                await link.click()
+                            cp = await pi.value
+                            await cp.wait_for_load_state()
+                            await cp.wait_for_timeout(5000)
+                        except Exception as e:
+                            _log(f"[线程{wid+1}] 打开课程失败: {ctitle} - {e}", "yellow")
+                            if cp:
+                                try: await cp.close()
+                                except: pass
+                            raise
+                        # 3) 点击学习按钮
+                        for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
+                            try:
+                                sb = cp.locator(f"text={kw}").first
+                                if await sb.count() > 0:
+                                    await sb.click()
+                                    await cp.wait_for_timeout(5000)
+                                    break
+                            except:
+                                pass
+                        # 4) 播放视频
+                        _progress({"wid": wid, "course": ctitle[:40], "progress": "0%", "eta": "-", "status": "学习中"})
+                        def on_progress(pct):
+                            _progress({"wid": wid, "course": ctitle[:40],
+                                       "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
+                        await self.find_and_play_video(cp, wid, on_progress)
+                        try:
+                            await cp.close()
+                        except:
+                            pass
+                        done_ok = True
+                        break
+                    except Exception as e:
+                        if cp:
+                            try: await cp.close()
+                            except: pass
+                        if attempt < 2:
+                            _log(f"[线程{wid+1}] 第{attempt}次失败，重试: {ctitle}", "yellow")
+                            await asyncio.sleep(2)
+                            continue
+                        _log(f"[线程{wid+1}] 课程失败: {ctitle} - {e}", "red")
+                        _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "异常"})
+                        break
+
+                if done_ok:
+                    _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-", "status": "✓ 完成"})
+                    _log(f"[线程{wid+1}] 完成: {ctitle}", "green")
+
+                # 5) 完成一门课后查询学时，检查目标
+                try:
+                    h = await self._get_study_hours()
+                    _hours({"central": h.get("central", 0), "online": h.get("online", 0),
+                            "updated": datetime.now().strftime("%H:%M:%S")})
+                    if self.study_goal > 0:
+                        cur = h.get(self.goal_type, 0)
+                        _log(f"网络自学进度: {cur:.1f}/{self.study_goal} 学时", "blue")
+                        if cur >= self.study_goal:
+                            _log(f"✓ 网络自学目标已达成!", "bold green")
+                            raise GoalReached()
+                except GoalReached:
+                    raise
+                except Exception:
+                    pass
+
+        tasks = []
+        for wid in range(nw):
+            aidx = [courses[j] for j in range(wid, len(courses), nw)]
+            tasks.append(asyncio.create_task(cworker(wid, self.pages[wid], aidx)))
+            await asyncio.sleep(3)
+        try:
+            await asyncio.gather(*tasks)
+        except GoalReached:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except:
+                pass
+        _log("网络自学阶段完成", "bold green")
+
     @staticmethod
     def _is_learnable(action: str, hours: str = "") -> bool:
         """判断课程是否可以学习（未完成或进行中）"""

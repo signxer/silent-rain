@@ -1083,6 +1083,20 @@ class DashboardScreen(QWidget):
                 return
             log("登录成功", "green")
 
+            # 手动模式：直接从指定URL学习（不依赖学习目标，需在任何目标检查之前）
+            if cfg_mode == "manual":
+                if not cfg_manual_urls:
+                    log("手动模式未指定URL，退出", "yellow")
+                    thread.done_signal.emit(0, 0)
+                    return
+                log(f"手动模式：{len(cfg_manual_urls)} 个URL", "blue")
+                await learner.learn_from_urls(
+                    cfg_manual_urls, cfg_workers,
+                    progress_cb, hours_cb, log
+                )
+                thread.done_signal.emit(0, 0)
+                return
+
             # 获取配置（新格式：central_goal/online_goal，0表示不学习）
             cfg_central_goal = getattr(win, "cfg_central_goal", 0)
             cfg_online_goal = getattr(win, "cfg_online_goal", 0)
@@ -1157,111 +1171,106 @@ class DashboardScreen(QWidget):
                 thread.done_signal.emit(0, 0)
                 return
 
-            # 手动模式：直接从指定URL学习
-            if cfg_mode == "manual":
-                log(f"手动模式：{len(cfg_manual_urls)} 个URL", "blue")
-                await learner.learn_from_urls(
-                    cfg_manual_urls, cfg_workers,
-                    progress_cb, hours_cb, log
-                )
-                thread.done_signal.emit(0, 0)
-                return
-
             # ── 自动模式：按阶段顺序学习 ──
             page = learner.pages[0]
-            list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
+            central_phase = any(p[0] == "central" for p in phases)
 
-            # 加载专题班列表页（刷新直到标签树出来）
-            tags_by_category = {}
-            load_attempt = 0
-            while not tags_by_category:
-                load_attempt += 1
-                try:
-                    await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
-                    await page.wait_for_timeout(6000)
-                except:
-                    pass
+            # 集中培训：走专题班流程（标签筛选、翻页、进度恢复）
+            # 网络自学不走这里，直接去课程列表 /course/#/list/1
+            if central_phase:
+                list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
 
-                # 检查是否还在登录页（session过期）
-                body = ""
-                try:
-                    body = await page.locator("body").inner_text(timeout=3000)
-                except:
-                    pass
-                if "立即登录" in body or "密码登录" in body or "统一认证" in body:
-                    log("Session过期，请在浏览器中重新登录...", "red")
-                    await page.goto("https://u.ccb.com/portal/#/study", wait_until="domcontentloaded", timeout=15000)
-                    # 等待用户手动登录
-                    for _ in range(120):
-                        await asyncio.sleep(2)
-                        try:
-                            check_body = await page.locator("body").inner_text(timeout=2000)
-                            if "立即登录" not in check_body and "密码登录" not in check_body:
+                # 加载专题班列表页（刷新直到标签树出来）
+                tags_by_category = {}
+                load_attempt = 0
+                while not tags_by_category:
+                    load_attempt += 1
+                    try:
+                        await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                        await page.wait_for_timeout(6000)
+                    except:
+                        pass
+
+                    # 检查是否还在登录页（session过期）
+                    body = ""
+                    try:
+                        body = await page.locator("body").inner_text(timeout=3000)
+                    except:
+                        pass
+                    if "立即登录" in body or "密码登录" in body or "统一认证" in body:
+                        log("Session过期，请在浏览器中重新登录...", "red")
+                        await page.goto("https://u.ccb.com/portal/#/study", wait_until="domcontentloaded", timeout=15000)
+                        # 等待用户手动登录
+                        for _ in range(120):
+                            await asyncio.sleep(2)
+                            try:
+                                check_body = await page.locator("body").inner_text(timeout=2000)
+                                if "立即登录" not in check_body and "密码登录" not in check_body:
+                                    break
+                            except:
+                                pass
+                        log("登录成功，继续加载...", "green")
+                        continue
+
+                    try:
+                        tags_by_category = await learner.get_available_tags(page) or {}
+                    except:
+                        pass
+
+                    if tags_by_category:
+                        tag_count = sum(len(v) for v in tags_by_category.values())
+                        log(f"发现 {tag_count} 个标签", "blue")
+                        break
+
+                    log(f"标签未加载，重试({load_attempt})...", "yellow")
+                    await page.wait_for_timeout(3000)
+
+                if cfg_tags:
+                    # 有已保存标签，询问用户
+                    self._tag_event.clear()
+                    thread.tag_confirm_signal.emit(cfg_tags, tags_by_category)
+                    await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
+                    cfg_tags = list(getattr(win, "cfg_tags", []))
+                elif tags_by_category:
+                    # 无已保存标签，直接弹选择框
+                    self._tag_event.clear()
+                    thread.tag_request_signal.emit(tags_by_category)
+                    await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
+                    cfg_tags = list(getattr(win, "cfg_tags", []))
+
+                log(f"标签: {', '.join(cfg_tags)}" if cfg_tags else "未选择标签，学习全部", "green" if cfg_tags else "yellow")
+
+                if cfg_tags:
+                    learner.tags_to_learn = cfg_tags
+                    log(f"应用标签筛选: {', '.join(cfg_tags)}", "blue")
+                    filter_ok = await learner.filter_by_tags(page)
+                    if not filter_ok:
+                        log("标签筛选失败，停止学习", "red")
+                        thread.done_signal.emit(0, 0)
+                        return
+
+                progress = learner.load_progress()
+                completed_ids = set(progress.get("completed_ws_ids", []))
+                last_page = progress.get("last_page", 1)
+
+                # 询问是否从上次页码继续
+                page_num = 1
+                if last_page > 1:
+                    self._page_event = threading.Event()
+                    self._page_resume = True
+                    thread.page_confirm_signal.emit(last_page)
+                    await asyncio.get_event_loop().run_in_executor(None, self._page_event.wait)
+
+                    if self._page_resume:
+                        log(f"跳转到第 {last_page} 页", "blue")
+                        for _ in range(last_page - 1):
+                            moved = await learner.go_to_next_page(page)
+                            if not moved:
                                 break
-                        except:
-                            pass
-                    log("登录成功，继续加载...", "green")
-                    continue
-
-                try:
-                    tags_by_category = await learner.get_available_tags(page) or {}
-                except:
-                    pass
-
-                if tags_by_category:
-                    tag_count = sum(len(v) for v in tags_by_category.values())
-                    log(f"发现 {tag_count} 个标签", "blue")
-                    break
-
-                log(f"标签未加载，重试({load_attempt})...", "yellow")
-                await page.wait_for_timeout(3000)
-
-            if cfg_tags:
-                # 有已保存标签，询问用户
-                self._tag_event.clear()
-                thread.tag_confirm_signal.emit(cfg_tags, tags_by_category)
-                await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
-                cfg_tags = list(getattr(win, "cfg_tags", []))
-            elif tags_by_category:
-                # 无已保存标签，直接弹选择框
-                self._tag_event.clear()
-                thread.tag_request_signal.emit(tags_by_category)
-                await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
-                cfg_tags = list(getattr(win, "cfg_tags", []))
-
-            log(f"标签: {', '.join(cfg_tags)}" if cfg_tags else "未选择标签，学习全部", "green" if cfg_tags else "yellow")
-
-            if cfg_tags:
-                learner.tags_to_learn = cfg_tags
-                log(f"应用标签筛选: {', '.join(cfg_tags)}", "blue")
-                filter_ok = await learner.filter_by_tags(page)
-                if not filter_ok:
-                    log("标签筛选失败，停止学习", "red")
-                    thread.done_signal.emit(0, 0)
-                    return
-
-            progress = learner.load_progress()
-            completed_ids = set(progress.get("completed_ws_ids", []))
-            last_page = progress.get("last_page", 1)
-
-            # 询问是否从上次页码继续
-            page_num = 1
-            if last_page > 1:
-                self._page_event = threading.Event()
-                self._page_resume = True
-                thread.page_confirm_signal.emit(last_page)
-                await asyncio.get_event_loop().run_in_executor(None, self._page_event.wait)
-
-                if self._page_resume:
-                    log(f"跳转到第 {last_page} 页", "blue")
-                    for _ in range(last_page - 1):
-                        moved = await learner.go_to_next_page(page)
-                        if not moved:
-                            break
-                        page_num += 1
-                        await page.wait_for_timeout(1000)
-                else:
-                    log("从第 1 页开始", "blue")
+                            page_num += 1
+                            await page.wait_for_timeout(1000)
+                    else:
+                        log("从第 1 页开始", "blue")
 
             # ── 按阶段顺序学习（先集中培训，再网络自学）──
             for phase_goal_type, phase_goal_hours in phases:
@@ -1285,6 +1294,16 @@ class DashboardScreen(QWidget):
                 except:
                     learner.study_goal = phase_goal_hours
                 learner.goal_type = phase_goal_type
+
+                if phase_goal_type == "online":
+                    # 网络自学：从课程列表页 /course/#/list/1 采集课程学习，
+                    # 不走专题班流程
+                    await learner.learn_course_list(
+                        "https://u.ccb.com/course/#/list/1",
+                        log_callback=log, progress_callback=progress_cb, hours_callback=hours_cb,
+                    )
+                    log(f"✓ {type_name}阶段完成", "bold green")
+                    continue
 
                 no_more_pages = False
                 tasks = []
