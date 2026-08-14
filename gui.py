@@ -759,7 +759,6 @@ class ModeScreen(QWidget):
         a_layout.setSpacing(12)
         a_layout.setContentsMargins(4, 20, 4, 20)
         a_desc = BodyLabel("自动寻找专题班，按学时目标学习")
-        a_desc.setStyleSheet("line-height: 1.6;")
         a_layout.addWidget(a_desc)
         a_hint = CaptionLabel("适合：需要完成学时目标的日常挂机学习")
         a_hint.setStyleSheet("color: #888;")
@@ -782,7 +781,6 @@ class ModeScreen(QWidget):
         m_layout.setSpacing(12)
         m_layout.setContentsMargins(4, 20, 4, 20)
         m_desc = BodyLabel("指定专题班或课程 URL，精确学习")
-        m_desc.setStyleSheet("line-height: 1.6;")
         m_layout.addWidget(m_desc)
         m_hint = CaptionLabel("适合：学习特定课程、补学指定内容")
         m_hint.setStyleSheet("color: #888;")
@@ -2264,8 +2262,9 @@ class MainWindow(_BaseWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("润物 Moisten")
-        self.resize(1000, 650)
-        self.setMinimumSize(800, 500)
+        # 默认/最小尺寸要足够容纳各设置页内容（过小会导致文字被裁切）
+        self.resize(1080, 720)
+        self.setMinimumSize(900, 640)
         self._drag_pos = None
 
         # 设置窗口图标
