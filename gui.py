@@ -842,6 +842,17 @@ class ManualScreen(QWidget):
         super().__init__(parent)
         self._build_ui()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 每次进入手动页时回填已保存的 URL（重启/重新进入后依然可见可用）
+        try:
+            win = self.window()
+            saved = getattr(win, "cfg_manual_urls", [])
+            if saved and not self.text_urls.toPlainText().strip():
+                self.text_urls.setPlainText("\n".join(saved))
+        except Exception:
+            pass
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 30, 40, 30)
@@ -2584,6 +2595,10 @@ del "%~f0"
                 return False
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            # 先恢复模式与手动URL（即使配置不完整返回 False，也要恢复，
+            # 供手动页回填与手动模式自动开始使用）
+            self.cfg_mode = cfg.get("mode", "auto")
+            self.cfg_manual_urls = cfg.get("manual_urls", [])
             if "workers" not in cfg:
                 return False
             self.cfg_workers = cfg.get("workers", 5)
@@ -2595,9 +2610,6 @@ del "%~f0"
             self.cfg_online_goal = cfg.get("online_goal", 0)
             self.cfg_central_mode = cfg.get("central_mode", "target")
             self.cfg_online_mode = cfg.get("online_mode", "target")
-            # 模式互斥：恢复上次选择（手动模式带URL，自动模式带目标）
-            self.cfg_mode = cfg.get("mode", "auto")
-            self.cfg_manual_urls = cfg.get("manual_urls", [])
             # 向后兼容旧格式：仅当新格式字段未设置时才回退旧 study_goal
             if cfg.get("study_goal", 0) > 0 and not (self.cfg_central_goal or self.cfg_online_goal):
                 if cfg.get("goal_type") == "central":
