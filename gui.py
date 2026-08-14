@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import urllib.request
 import platform
 import sys
@@ -2976,6 +2977,21 @@ def _get_resource_path(filename):
     return os.path.join(base, filename)
 
 
+def _updated_exe_name(old_path: str) -> str:
+    """根据旧文件名与新版本号，计算更新后的文件名（保留用户命名风格）。
+
+    - 旧文件带版本号（如 Moisten-1.7.5-Windows.exe）→ 版本号换成新版本
+      （Moisten-1.7.6-Windows.exe），文件名与真实版本一致，不再出现"新版旧名"
+    - 旧文件无版本号（如 Moisten.exe）→ 保持原名，快捷方式不失效
+    """
+    base = os.path.basename(old_path)
+    m = re.match(r"^(.*?)-(\d+\.\d+\.\d+)(.*?)(\.\w+)$", base)
+    if m:
+        prefix, _old_ver, middle, ext = m.groups()
+        return f"{prefix}-{CURRENT_VERSION}{middle}{ext}"
+    return base
+
+
 def _handle_self_update():
     """新版本启动时清理旧版（Windows 同目录更新方案）。
 
@@ -2997,13 +3013,15 @@ def _handle_self_update():
 
         def _cleanup():
             import time as _t
+            # 目标文件名：旧名带版本号则换新版本号，否则保持原名
+            target = os.path.join(os.path.dirname(old_path), _updated_exe_name(old_path))
             for _ in range(60):  # 最多等 60 秒（旧进程约 300ms 后退出）
                 try:
-                    if os.path.exists(old_path):
+                    if os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(target):
                         os.remove(old_path)  # 删除旧版（旧进程已退出，文件已解锁）
-                    # 把自己改回规范名（Windows 允许重命名运行中的 exe）
-                    if os.path.basename(current) != os.path.basename(old_path):
-                        os.rename(current, old_path)
+                    # 把自己改名为目标名（Windows 允许重命名运行中的 exe）
+                    if os.path.abspath(target) != current:
+                        os.rename(current, target)
                     return
                 except OSError:
                     _t.sleep(1)
