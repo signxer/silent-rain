@@ -6,44 +6,40 @@
 
 ## 功能
 
-- **自动登录** — 记住账号密码，下次自动填充
-- **双模式学习** — 自动模式（按学时目标学习）/ 手动模式（指定专题班 URL）
+- **自动登录** — 记住账号密码（系统钥匙串存储），下次自动填充
+- **双模式学习** — 自动模式（按学时目标学习）/ 手动模式（指定专题班或课程 URL）
 - **双目标支持** — 集中培训、网络自学独立设置，支持「总学时」和「差额补修」两种计算方式
+- **网络自学走课程列表** — 网络自学从 `u.ccb.com/course/#/list/1` 直接找课程，不走专题班
 - **标签筛选** — 按标签筛选专题班，支持多选，记住上次选择
 - **多线程并发** — 可配置 1-20 个工作线程同时学习
 - **无头模式** — 后台运行，不显示浏览器界面
 - **断点续学** — 记住学习进度和页码，下次自动从上次位置继续
 - **Fluent Design 界面** — 基于 QFluentWidgets，支持深色/浅色主题自适应
 
-## 安装
+## 安装（源码运行）
 
 ```bash
-git clone https://github.com/signxer/CCBU-Auto.git
-cd CCBU-Auto
+git clone https://github.com/signxer/silent-rain.git
+cd silent-rain
 pip install -r requirements.txt
-playwright install chromium
+python -m playwright install chromium
 ```
 
 Mac 用户也可运行 `./setup.sh` 一键安装。
 
-### 下载打包版本
+## 下载打包版本
 
-从 [Releases](https://github.com/signxer/CCBU-Auto/releases) 下载对应平台的可执行文件。
+从 [Releases](https://github.com/signxer/silent-rain/releases) 下载对应平台的可执行文件（发布仓库：https://github.com/signxer/Moisten）。
 
-**macOS 用户**：首次打开可能提示"已损坏"，需要在终端执行：
+**打包版本已内置 Chromium 浏览器**，无需额外安装 Playwright。
 
-```bash
-xattr -cr /path/to/CCBU-Auto.app
-```
-
-或右键 → 打开 → 仍然打开。
-
-**首次运行前**需要先安装 Playwright 浏览器引擎：
+**macOS 用户**：由于未进行 Apple 开发者签名，首次打开可能提示"已损坏"，需要在终端执行：
 
 ```bash
-pip3 install playwright
-python3 -m playwright install chromium
+xattr -cr /path/to/Moisten.app
 ```
+
+或右键 → 打开 → 仍然打开。Intel 与 Apple Silicon（通过 Rosetta）均可运行。
 
 ## 使用
 
@@ -63,42 +59,25 @@ python3 main.py start --headless --workers 5
 python3 main.py hours
 ```
 
-## 界面预览
+## 数据文件
 
-```
-┌─ 润物 Moisten ──────────────────────────────────┐
-│                                                         │
-│  ┌─ 培训学时 ────┐ ┌─ 学习目标 ────┐                   │
-│  │ 集中: 82.5 学时│ │ 集中总193学时 │   ┌─ 日志 ────┐  │
-│  │ 网络: 6.0 学时│ │    ╭─────╮    │   │ [10:23] .. │  │
-│  │ 更新: 09:40  │ │    │42.7%│    │   │ [10:24] .. │  │
-│  └───────────────┘ │    ╰─────╯    │   │ [10:25] .. │  │
-│                     └──────────────┘   └────────────┘  │
-│  ┌─ 学习进度 ──────────────────────────┐               │
-│  │ 课程              │ 进度 │ 预计 │ 状态│               │
-│  │ 正确用人导向...    │ 90%  │ 9m   │学习中│               │
-│  │ 正确政绩观...      │ 45%  │ 8m   │学习中│               │
-│  └─────────────────────────────────────┘               │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 配置文件
+打包版本数据存于用户数据目录（macOS：`~/Library/Application Support/Moisten`，Windows：`%APPDATA%\Moisten`），源码运行则存于项目目录：
 
 | 文件 | 说明 |
 |------|------|
-| `ccbu_config.json` | 运行配置（线程数、无头模式、学习目标） |
-| `ccbu_credentials.json` | 账号密码 |
-| `ccbu_progress.json` | 学习进度和已完成专题班 |
-| `ccbu_session.json` | 浏览器会话状态 |
-| `ccbu_tags.json` | 标签筛选状态 |
+| `moisten_config.json` | 运行配置（线程数、无头模式、学习目标） |
+| `moisten_credentials.json` | 账号（密码存系统钥匙串，此文件仅存混淆兜底） |
+| `moisten_progress.json` | 学习进度和已完成专题班 |
+| `moisten_session.json` | 浏览器会话状态 |
+| `moisten_tags.json` | 标签筛选状态 |
 
 ## 打包
 
-GitHub Actions 自动打包 Windows EXE：
+GitHub Actions 在推送 `v*` 标签时自动打包 Windows EXE + macOS DMG 并同步发布到 Moisten 仓库：
 
 ```bash
-# 手动打包
-pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --name=CCBU-Auto-GUI gui.py
+# 手动打包（需先 playwright install chromium 并配置浏览器路径）
+pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --add-data="VERSION;." --name=Moisten gui.py
 ```
 
 ## 许可证

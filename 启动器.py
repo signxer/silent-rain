@@ -23,6 +23,16 @@ def show_error(msg):
 
 
 def check_and_install():
+    """仅开发环境使用：源码运行时检查依赖并安装。
+
+    注意：本启动器面向源码运行（python3 启动器.py），不适用于 PyInstaller
+    冻结产物（冻结后 requirements.txt/gui.py 不在可执行文件旁）。
+    """
+    # 分发包名 -> 实际 import 名（部分包名与模块名不一致）
+    IMPORT_MAP = {
+        "PySide6-Fluent-Widgets": "qfluentwidgets",
+        "python-dotenv": "dotenv",
+    }
     req_file = os.path.join(SCRIPT_DIR, "requirements.txt")
     missing = []
     with open(req_file, "r") as f:
@@ -31,8 +41,11 @@ def check_and_install():
             if not line or line.startswith("#"):
                 continue
             pkg = line.split(">=")[0].split("==")[0].split("<")[0].strip()
+            if ";" in pkg:  # 环境标记（如 platform_system == "Windows"）
+                pkg = pkg.split(";")[0].strip()
+            mod = IMPORT_MAP.get(pkg, pkg.replace("-", "_").split("[")[0])
             try:
-                __import__(pkg.replace("-", "_").split("[")[0])
+                __import__(mod)
             except ImportError:
                 missing.append(line)
 

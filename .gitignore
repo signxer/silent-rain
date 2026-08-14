@@ -22,4 +22,10 @@ venv/
 .DS_Store
 debug_collect.log
 CCBUAutoV2_Mac.zip
-*.zip
+
+# 构建产物
+launcher.log
+dist/
+build/
+*.spec
+.env
