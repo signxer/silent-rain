@@ -5,6 +5,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+env:
+  RELEASE_REPO: signxer/Moisten
+
 jobs:
   # ── Windows ──
   build-windows:
@@ -23,6 +26,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # 打包内置 Chromium：PLAYWRIGHT_BROWSERS_PATH=0 会把浏览器装进
+      # playwright/driver/package/.local-browsers，随包分发后冻结版才能启动浏览器
+      - name: Install Playwright Chromium (bundled)
+        shell: bash
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium
+
       - name: Get version
         id: version
         shell: bash
@@ -32,7 +42,12 @@ jobs:
 
       - name: Build GUI EXE
         shell: bash
-        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --add-data="VERSION;." --name=Moisten gui.py
+        run: |
+          BROWSER_DIR=$(python -c "import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), 'driver', 'package', '.local-browsers'))")
+          pyinstaller -F -w --icon=icon.ico \
+            --add-data="icon.png;." --add-data="VERSION;." \
+            --add-data="$BROWSER_DIR;playwright/driver/package/.local-browsers" \
+            --name=Moisten gui.py
 
       - name: Rename
         shell: bash
@@ -46,8 +61,9 @@ jobs:
           retention-days: 1
 
   # ── macOS ──
+  # macos-13 = Intel runner，产物 x86_64：Intel 原生运行，Apple Silicon 走 Rosetta
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +77,11 @@ jobs:
           python3 -m pip install --upgrade pip
           pip3 install -r requirements.txt
           pip3 install pyinstaller
+
+      # 打包内置 Chromium（不再删除 .local-browsers）
+      - name: Install Playwright Chromium (bundled)
+        run: |
+          PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium
 
       - name: Get version
         id: version
@@ -84,20 +105,13 @@ jobs:
           iconutil -c icns icon.iconset -o icon.icns
           rm -rf icon.iconset
 
-      - name: Clean Playwright local browsers
-        run: |
-          # 删除 Playwright 包内的本地浏览器缓存
-          python3 -c "
-          import playwright, os, shutil
-          pkg_dir = os.path.dirname(playwright.__file__)
-          for root, dirs, files in os.walk(pkg_dir):
-              if '.local-browsers' in dirs:
-                  shutil.rmtree(os.path.join(root, '.local-browsers'))
-                  print(f'Removed: {os.path.join(root, \".local-browsers\")}')
-          "
-
       - name: Build GUI .app
-        run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --add-data="VERSION:." --name=Moisten gui.py
+        run: |
+          BROWSER_DIR=$(python3 -c "import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), 'driver', 'package', '.local-browsers'))")
+          pyinstaller -F -w --icon=icon.icns \
+            --add-data="icon.png:." --add-data="VERSION:." \
+            --add-data="$BROWSER_DIR:playwright/driver/package/.local-browsers" \
+            --name=Moisten gui.py
 
       - name: Create DMG
         run: |
@@ -107,17 +121,22 @@ jobs:
           mkdir -p Moisten.app/Contents/Resources
           cp dist/Moisten Moisten.app/Contents/MacOS/
           cp icon.png Moisten.app/Contents/Resources/
-          cat > Moisten.app/Contents/Info.plist << 'EOF'
+          cat > Moisten.app/Contents/Info.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-          <key>CFBundleExecutable><string>Moisten</string>
+          <key>CFBundleExecutable</key><string>Moisten</string>
           <key>CFBundleIconFile</key><string>icon</string>
-          <key>CFBundleName><string>Moisten</string>
+          <key>CFBundleName</key><string>Moisten</string>
           <key>CFBundleIdentifier</key><string>com.moisten.app</string>
-          <key>CFBundleVersion</key><string>1.0</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleVersion</key><string>${{ steps.version.outputs.VERSION }}</string>
+          <key>CFBundleShortVersionString</key><string>${{ steps.version.outputs.VERSION }}</string>
+          <key>LSMinimumSystemVersion</key><string>10.15</string>
           </dict></plist>
           EOF
+          # 校验 plist 合法性，非法直接失败（避免发布打不开的 .app）
+          plutil -lint Moisten.app/Contents/Info.plist
           cp -r Moisten.app dmg-dist/
           ln -sf /Applications dmg-dist/Applications
           hdiutil create -volname Moisten -srcfolder dmg-dist -ov -format UDZO dist/Moisten-${{ steps.version.outputs.VERSION }}-macOS.dmg
@@ -159,28 +178,38 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SYNC_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${{ github.ref_name }}"
+          # 只处理 tag 触发；手动触发（分支名）直接跳过，避免产生垃圾 release
+          case "$TAG" in v*) ;; *) echo "跳过：非 tag 触发 ($TAG)"; exit 0 ;; esac
           VER="${TAG#v}"
           # 从git commits自动生成更新日志
-          PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1)
+          PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1 || true)
           if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TAG" ]; then
             NOTES=$(git log ${PREV_TAG}..${TAG} --pretty=format:"- %s" --no-merges | head -20)
           else
             NOTES=$(git log --pretty=format:"- %s" --no-merges -10)
           fi
-          # 更新CHANGELOG.md
-          echo -e "\n## ${VER}\n${NOTES}\n$(cat CHANGELOG.md)" > CHANGELOG.md
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add CHANGELOG.md
-          git diff --cached --quiet || git commit -m "docs: CHANGELOG ${VER}"
-          git push || true
-          # 创建release
+          # 更新本仓库 CHANGELOG.md（用 API 直接写，避免 detached HEAD 上 git push 失败被吞）
+          NEW_CHANGELOG="# 更新日志
+
+          ## ${VER}
+          ${NOTES}
+          $(cat CHANGELOG.md)"
+          SHA=$(gh api repos/${{ github.repository }}/contents/CHANGELOG.md --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$SHA" ]; then
+            gh api repos/${{ github.repository }}/contents/CHANGELOG.md \
+              --method PUT \
+              --field message="docs: CHANGELOG ${VER}" \
+              --field content="$(echo "$NEW_CHANGELOG" | base64)" \
+              --field sha="$SHA"
+          fi
+          # 创建release（发布仓库）
           gh release create "${TAG}" \
-            --repo signxer/Moisten \
+            --repo "$RELEASE_REPO" \
             --title "润物 Moisten ${TAG}" \
             --notes "$NOTES" \
-            artifacts/**/* || true
+            artifacts/**/*
           # 更新releases.json（含更新日志）
           WIN_SIZE=$(stat -c%s artifacts/**/*Windows*.exe 2>/dev/null || echo "0")
           MAC_SIZE=$(stat -c%s artifacts/**/*macOS*.dmg 2>/dev/null || echo "0")
@@ -188,11 +217,11 @@ jobs:
           cat > /tmp/releases.json << EOF
           {"tag":"${TAG}","assets":[{"name":"Windows","file":"Moisten-${VER}-Windows.exe","size":${WIN_SIZE}},{"name":"macOS","file":"Moisten-${VER}-macOS.dmg","size":${MAC_SIZE}}],"notes":${NOTES_JSON}}
           EOF
-          gh api repos/signxer/Moisten/contents/releases.json \
+          gh api repos/$RELEASE_REPO/contents/releases.json \
             --method PUT \
             --field message="update releases.json for ${TAG}" \
             --field content="$(base64 < /tmp/releases.json)" \
-            --field sha="$(gh api repos/signxer/Moisten/contents/releases.json --jq '.sha')" || true
+            --field sha="$(gh api repos/$RELEASE_REPO/contents/releases.json --jq '.sha')"
 
       - name: Cleanup artifacts
         if: always()
@@ -206,15 +235,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_SYNC_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${{ github.ref_name }}"
+          case "$TAG" in v*) ;; *) exit 0 ;; esac
           VER="${TAG#v}"
-          # 获取当前VERSION文件的SHA
           SHA=$(gh api repos/${{ github.repository }}/contents/VERSION --jq '.sha' 2>/dev/null || echo "")
           if [ -n "$SHA" ]; then
-            echo -n "$VER" | base64 > /tmp/version_b64
             gh api repos/${{ github.repository }}/contents/VERSION \
               --method PUT \
               --field message="chore: VERSION ${VER}" \
               --field content="$(echo -n "$VER" | base64)" \
-              --field sha="$SHA" || true
+              --field sha="$SHA"
           fi
