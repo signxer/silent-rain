@@ -105,6 +105,23 @@ def _ver_tuple(v):
     return tuple(parts)
 
 
+def _looks_like_executable(path) -> bool:
+    """粗略校验下载文件是否为可执行文件（PE/Mach-O 魔数）。
+
+    用于拦截 gh-proxy 等代理返回的错误页/截断文件被当作安装包
+    替换掉正在运行的程序（否则重启时报 PyInstaller
+    "Failed to start python interpreter"）。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        if sys.platform == "win32":
+            return head[:2] == b"MZ"  # PE 可执行文件
+        # macOS：Mach-O / universal binary 魔数
+        return head[:2] == b"MZ" or head in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
+    except Exception:
+        return False
+
+
 def check_for_update():
     """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志, 下载URL)"""
     data = None
@@ -2414,39 +2431,67 @@ class MainWindow(_BaseWindow):
         _bridge.fail.connect(lambda err: InfoBar.error("更新失败", err, parent=self, position=InfoBarPosition.TOP))
 
         def do_download():
+            import tempfile as _tf
+            import time as _tm
+            from PySide6.QtCore import QMetaObject, Q_ARG
             try:
-                import tempfile
                 filename = url.split("/")[-1]
-                download_path = os.path.join(tempfile.gettempdir(), filename)
+                download_path = os.path.join(_tf.gettempdir(), filename)
 
-                download_url = url
+                # 候选下载源：直连优先；直连失败再走代理
+                candidates = [url]
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "Moisten"}, method="HEAD")
-                    urllib.request.urlopen(req, timeout=10)
-                except:
-                    download_url = f"https://gh-proxy.com/{url}"
+                    urllib.request.urlopen(req, timeout=10).close()
+                except Exception:
+                    candidates.append(f"https://gh-proxy.com/{url}")
 
-                req = urllib.request.Request(download_url, headers={"User-Agent": "Moisten"})
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    total = int(resp.headers.get("Content-Length", 0))
-                    downloaded = 0
-                    with open(download_path, "wb") as f:
-                        while True:
-                            if cancel_flag[0]:
+                # 下载 + 完整性校验（大小一致 + 可执行文件头），失败自动重试
+                ok = False
+                last_err = ""
+                for dl_url in candidates:
+                    for attempt in range(3):
+                        if cancel_flag[0]:
+                            return
+                        try:
+                            req = urllib.request.Request(dl_url, headers={"User-Agent": "Moisten"})
+                            with urllib.request.urlopen(req, timeout=300) as resp:
+                                total = int(resp.headers.get("Content-Length", 0))
+                                downloaded = 0
+                                with open(download_path, "wb") as f:
+                                    while True:
+                                        if cancel_flag[0]:
+                                            os.remove(download_path)
+                                            return
+                                        chunk = resp.read(8192)
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        if total > 0:
+                                            pct = int(downloaded / total * 100)
+                                            size_mb = downloaded / 1024 / 1024
+                                            total_mb = total / 1024 / 1024
+                                            QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, pct))
+                                            QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, f"已下载 {size_mb:.1f} / {total_mb:.1f} MB ({pct}%)"))
+                            # 完整性校验：拦截代理错误页/截断文件
+                            if total > 0 and downloaded != total:
+                                raise RuntimeError(f"下载不完整（{downloaded}/{total} 字节），已中止")
+                            if not _looks_like_executable(download_path):
+                                raise RuntimeError("下载文件校验失败（非有效安装包，下载源可能返回了错误页）")
+                            ok = True
+                            break
+                        except Exception as e:
+                            last_err = str(e)
+                            try:
                                 os.remove(download_path)
-                                return
-                            chunk = resp.read(8192)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total > 0:
-                                pct = int(downloaded / total * 100)
-                                size_mb = downloaded / 1024 / 1024
-                                total_mb = total / 1024 / 1024
-                                from PySide6.QtCore import QMetaObject, Q_ARG
-                                QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, pct))
-                                QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, f"已下载 {size_mb:.1f} / {total_mb:.1f} MB ({pct}%)"))
+                            except Exception:
+                                pass
+                            _tm.sleep(2)
+                    if ok:
+                        break
+                if not ok:
+                    raise RuntimeError(f"下载失败: {last_err}")
 
                 QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, "下载完成，正在安装..."))
                 QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, 100))
@@ -2473,7 +2518,7 @@ class MainWindow(_BaseWindow):
         current = sys.executable
 
         if _plat.system() == "Windows" and current.endswith(".exe"):
-            # 写一个bat脚本：等主程序退出 → 替换 → 重启
+            # 写一个bat脚本：等主程序退出 → 备份旧版 → 替换 → 重启
             bat_path = os.path.join(tempfile.gettempdir(), "moisten_update.bat")
             with open(bat_path, "w") as f:
                 f.write(f"""@echo off
@@ -2484,6 +2529,7 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak >nul
     goto wait
 )
+copy /y "{current}" "{current}.bak" >nul 2>&1
 copy /y "{download_path}" "{current}" >nul
 del "{download_path}" >nul
 start "" "{current}"
