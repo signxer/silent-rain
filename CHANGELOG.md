@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.7.5
+- chore: VERSION 1.7.5
+- fix(ui): 卡片viewLayout为QHBoxLayout导致双层边距叠加+高度计算异常——边距只设卡片层、内层归零；文字/输入框/按钮显式高度杜绝裁切；内容贴分割线
+- chore: VERSION 1.7.4
+- docs: CHANGELOG 1.7.4
+# 更新日志
+
 ## 1.7.4
 - fix(手动模式): 手动页回填已保存URL（重启后可见可用）；_load_saved_config提前恢复模式与URL；chore: VERSION 1.7.4
 - fix(ui): 移除无单位line-height导致的文字裁切；调大窗口默认/最小尺寸(1080x720/900x640)避免内容被挤压
