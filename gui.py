@@ -10,13 +10,12 @@ import threading
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QEventLoop
-from PySide6.QtGui import QColor, QFont, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
-    QHeaderView, QSizePolicy, QSpacerItem,
-    QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QLabel,
+    QHeaderView, QScrollArea,
+    QDialog, QLabel,
 )
 
 from qfluentwidgets import (
@@ -27,13 +26,12 @@ from qfluentwidgets import (
     LineEdit, SpinBox, SwitchButton,
     RadioButton, CheckBox,
     TableWidget, ProgressBar, ProgressRing,
-    PlainTextEdit, TextEdit,
+    PlainTextEdit,
     SubtitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel,
     TitleLabel, IconWidget,
     InfoBar, InfoBarPosition,
     MessageBox, Dialog,
-    HyperlinkButton,
-    isDarkTheme, setTheme, Theme,
+    setTheme, Theme,
 )
 
 from main import AutoLearner, CONFIG_PATH, PROGRESS_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH
@@ -50,10 +48,16 @@ class AsyncThread(QThread):
     tag_request_signal = Signal(dict)
     tag_confirm_signal = Signal(list, dict)  # (saved_tags, tags_by_category)
     page_confirm_signal = Signal(int)  # last_page
+    eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
         self._coro_func = coro_func
+        self._stop_event = threading.Event()
+
+    def request_stop(self):
+        """请求协作式停止：学习协程在检查点主动退出"""
+        self._stop_event.set()
 
     def run(self):
         if sys.platform == "win32":
@@ -80,7 +84,8 @@ def _get_version():
     # 从VERSION文件读取
     vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
     if os.path.exists(vf):
-        return open(vf).read().strip().lstrip("v")
+        with open(vf, encoding="utf-8") as f:
+            return f.read().strip().lstrip("v")
     return "dev"
 
 CURRENT_VERSION = _get_version()
@@ -303,7 +308,17 @@ class LoginScreen(QWidget):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     self._creds = json.load(f)
-                # 解密密码
+                # 密码：优先系统钥匙串，回退旧 XOR 字段
+                username = self._creds.get("username", "")
+                if username:
+                    try:
+                        from main import AutoLearner
+                        kp = AutoLearner._load_password(username)
+                        if kp:
+                            self._creds["password"] = kp
+                            return
+                    except:
+                        pass
                 if self._creds.get("password"):
                     try:
                         from main import AutoLearner
@@ -597,7 +612,7 @@ class GoalScreen(QWidget):
         btn_skip = PushButton("  跳过")
         btn_skip.setIcon(FIF.CLOSE)
         btn_skip.setFixedSize(120, 40)
-        btn_skip.clicked.connect(lambda: self._on_done(False, 0, False, 0))
+        btn_skip.clicked.connect(lambda: self._on_done(False, 0, "target", False, 0, "target"))
         btn_layout.addWidget(btn_skip)
 
         btn_next = PrimaryPushButton("  继续")
@@ -668,6 +683,11 @@ class ModeScreen(QWidget):
         subtitle.setStyleSheet("color: #888;")
         layout.addWidget(subtitle)
 
+        # 当前模式提示（互斥）
+        self.lbl_current = CaptionLabel("")
+        self.lbl_current.setStyleSheet("color: #107c10;")
+        layout.addWidget(self.lbl_current)
+
         layout.addSpacing(24)
 
         # Auto mode card
@@ -720,9 +740,37 @@ class ModeScreen(QWidget):
 
         layout.addStretch()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        win = self.window()
+        mode = getattr(win, "cfg_mode", "auto")
+        self.lbl_current.setText(
+            f"当前模式：{'自动模式' if mode == 'auto' else '手动模式'}（两模式互斥，切换会清空另一种模式的设置）")
+
     def _select_mode(self, mode):
         win = self.window()
         win.cfg_mode = mode
+        # 互斥：选择一种模式即清空另一种模式的配置，避免两套设置混在一起
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg["mode"] = mode
+            if mode == "auto":
+                win.cfg_manual_urls = []
+                cfg.pop("manual_urls", None)
+            else:
+                win.cfg_central_goal = 0
+                win.cfg_online_goal = 0
+                cfg.pop("central_goal", None)
+                cfg.pop("online_goal", None)
+                cfg.pop("central_mode", None)
+                cfg.pop("online_mode", None)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except:
+            pass
         if mode == "auto":
             win.next_screen()  # → goal → tags → dashboard
         else:
@@ -807,6 +855,18 @@ class ManualScreen(QWidget):
 
         win = self.window()
         win.cfg_manual_urls = urls
+        # 持久化手动模式与URL（重启后仍按手动模式继续）
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg["mode"] = "manual"
+            cfg["manual_urls"] = urls
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except:
+            pass
         win.next_screen()  # → dashboard
 
 
@@ -982,7 +1042,44 @@ class DashboardScreen(QWidget):
 
         layout.addLayout(main_area, 1)
 
+    def _stop_current_learning(self):
+        """停止正在运行的学习任务（配置变更/重新开始时调用）"""
+        # 1) 解除可能阻塞 worker 的对话框等待
+        for ev in ("_tag_event", "_page_event"):
+            ev_obj = getattr(self, ev, None)
+            if ev_obj:
+                ev_obj.set()
+        # 2) 请求协作式停止：学习引擎在课程/阶段边界主动退出
+        learner = getattr(self, "_learner", None)
+        if learner:
+            try:
+                learner._stop_event.set()
+            except Exception:
+                pass
+        worker = getattr(self, "_worker", None)
+        if worker:
+            worker.request_stop()
+
     def start_learning(self):
+        # 已有学习线程在运行：先停止旧任务并关闭其浏览器，再用新配置重新开始
+        old_worker = getattr(self, "_worker", None)
+        if old_worker and old_worker.isRunning():
+            self._on_log("检测到学习中，正在停止旧任务...", "yellow")
+            old_learner = getattr(self, "_learner", None)
+            self._stop_current_learning()
+            if not old_worker.wait(15000):
+                self._on_log("旧任务未能在限时内停止，请稍后重试", "red")
+                return
+            # 关闭旧 learner 的浏览器，避免新旧两个浏览器并存
+            if old_learner:
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(old_learner.close())
+                    loop.close()
+                except:
+                    pass
+            self._on_log("旧任务已停止，使用新配置重新开始", "green")
         win = self.window()
         self._init_table(win.cfg_workers)
         self._set_goal_info(win)
@@ -998,6 +1095,7 @@ class DashboardScreen(QWidget):
 
         self._learner = None  # 保存learner引用用于退出时清理
         self._worker = AsyncThread(self._run_learning, self)
+        self._worker.win = win  # GUI线程捕获窗口引用，worker不再跨线程调用 window()
         self._worker.log_signal.connect(self._on_log)
         self._worker.progress_signal.connect(self._on_progress)
         self._worker.hours_signal.connect(self._on_hours)
@@ -1005,6 +1103,7 @@ class DashboardScreen(QWidget):
         self._worker.tag_request_signal.connect(self._on_tag_request)
         self._worker.tag_confirm_signal.connect(self._on_tag_confirm)
         self._worker.page_confirm_signal.connect(self._on_page_confirm)
+        self._worker.eta_reset_signal.connect(self._on_eta_reset)
         self._worker.start()
 
     def _init_table(self, workers):
@@ -1016,6 +1115,12 @@ class DashboardScreen(QWidget):
             self.table.setItem(i, 3, QTableWidgetItem("等待中"))
 
     def _set_goal_info(self, win):
+        # 手动模式：无学时目标，显示手动信息而不是"不学习"
+        mode = getattr(win, "cfg_mode", "auto")
+        if mode == "manual":
+            n = len(getattr(win, "cfg_manual_urls", []))
+            self.lbl_goal_info.setText(f"手动模式 · {n} 个URL" if n else "手动模式（未设置URL）")
+            return
         c_goal = getattr(win, "cfg_central_goal", 0)
         o_goal = getattr(win, "cfg_online_goal", 0)
         c_mode = getattr(win, "cfg_central_mode", "target")
@@ -1035,22 +1140,18 @@ class DashboardScreen(QWidget):
         self.lbl_goal_info.setText(" + ".join(parts) + "学时")
 
     async def _run_learning(self, thread: AsyncThread):
-        # 重置 ETA 追踪
-        self._learn_start_time = None
-        self._progress_history = []
-        self._eta_seconds = None
-        self._eta_calc_time = None
-        self._eta_timer.stop()
-        self.lbl_eta.setText("")
+        # 重置 ETA 追踪（在 GUI 线程执行，worker 不跨线程操作 Qt 对象）
+        thread.eta_reset_signal.emit()
 
-        win = self.window()
+        win = thread.win  # GUI线程捕获的窗口引用，避免跨线程 window()
+        # 清除上一轮的固定绝对目标（差额模式下进度环使用）
+        win.cfg_central_abs_goal = 0
+        win.cfg_online_abs_goal = 0
         cfg_workers = getattr(win, "cfg_workers", 1)
         cfg_headless = getattr(win, "cfg_headless", False)
         cfg_username = getattr(win, "cfg_username", "")
         cfg_password = getattr(win, "cfg_password", "")
         cfg_auto_login = getattr(win, "cfg_auto_login", True)
-        cfg_goal_type = getattr(win, "cfg_goal_type", "central")
-        cfg_goal_hours = getattr(win, "cfg_goal_hours", 0)
         cfg_tags = getattr(win, "cfg_tags", [])
         cfg_mode = getattr(win, "cfg_mode", "auto")
         cfg_manual_urls = getattr(win, "cfg_manual_urls", [])
@@ -1094,7 +1195,7 @@ class DashboardScreen(QWidget):
                     cfg_manual_urls, cfg_workers,
                     progress_cb, hours_cb, log
                 )
-                thread.done_signal.emit(0, 0)
+                thread.done_signal.emit(*getattr(learner, "last_stats", (0, 0)))
                 return
 
             # 获取配置（新格式：central_goal/online_goal，0表示不学习）
@@ -1127,7 +1228,10 @@ class DashboardScreen(QWidget):
                             log(f"使用上次记录: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "yellow")
                     else:
                         log(f"当前: 集中{cur_hours['central']:.1f} 网络{cur_hours['online']:.1f} 学时", "blue")
-                    hours_cb(_h)
+                    hours_cb({
+                        "central": _h.get("central", 0), "online": _h.get("online", 0),
+                        "updated": datetime.now().strftime("%H:%M:%S"),
+                    })
 
                     # 保存当前学时到配置（供差额模式计算绝对目标用）
                     try:
@@ -1180,11 +1284,15 @@ class DashboardScreen(QWidget):
             if central_phase:
                 list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
 
-                # 加载专题班列表页（刷新直到标签树出来）
+                # 加载专题班列表页（刷新直到标签树出来，最多重试 N 次防止无限卡死）
                 tags_by_category = {}
                 load_attempt = 0
+                MAX_TAG_LOAD = 10
                 while not tags_by_category:
                     load_attempt += 1
+                    if load_attempt > MAX_TAG_LOAD:
+                        log(f"标签加载失败（{MAX_TAG_LOAD}次），按不筛选继续学习", "yellow")
+                        break
                     try:
                         await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
                         await page.wait_for_timeout(6000)
@@ -1225,17 +1333,28 @@ class DashboardScreen(QWidget):
                     log(f"标签未加载，重试({load_attempt})...", "yellow")
                     await page.wait_for_timeout(3000)
 
+                # 标签选择：等待对话框结果（带超时，防止 worker 永久阻塞）
+                _wait_tag = lambda: asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait),
+                    timeout=180)
+
                 if cfg_tags:
                     # 有已保存标签，询问用户
                     self._tag_event.clear()
                     thread.tag_confirm_signal.emit(cfg_tags, tags_by_category)
-                    await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
+                    try:
+                        await _wait_tag()
+                    except asyncio.TimeoutError:
+                        log("标签选择超时，使用已保存标签", "yellow")
                     cfg_tags = list(getattr(win, "cfg_tags", []))
                 elif tags_by_category:
                     # 无已保存标签，直接弹选择框
                     self._tag_event.clear()
                     thread.tag_request_signal.emit(tags_by_category)
-                    await asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait)
+                    try:
+                        await _wait_tag()
+                    except asyncio.TimeoutError:
+                        log("标签选择超时，按未选择继续", "yellow")
                     cfg_tags = list(getattr(win, "cfg_tags", []))
 
                 log(f"标签: {', '.join(cfg_tags)}" if cfg_tags else "未选择标签，学习全部", "green" if cfg_tags else "yellow")
@@ -1259,7 +1378,13 @@ class DashboardScreen(QWidget):
                     self._page_event = threading.Event()
                     self._page_resume = True
                     thread.page_confirm_signal.emit(last_page)
-                    await asyncio.get_event_loop().run_in_executor(None, self._page_event.wait)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(None, self._page_event.wait),
+                            timeout=120)
+                    except asyncio.TimeoutError:
+                        log("页码确认超时，从第 1 页开始", "yellow")
+                        self._page_resume = False
 
                     if self._page_resume:
                         log(f"跳转到第 {last_page} 页", "blue")
@@ -1274,23 +1399,29 @@ class DashboardScreen(QWidget):
 
             # ── 按阶段顺序学习（先集中培训，再网络自学）──
             for phase_goal_type, phase_goal_hours in phases:
+                # 用户变更配置：停止整个学习流程
+                if thread._stop_event.is_set():
+                    log("学习已停止（配置已变更）", "yellow")
+                    break
                 type_name = "集中培训" if phase_goal_type == "central" else "网络自学"
                 if phase_goal_hours > 0:
                     log(f"━━ 阶段: {type_name} 目标{phase_goal_hours:.0f}学时 ━━", "bold blue")
                 else:
                     log(f"━━ 阶段: {type_name} 无限制 ━━", "bold blue")
 
-                # 重置ETA追踪
-                self._learn_start_time = None
-                self._progress_history = []
-                self._eta_seconds = None
-                self._eta_calc_time = None
+                # 重置ETA追踪（GUI线程执行）
+                thread.eta_reset_signal.emit()
 
                 # study_goal 是绝对目标值（当前学时 + 还需学时）
                 # phase_goal_hours 是"还需"的值，需要加上当前学时
                 try:
                     _cur = (await learner._get_study_hours()).get(phase_goal_type, 0)
                     learner.study_goal = _cur + phase_goal_hours
+                    # 记录固定绝对目标，供GUI进度环显示（差额模式不再随学时增长）
+                    if phase_goal_type == "central":
+                        win.cfg_central_abs_goal = learner.study_goal
+                    else:
+                        win.cfg_online_abs_goal = learner.study_goal
                 except:
                     learner.study_goal = phase_goal_hours
                 learner.goal_type = phase_goal_type
@@ -1298,11 +1429,14 @@ class DashboardScreen(QWidget):
                 if phase_goal_type == "online":
                     # 网络自学：从课程列表页 /course/#/list/1 采集课程学习，
                     # 不走专题班流程
-                    await learner.learn_course_list(
+                    ok = await learner.learn_course_list(
                         "https://u.ccb.com/course/#/list/1",
                         log_callback=log, progress_callback=progress_cb, hours_callback=hours_cb,
                     )
-                    log(f"✓ {type_name}阶段完成", "bold green")
+                    if ok:
+                        log(f"✓ {type_name}阶段完成", "bold green")
+                    else:
+                        log(f"✗ {type_name}阶段未完成（未能获取课程，请检查登录/网络后重试）", "red")
                     continue
 
                 no_more_pages = False
@@ -1311,6 +1445,8 @@ class DashboardScreen(QWidget):
 
                 # 采集课程，至少凑够 worker 数量再开始学（除非已无更多页）
                 while len(tasks) < cfg_workers and not no_more_pages:
+                    if thread._stop_event.is_set():
+                        break
                     workshops = await learner.get_workshops(page)
                     if not workshops:
                         no_more_pages = True
@@ -1330,7 +1466,6 @@ class DashboardScreen(QWidget):
                         no_more_pages = True
                     else:
                         page_num += 1
-                        await page.wait_for_timeout(3000)
                         await page.wait_for_timeout(3000)
 
                 if tasks:
@@ -1372,10 +1507,10 @@ class DashboardScreen(QWidget):
 
                     async def fetch_more_courses(queue):
                         nonlocal no_more_pages, page_num
-                        if no_more_pages:
+                        if no_more_pages or thread._stop_event.is_set():
                             return 0
                         async with _fetch_lock:
-                            if no_more_pages:
+                            if no_more_pages or thread._stop_event.is_set():
                                 return 0
                             # 队列有其他worker补充的课程，不算空
                             if queue.qsize() > 0:
@@ -1452,12 +1587,17 @@ class DashboardScreen(QWidget):
                     await learner.parallel_learn_courses(
                         tasks, ws_locks, fetch_more_courses, progress_cb, hours_cb, log
                     )
+                    if thread._stop_event.is_set():
+                        break
                     log(f"✓ {type_name}阶段完成", "bold green")
                 else:
                     log(f"{type_name}: 没有需要学习的课程", "yellow")
 
-            log("全部学习目标完成!", "bold green")
-            thread.done_signal.emit(0, 0)
+            if thread._stop_event.is_set():
+                log("本次学习已停止（配置已变更），旧任务结束", "yellow")
+            else:
+                log("全部学习目标完成!", "bold green")
+            thread.done_signal.emit(*getattr(learner, "last_stats", (0, 0)))
 
         except Exception as e:
             # 页面/浏览器被关闭时静默处理（用户打开设置页面等场景）
@@ -1490,6 +1630,16 @@ class DashboardScreen(QWidget):
         self.lbl_online.setText(f"网络自学: {data.get('online', 0):.1f} 学时")
         self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
         win = self.window()
+
+        # 手动模式：无学时目标，显示手动信息而不是"不学习"
+        mode = getattr(win, "cfg_mode", "auto")
+        if mode == "manual":
+            n = len(getattr(win, "cfg_manual_urls", []))
+            self.progress_ring.setValue(0)
+            self.lbl_goal_info.setText(f"手动模式 · 按 {n} 个URL学习" if n else "手动模式（未设置URL）")
+            self.lbl_eta.setText("")
+            return
+
         c_goal = getattr(win, "cfg_central_goal", 0)
         o_goal = getattr(win, "cfg_online_goal", 0)
         c_mode = getattr(win, "cfg_central_mode", "target")
@@ -1498,9 +1648,10 @@ class DashboardScreen(QWidget):
         c_cur = data.get("central", 0)
         o_cur = data.get("online", 0)
 
-        # 差额模式：目标 = 已有 + 差额
-        c_target = c_cur + c_goal if c_mode == "remain" else c_goal
-        o_target = o_cur + o_goal if o_mode == "remain" else o_goal
+        # 差额模式：目标 = 阶段开始时固定的绝对目标（已有 + 差额），
+        # 不再用"当前学时 + 差额"动态计算（否则进度环永远到不了100%）
+        c_target = getattr(win, "cfg_central_abs_goal", 0) or (c_cur + c_goal if c_mode == "remain" else c_goal)
+        o_target = getattr(win, "cfg_online_abs_goal", 0) or (o_cur + o_goal if o_mode == "remain" else o_goal)
 
         # 没有目标
         if c_target <= 0 and o_target <= 0:
@@ -1604,9 +1755,21 @@ class DashboardScreen(QWidget):
         finish = datetime.now() + timedelta(seconds=remaining)
         self.lbl_eta.setText(f"剩余{cn}·预计{finish.strftime('%H:%M')}完成")
 
+    def _on_eta_reset(self):
+        """GUI线程内重置ETA状态（由worker通过信号触发，避免跨线程写Qt对象）"""
+        self._learn_start_time = None
+        self._progress_history = []
+        self._eta_seconds = None
+        self._eta_calc_time = None
+        self._eta_timer.stop()
+        self.lbl_eta.setText("")
+
     def _on_done(self, success, failed):
         self._eta_timer.stop()
-        InfoBar.success("完成", f"学习流程结束，成功 {success} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
+        if success or failed:
+            InfoBar.success("完成", f"学习流程结束，成功 {success} 门，失败 {failed} 门", parent=self, position=InfoBarPosition.TOP_RIGHT)
+        else:
+            InfoBar.success("完成", "学习流程结束", parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _check_update_manual(self):
         """手动检查更新"""
@@ -1627,7 +1790,6 @@ class DashboardScreen(QWidget):
             InfoBar.error("检查失败", str(e), parent=self, position=InfoBarPosition.TOP_RIGHT)
 
     def _on_tag_request(self, tags_by_category):
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QScrollArea, QWidget
 
         # 加载上次选择
         saved_tags = set()
@@ -1678,6 +1840,9 @@ class DashboardScreen(QWidget):
             cat_label.setStyleSheet("margin-top: 8px;")
             scroll_layout.addWidget(cat_label)
 
+            # 防御：异常数据（如单个字符串）也按可迭代处理，避免槽抛异常导致事件永不放行
+            if not isinstance(tags, (list, tuple, set)):
+                tags = [tags]
             for tag in tags:
                 all_tags.append(tag)
                 cb = CheckBox(f"  {tag}")
@@ -1739,8 +1904,6 @@ class DashboardScreen(QWidget):
 
     def _on_tag_confirm(self, saved_tags, tags_by_category):
         """有已保存标签时，询问用户：使用已保存 / 重新选择 / 跳过"""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
-        from PySide6.QtCore import QTimer
 
         TIMEOUT = 10  # 秒
 
@@ -1824,8 +1987,6 @@ class DashboardScreen(QWidget):
 
     def _on_page_confirm(self, last_page):
         """询问是否从上次保存的页码继续"""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
-        from PySide6.QtCore import QTimer
 
         TIMEOUT = 10
 
@@ -1919,9 +2080,17 @@ class MainWindow(_BaseWindow):
         dlg.cancelButton.setText("取消")
         dlg.yesButton.setText("退出")
         if dlg.exec():
-            # 清理浏览器
+            dash = getattr(self, "screen_dashboard", None)
+            # 1) 请求协作式停止（置位停止标志、解除对话框等待，让 worker 尽快退出）
+            if dash:
+                dash._stop_current_learning()
+            # 2) 等待 worker 线程结束（限时，避免 GUI 卡死）
+            worker = getattr(dash, "_worker", None) if dash else None
+            if worker and worker.isRunning():
+                worker.wait(10000)
+            # 3) 清理浏览器（worker 结束后再关，避免两个事件循环并发操作同一 context）
             try:
-                learner = self.screen_dashboard._learner
+                learner = dash._learner if dash else None
                 if learner:
                     import asyncio
                     loop = asyncio.new_event_loop()
@@ -1959,7 +2128,6 @@ class MainWindow(_BaseWindow):
         self.cfg_username = ""
         self.cfg_password = ""
         self.cfg_auto_login = True
-        self.cfg_goal_mode = "none"      # none/unlimited/target/remain
         self.cfg_central_goal = 0.0
         self.cfg_online_goal = 0.0
         self.cfg_tags = []
@@ -2079,6 +2247,13 @@ class MainWindow(_BaseWindow):
 
         cancel_flag = [False]
 
+        # 下载线程完成后切回 GUI 线程执行安装/提示（Qt 控件只能在 GUI 线程操作）
+        from PySide6.QtCore import QObject as _QObject
+        class _UpdateBridge(_QObject):
+            apply = Signal(str)
+        _bridge = _UpdateBridge()
+        _bridge.apply.connect(self._apply_update)
+
         def do_download():
             try:
                 import tempfile
@@ -2116,7 +2291,7 @@ class MainWindow(_BaseWindow):
 
                 QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, "下载完成，正在安装..."))
                 QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, 100))
-                self._apply_update(download_path)
+                _bridge.apply.emit(download_path)
 
             except Exception as e:
                 QMetaObject.invokeMethod(dlg, "reject", Qt.QueuedConnection)
@@ -2204,8 +2379,11 @@ rm -f "{sh_path}"
             self.cfg_online_goal = cfg.get("online_goal", 0)
             self.cfg_central_mode = cfg.get("central_mode", "target")
             self.cfg_online_mode = cfg.get("online_mode", "target")
-            # 向后兼容旧格式
-            if cfg.get("study_goal", 0) > 0:
+            # 模式互斥：恢复上次选择（手动模式带URL，自动模式带目标）
+            self.cfg_mode = cfg.get("mode", "auto")
+            self.cfg_manual_urls = cfg.get("manual_urls", [])
+            # 向后兼容旧格式：仅当新格式字段未设置时才回退旧 study_goal
+            if cfg.get("study_goal", 0) > 0 and not (self.cfg_central_goal or self.cfg_online_goal):
                 if cfg.get("goal_type") == "central":
                     self.cfg_central_goal = cfg["study_goal"]
                 else:
@@ -2218,7 +2396,15 @@ rm -f "{sh_path}"
                     creds = json.load(f)
                 self.cfg_username = creds.get("username", "")
                 self.cfg_password = creds.get("password", "")
-                # 解密密码
+                # 密码：优先系统钥匙串，回退旧 XOR 字段
+                if self.cfg_username:
+                    try:
+                        from main import AutoLearner
+                        kp = AutoLearner._load_password(self.cfg_username)
+                        if kp:
+                            self.cfg_password = kp
+                    except:
+                        pass
                 if self.cfg_password:
                     try:
                         from main import AutoLearner
@@ -2303,6 +2489,22 @@ def _get_resource_path(filename):
 
 
 def main():
+    # 打包为 windowed 模式（-w）时没有控制台，启动期致命错误必须弹窗可见
+    try:
+        _main()
+    except Exception as e:
+        import traceback
+        try:
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(None, "Moisten 启动失败",
+                                 f"{e}\n\n{traceback.format_exc()}")
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+def _main():
     import platform, multiprocessing
     multiprocessing.freeze_support()
     # 抑制 Qt 字体警告
