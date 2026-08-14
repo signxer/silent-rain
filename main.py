@@ -154,7 +154,7 @@ def safe_print(text, style=None):
         print(text)
 
 
-DEBUG_LOG = "ccbu_debug.log"
+DEBUG_LOG = "moisten_debug.log"
 
 def init_debug_log():
     # 清空调试日志
@@ -3726,7 +3726,7 @@ class AutoLearner:
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx):
-    """建行学习自动学习工具"""
+    """网络课程自动学习工具"""
     if ctx.invoked_subcommand is None:
         ctx.invoke(start)
 

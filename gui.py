@@ -218,7 +218,7 @@ class WelcomeScreen(QWidget):
         self.lbl_title.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_title)
 
-        self.lbl_sub = BodyLabel("建行大学自动学习工具 · 随风潜入夜，润物细无声")
+        self.lbl_sub = BodyLabel("网络课程自动学习工具 · 随风潜入夜，润物细无声")
         self.lbl_sub.setStyleSheet("color: #888;")
         self.lbl_sub.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_sub)
@@ -1070,7 +1070,7 @@ class ManualScreen(QWidget):
 
         urls = [line.strip() for line in text.split("\n") if line.strip() and "ccb.com" in line]
         if not urls:
-            InfoBar.warning("提示", "未识别到有效的CCB URL", parent=self, position=InfoBarPosition.TOP)
+            InfoBar.warning("提示", "未识别到有效的课程URL", parent=self, position=InfoBarPosition.TOP)
             return
 
         win = self.window()
