@@ -1,5 +1,14 @@
 # 更新日志
 
+## 1.7.8
+- chore: VERSION 1.7.8
+- chore: 欢迎页副标题、URL提示、脚本注释、日志文件名去品牌化
+- chore: VERSION 1.7.7
+- docs: CHANGELOG 1.7.7
+- chore: VERSION 1.7.6
+- docs: CHANGELOG 1.7.6
+# 更新日志
+
 ## 1.7.7
 - chore: VERSION 1.7.7
 - fix(自动更新): 更新后exe文件名保留命名风格、版本号换成新版本（Moisten-1.7.5→1.7.6），无版本号稳定名保持不变
