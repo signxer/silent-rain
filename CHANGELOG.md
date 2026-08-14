@@ -1,5 +1,15 @@
 # 更新日志
 
+## 1.7.0
+- fix(ci): pyinstaller改回单行命令修复Windows构建失败；macos-13已淘汰改回macos-latest
+- feat: Chromium下载GUI进度等待框；默认系统Chrome+5线程；修复_download_chromium误插init内导致编译错误
+- fix: 不打包Chromium改为运行时按需下载；修复init重复启动驱动泄漏
+- docs: 更新README/依赖上限/启动器依赖映射/gitignore
+- ci: 打包内置Chromium、修复Info.plist、发布同步失败可见、移除签名/公证
+- fix: 全面修复与优化（登录态保存/心跳恢复/跨页定位/线程安全/变更配置即停止旧任务/手动自动模式互斥等）
+- chore: VERSION 1.6.4
+# 更新日志
+
 ## 1.4.9
 - 用户密码加密存储（XOR + base64）
 
