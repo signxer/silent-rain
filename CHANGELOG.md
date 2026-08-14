@@ -1,5 +1,15 @@
 # 更新日志
 
+## 1.7.1
+- feat: 视频卡住时刷新页面重试播放（最多3次），仍卡住才放弃；平台%与本地播放时间都无进展才算卡住
+- feat: 四项优化（O1学时查询60s TTL节流 / O4视频3分钟停滞检测+调用方检查返回值 / O3网络自学断点续学 / B1 Chromium下载真实MB进度）
+- fix(冻结版): Chromium下载与启动路径不一致导致Windows无法启动浏览器（Playwright冻结时setdefault指向临时_MEI目录）；显式设到标准用户缓存目录
+- fix: 收尾体检项（阶段页面关闭/事件等待不泄漏线程/标签框倒计时/目标页刷新/更新对话框取消/注释与重复逻辑清理）
+- fix: 体检修复（hours命令、进度文件锁、版本比较、会话在worker内关闭、subprocess导入、下载超时、更新检查后台化等）+ 设置页布局优化
+- chore: VERSION 1.7.0
+- docs: CHANGELOG 1.7.0
+# 更新日志
+
 ## 1.7.0
 - fix(ci): pyinstaller改回单行命令修复Windows构建失败；macos-13已淘汰改回macos-latest
 - feat: Chromium下载GUI进度等待框；默认系统Chrome+5线程；修复_download_chromium误插init内导致编译错误
