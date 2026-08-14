@@ -39,6 +39,17 @@ load_dotenv()
 console = Console()
 
 
+def _default_browsers_path() -> str:
+    """Playwright 默认浏览器缓存目录（与 node 端默认一致）"""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, "ms-playwright")
+    elif sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~/Library/Caches"), "ms-playwright")
+    else:
+        return os.path.join(os.path.expanduser("~/.cache"), "ms-playwright")
+
+
 class GoalReached(Exception):
     """学习目标已达成，通知上层清理退出"""
     pass
@@ -206,6 +217,13 @@ class AutoLearner:
         # download_callback(start: bool)：下载 Chromium 前回调 True、完成后回调 False，
         # 供 GUI 显示等待进度（GUI 侧通过信号转回主线程）
 
+        # 冻结版关键修复：Playwright 的 transport 在冻结时会用
+        # env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0") 把浏览器路径指向临时 _MEI 解包目录
+        # （每次启动都会被清空，且与下载位置不一致）。
+        # 这里预先设到标准用户缓存目录，setdefault 便不会覆盖，下载与启动用同一持久路径。
+        if getattr(sys, 'frozen', False):
+            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _default_browsers_path())
+
         # 不打包浏览器：Chromium 使用 Playwright 默认缓存目录
         # （macOS: ~/Library/Caches/ms-playwright，Windows: %LOCALAPPDATA%\ms-playwright），
         # 首次使用"内置 Chromium"模式时自动下载
@@ -348,8 +366,12 @@ class AutoLearner:
             if getattr(sys, 'frozen', False):
                 from playwright._impl._driver import compute_driver_executable, get_driver_env
                 node, cli = compute_driver_executable()
+                env = get_driver_env()
+                # 关键：冻结版必须与运行时查找路径一致（标准用户缓存），
+                # 否则会装进临时 _MEI 目录（每次启动丢失）
+                env.setdefault("PLAYWRIGHT_BROWSERS_PATH", _default_browsers_path())
                 # 30 分钟上限：网络挂起时不至于永久阻塞 GUI
-                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env(),
+                r = subprocess.run([node, cli, "install", "chromium"], env=env,
                                    timeout=1800)
             else:
                 r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
