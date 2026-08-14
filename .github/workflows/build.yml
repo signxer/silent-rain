@@ -35,9 +35,8 @@ jobs:
 
       - name: Build GUI EXE
         shell: bash
-        run: pyinstaller -F -w --icon=icon.ico \
-          --add-data="icon.png;." --add-data="VERSION;." \
-          --name=Moisten gui.py
+        # 注意：保持单行命令，多行 \ 续行在 Windows Git Bash 下会解析失败
+        run: pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --add-data="VERSION;." --name=Moisten gui.py
 
       - name: Rename
         shell: bash
@@ -51,9 +50,9 @@ jobs:
           retention-days: 1
 
   # ── macOS ──
-  # macos-13 = Intel runner，产物 x86_64：Intel 原生运行，Apple Silicon 走 Rosetta
+  # macos-latest = Apple Silicon（arm64），Intel Mac 不支持
   build-macos:
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -91,9 +90,8 @@ jobs:
           rm -rf icon.iconset
 
       - name: Build GUI .app
-        run: pyinstaller -F -w --icon=icon.icns \
-          --add-data="icon.png:." --add-data="VERSION:." \
-          --name=Moisten gui.py
+        # 保持单行命令（多行 \ 续行在 Git Bash 下解析失败）
+        run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --add-data="VERSION:." --name=Moisten gui.py
 
       - name: Create DMG
         run: |

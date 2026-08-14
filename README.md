@@ -39,7 +39,7 @@ Mac 用户也可运行 `./setup.sh` 一键安装。
 xattr -cr /path/to/Moisten.app
 ```
 
-或右键 → 打开 → 仍然打开。Intel 与 Apple Silicon（通过 Rosetta）均可运行。
+或右键 → 打开 → 仍然打开。当前构建为 Apple Silicon（M1/M2/M3/M4）版本，Intel Mac 暂不支持。
 
 ## 使用
 
