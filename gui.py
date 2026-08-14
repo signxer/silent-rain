@@ -187,9 +187,10 @@ class ConfigScreen(QWidget):
         workers_card = HeaderCardWidget(self)
         workers_card.setTitle("工作线程数")
         workers_card.setBorderRadius(8)
+        workers_card.viewLayout.setContentsMargins(24, 8, 24, 16)
         w_layout = QHBoxLayout()
         w_layout.setSpacing(12)
-        w_layout.setContentsMargins(4, 12, 4, 12)
+        w_layout.setContentsMargins(0, 0, 0, 0)
 
         self.spin_workers = SpinBox()
         self.spin_workers.setRange(1, 20)
@@ -210,9 +211,11 @@ class ConfigScreen(QWidget):
         browser_card = HeaderCardWidget(self)
         browser_card.setTitle("浏览器设置")
         browser_card.setBorderRadius(8)
+        # 卡片 viewLayout 是 QHBoxLayout：边距只设一次，内层归零（避免叠加）
+        browser_card.viewLayout.setContentsMargins(24, 8, 24, 16)
         card_layout = QVBoxLayout()
-        card_layout.setSpacing(20)
-        card_layout.setContentsMargins(4, 14, 4, 14)
+        card_layout.setSpacing(14)
+        card_layout.setContentsMargins(0, 0, 0, 0)
 
         # 行标签统一宽度，让控件纵向对齐（避免文字挤在一起）
         def _row_label(text):
@@ -264,10 +267,12 @@ class ConfigScreen(QWidget):
         self.input_chrome_path.setPlaceholderText("留空自动检测")
         self.input_chrome_path.setText(self._saved.get("chrome_path", ""))
         self.input_chrome_path.setFixedWidth(250)
+        self.input_chrome_path.setFixedHeight(32)  # 显式高度，避免输入框被裁切
         path_row.addWidget(self.input_chrome_path)
 
         btn_browse = PushButton("浏览")
         btn_browse.setFixedWidth(60)
+        btn_browse.setFixedHeight(32)
         btn_browse.clicked.connect(self._browse_chrome)
         path_row.addWidget(btn_browse)
         path_row.addStretch()
@@ -542,9 +547,10 @@ class GoalScreen(QWidget):
         central_card = HeaderCardWidget(self)
         central_card.setTitle("集中培训")
         central_card.setBorderRadius(8)
+        central_card.viewLayout.setContentsMargins(24, 8, 24, 16)
         c_layout = QVBoxLayout()
         c_layout.setSpacing(10)
-        c_layout.setContentsMargins(0, 8, 0, 8)
+        c_layout.setContentsMargins(0, 0, 0, 0)
 
         c_switch_row = QHBoxLayout()
         c_switch_row.addWidget(BodyLabel("是否学习:"))
@@ -602,9 +608,10 @@ class GoalScreen(QWidget):
         online_card = HeaderCardWidget(self)
         online_card.setTitle("网络自学")
         online_card.setBorderRadius(8)
+        online_card.viewLayout.setContentsMargins(24, 8, 24, 16)
         o_layout = QVBoxLayout()
         o_layout.setSpacing(10)
-        o_layout.setContentsMargins(0, 8, 0, 8)
+        o_layout.setContentsMargins(0, 0, 0, 0)
 
         o_switch_row = QHBoxLayout()
         o_switch_row.addWidget(BodyLabel("是否学习:"))
@@ -751,19 +758,23 @@ class ModeScreen(QWidget):
 
         layout.addSpacing(24)
 
-        # Auto mode card（内容贴分割线下方、按钮留出底边距、卡片不纵向拉伸）
+        # Auto mode card（viewLayout是QHBoxLayout：边距只设一次，内层归零，
+        # 显式行高杜绝裁切；内容贴分割线、按钮留出底边距）
         auto_card = HeaderCardWidget(self)
         auto_card.setTitle("自动模式")
         auto_card.setBorderRadius(10)
+        auto_card.viewLayout.setContentsMargins(24, 6, 24, 14)
         a_layout = QVBoxLayout()
-        a_layout.setSpacing(12)
-        a_layout.setContentsMargins(4, 20, 4, 20)
+        a_layout.setSpacing(6)
+        a_layout.setContentsMargins(0, 0, 0, 0)
         a_desc = BodyLabel("自动寻找专题班，按学时目标学习")
+        a_desc.setFixedHeight(30)
         a_layout.addWidget(a_desc)
         a_hint = CaptionLabel("适合：需要完成学时目标的日常挂机学习")
         a_hint.setStyleSheet("color: #888;")
+        a_hint.setFixedHeight(24)
         a_layout.addWidget(a_hint)
-        a_layout.addSpacing(16)
+        a_layout.addSpacing(12)
         btn_auto = PrimaryPushButton("  选择自动模式")
         btn_auto.setIcon(FIF.PLAY)
         btn_auto.setFixedWidth(200)
@@ -771,21 +782,24 @@ class ModeScreen(QWidget):
         btn_auto.clicked.connect(lambda: self._select_mode("auto"))
         a_layout.addWidget(btn_auto)
         auto_card.viewLayout.addLayout(a_layout)
-        layout.addWidget(auto_card, 0, Qt.AlignTop)
+        layout.addWidget(auto_card)
 
         # Manual mode card
         manual_card = HeaderCardWidget(self)
         manual_card.setTitle("手动模式")
         manual_card.setBorderRadius(10)
+        manual_card.viewLayout.setContentsMargins(24, 6, 24, 14)
         m_layout = QVBoxLayout()
-        m_layout.setSpacing(12)
-        m_layout.setContentsMargins(4, 20, 4, 20)
+        m_layout.setSpacing(6)
+        m_layout.setContentsMargins(0, 0, 0, 0)
         m_desc = BodyLabel("指定专题班或课程 URL，精确学习")
+        m_desc.setFixedHeight(30)
         m_layout.addWidget(m_desc)
         m_hint = CaptionLabel("适合：学习特定课程、补学指定内容")
         m_hint.setStyleSheet("color: #888;")
+        m_hint.setFixedHeight(24)
         m_layout.addWidget(m_hint)
-        m_layout.addSpacing(16)
+        m_layout.addSpacing(12)
         btn_manual = PrimaryPushButton("  选择手动模式")
         btn_manual.setIcon(FIF.LINK)
         btn_manual.setFixedWidth(200)
@@ -793,7 +807,7 @@ class ModeScreen(QWidget):
         btn_manual.clicked.connect(lambda: self._select_mode("manual"))
         m_layout.addWidget(btn_manual)
         manual_card.viewLayout.addLayout(m_layout)
-        layout.addWidget(manual_card, 0, Qt.AlignTop)
+        layout.addWidget(manual_card)
 
         layout.addStretch()
 
