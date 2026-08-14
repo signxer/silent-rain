@@ -458,6 +458,25 @@ class GoalScreen(QWidget):
         self._load_goal()
         self._build_ui()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 模式互斥切换会清空另一模式的目标配置，进入时重新读取并刷新控件，
+        # 避免显示切换前的旧值（A14）
+        self._load_goal()
+        try:
+            self.switch_central.setChecked(self._saved_central_on)
+            self.spin_central.setValue(int(self._saved_central))
+            self.switch_online.setChecked(self._saved_online_on)
+            self.spin_online.setValue(int(self._saved_online))
+            self.radio_central_remain.setChecked(self._saved_central_mode == "remain")
+            self.radio_central_target.setChecked(self._saved_central_mode != "remain")
+            self.radio_online_remain.setChecked(self._saved_online_mode == "remain")
+            self.radio_online_target.setChecked(self._saved_online_mode != "remain")
+            self.central_goal_widget.setVisible(self._saved_central_on)
+            self.online_goal_widget.setVisible(self._saved_online_on)
+        except Exception:
+            pass
+
     def _load_goal(self):
         self._saved_central = 0
         self._saved_online = 0
@@ -1145,12 +1164,17 @@ class DashboardScreen(QWidget):
             self.table.setItem(i, 2, QTableWidgetItem("-"))
             self.table.setItem(i, 3, QTableWidgetItem("等待中"))
 
+    def _manual_goal_text(self):
+        """手动模式的目标区文案（供 _set_goal_info / _on_hours 共用）"""
+        win = self.window()
+        n = len(getattr(win, "cfg_manual_urls", []))
+        return f"手动模式 · {n} 个URL" if n else "手动模式（未设置URL）"
+
     def _set_goal_info(self, win):
         # 手动模式：无学时目标，显示手动信息而不是"不学习"
         mode = getattr(win, "cfg_mode", "auto")
         if mode == "manual":
-            n = len(getattr(win, "cfg_manual_urls", []))
-            self.lbl_goal_info.setText(f"手动模式 · {n} 个URL" if n else "手动模式（未设置URL）")
+            self.lbl_goal_info.setText(self._manual_goal_text())
             return
         c_goal = getattr(win, "cfg_central_goal", 0)
         o_goal = getattr(win, "cfg_online_goal", 0)
@@ -1371,26 +1395,23 @@ class DashboardScreen(QWidget):
                     await page.wait_for_timeout(3000)
 
                 # 标签选择：等待对话框结果（带超时，防止 worker 永久阻塞）
-                _wait_tag = lambda: asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, self._tag_event.wait),
-                    timeout=180)
+                # 用 Event.wait(timeout) 而非 run_in_executor：超时不会泄漏线程
+                async def _wait_tag(timeout=180):
+                    return await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self._tag_event.wait(timeout))
 
                 if cfg_tags:
                     # 有已保存标签，询问用户
                     self._tag_event.clear()
                     thread.tag_confirm_signal.emit(cfg_tags, tags_by_category)
-                    try:
-                        await _wait_tag()
-                    except asyncio.TimeoutError:
+                    if not await _wait_tag():
                         log("标签选择超时，使用已保存标签", "yellow")
                     cfg_tags = list(getattr(win, "cfg_tags", []))
                 elif tags_by_category:
                     # 无已保存标签，直接弹选择框
                     self._tag_event.clear()
                     thread.tag_request_signal.emit(tags_by_category)
-                    try:
-                        await _wait_tag()
-                    except asyncio.TimeoutError:
+                    if not await _wait_tag():
                         log("标签选择超时，按未选择继续", "yellow")
                     cfg_tags = list(getattr(win, "cfg_tags", []))
 
@@ -1415,11 +1436,9 @@ class DashboardScreen(QWidget):
                     self._page_event = threading.Event()
                     self._page_resume = True
                     thread.page_confirm_signal.emit(last_page)
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(None, self._page_event.wait),
-                            timeout=120)
-                    except asyncio.TimeoutError:
+                    # 带超时的 Event.wait（不泄漏线程）
+                    if not await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: self._page_event.wait(120)):
                         log("页码确认超时，从第 1 页开始", "yellow")
                         self._page_resume = False
 
@@ -1624,6 +1643,12 @@ class DashboardScreen(QWidget):
                     await learner.parallel_learn_courses(
                         tasks, ws_locks, fetch_more_courses, progress_cb, hours_cb, log
                     )
+                    # 关闭阶段专用页面，避免长会话页面累积
+                    for _p in (_list_page, _detail_page):
+                        try:
+                            await _p.close()
+                        except:
+                            pass
                     if thread._stop_event.is_set():
                         break
                     log(f"✓ {type_name}阶段完成", "bold green")
@@ -1680,9 +1705,8 @@ class DashboardScreen(QWidget):
         # 手动模式：无学时目标，显示手动信息而不是"不学习"
         mode = getattr(win, "cfg_mode", "auto")
         if mode == "manual":
-            n = len(getattr(win, "cfg_manual_urls", []))
             self.progress_ring.setValue(0)
-            self.lbl_goal_info.setText(f"手动模式 · 按 {n} 个URL学习" if n else "手动模式（未设置URL）")
+            self.lbl_goal_info.setText(self._manual_goal_text())
             self.lbl_eta.setText("")
             return
 
@@ -1963,6 +1987,25 @@ class DashboardScreen(QWidget):
         btn_ok.clicked.connect(lambda: dlg.done(1))
         btn_layout.addWidget(btn_ok)
         outer.addLayout(btn_layout)
+
+        # 自动确认倒计时：超时按当前勾选继续，避免 worker 超时后用过期标签
+        TIMEOUT = 30
+        countdown = [TIMEOUT]
+        timer = QTimer(dlg)
+        timer.setInterval(1000)
+
+        def tick():
+            countdown[0] -= 1
+            if countdown[0] <= 0:
+                timer.stop()
+                dlg.done(1)  # 按当前勾选自动确认
+            else:
+                btn_ok.setText(f"确认选择 ({countdown[0]}s)")
+
+        timer.timeout.connect(tick)
+        timer.start()
+        btn_skip.clicked.connect(timer.stop)
+        btn_ok.clicked.connect(timer.stop)
 
         result = dlg.exec()
 
@@ -2346,6 +2389,10 @@ class MainWindow(_BaseWindow):
         layout.addLayout(btn_row)
 
         cancel_flag = [False]
+        download_done = [False]  # 下载是否已成功完成（区分"点X关闭"与"完成"）
+
+        # 对话框被关闭（含标题栏 X）且未完成下载 → 取消下载
+        dlg.finished.connect(lambda: cancel_flag.__setitem__(0, True) if not download_done[0] else None)
 
         # 下载线程完成后切回 GUI 线程执行安装/提示（Qt 控件只能在 GUI 线程操作）
         from PySide6.QtCore import QObject as _QObject
@@ -2393,6 +2440,7 @@ class MainWindow(_BaseWindow):
 
                 QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, "下载完成，正在安装..."))
                 QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, 100))
+                download_done[0] = True  # 完成后再关闭对话框不会触发取消
                 _bridge.apply.emit(download_path)
 
             except Exception as e:
@@ -2559,7 +2607,7 @@ rm -f "{sh_path}"
                 self.switchTo(self.screen_dashboard)
                 self.screen_dashboard.start_learning()
         elif self._screen_index == 5:
-            # auto: tags → dashboard
+            # 启动时恢复配置自动进入仪表盘
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
 
