@@ -212,6 +212,11 @@ class ConfigScreen(QWidget):
         row2.addStretch()
         card_layout.addLayout(row2)
 
+        # 内置 Chromium 提示：首次使用自动下载
+        browser_hint = CaptionLabel("内置 Chromium 首次使用会自动下载（约200MB）；本地 Chrome 无需下载")
+        browser_hint.setStyleSheet("color: #888;")
+        card_layout.addWidget(browser_hint)
+
         # Row 3: Chrome path (only when using local Chrome)
         self.chrome_path_widget = QWidget()
         path_row = QHBoxLayout(self.chrome_path_widget)

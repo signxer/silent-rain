@@ -26,13 +26,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 打包内置 Chromium：PLAYWRIGHT_BROWSERS_PATH=0 会把浏览器装进
-      # playwright/driver/package/.local-browsers，随包分发后冻结版才能启动浏览器
-      - name: Install Playwright Chromium (bundled)
-        shell: bash
-        run: |
-          PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install chromium
-
       - name: Get version
         id: version
         shell: bash
@@ -42,12 +35,9 @@ jobs:
 
       - name: Build GUI EXE
         shell: bash
-        run: |
-          BROWSER_DIR=$(python -c "import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), 'driver', 'package', '.local-browsers'))")
-          pyinstaller -F -w --icon=icon.ico \
-            --add-data="icon.png;." --add-data="VERSION;." \
-            --add-data="$BROWSER_DIR;playwright/driver/package/.local-browsers" \
-            --name=Moisten gui.py
+        run: pyinstaller -F -w --icon=icon.ico \
+          --add-data="icon.png;." --add-data="VERSION;." \
+          --name=Moisten gui.py
 
       - name: Rename
         shell: bash
@@ -78,11 +68,6 @@ jobs:
           pip3 install -r requirements.txt
           pip3 install pyinstaller
 
-      # 打包内置 Chromium（不再删除 .local-browsers）
-      - name: Install Playwright Chromium (bundled)
-        run: |
-          PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium
-
       - name: Get version
         id: version
         run: |
@@ -106,12 +91,9 @@ jobs:
           rm -rf icon.iconset
 
       - name: Build GUI .app
-        run: |
-          BROWSER_DIR=$(python3 -c "import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), 'driver', 'package', '.local-browsers'))")
-          pyinstaller -F -w --icon=icon.icns \
-            --add-data="icon.png:." --add-data="VERSION:." \
-            --add-data="$BROWSER_DIR:playwright/driver/package/.local-browsers" \
-            --name=Moisten gui.py
+        run: pyinstaller -F -w --icon=icon.icns \
+          --add-data="icon.png:." --add-data="VERSION:." \
+          --name=Moisten gui.py
 
       - name: Create DMG
         run: |

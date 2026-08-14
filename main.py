@@ -203,9 +203,9 @@ class AutoLearner:
     async def init(self, log_callback=None, chrome_path=""):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
 
-        # PyInstaller 打包后，让 Playwright 在可执行文件目录查找浏览器
-        if getattr(sys, 'frozen', False):
-            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+        # 不打包浏览器：Chromium 使用 Playwright 默认缓存目录
+        # （macOS: ~/Library/Caches/ms-playwright，Windows: %LOCALAPPDATA%\ms-playwright），
+        # 首次使用"内置 Chromium"模式时自动下载
 
         # 启动 Playwright
         try:
@@ -228,21 +228,36 @@ class AutoLearner:
             except Exception as e:
                 err_msg = str(e)
                 if "Executable doesn't exist" in err_msg or "Browser" in err_msg:
-                    if getattr(sys, 'frozen', False):
-                        _log("未找到内置 Chromium 浏览器（打包版本应已内置，可能被安全软件隔离），", "red")
-                        _log("请从官网重新下载最新版本，或改用系统 Chrome 浏览器", "yellow")
-                        raise RuntimeError("Chromium not installed")
-                    else:
-                        _log("首次运行，正在安装 Chromium 浏览器...", "blue")
-                        import subprocess
-                        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+                    _log("未找到内置 Chromium 浏览器，正在下载（首次使用约需几分钟）...", "yellow")
+                    if not self._download_chromium(_log):
+                        _log("Chromium 下载失败，请检查网络后重试，或改用系统 Chrome 浏览器", "red")
+                        raise RuntimeError("Chromium download failed")
+                    _log("Chromium 下载完成", "green")
                 else:
                     raise
+
+    def _download_chromium(self, _log=None) -> bool:
+        """下载内置 Chromium 浏览器到系统缓存目录。
+        源码版用 python -m playwright；冻结版用打包自带的 Playwright 驱动（node + cli.js），
+        两者都装到 Playwright 默认缓存路径，运行时即可找到。"""
+        _log = _log or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            import subprocess
+            if getattr(sys, 'frozen', False):
+                from playwright._impl._driver import compute_driver_executable, get_driver_env
+                node, cli = compute_driver_executable()
+                r = subprocess.run([node, cli, "install", "chromium"], env=get_driver_env())
+            else:
+                r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+            return r.returncode == 0
+        except Exception as e:
+            debug(f"下载 Chromium 失败: {e}")
+            return False
 
         # 清理Playwright残留的chromium进程（不影响用户自己的浏览器）
         _kill_playwright_chrome()
 
-        self.playwright = await async_playwright().start()
+        # 复用上方已启动的 playwright 实例（不再重复 start，避免驱动进程泄漏）
         launch_opts = {"headless": self.headless}
         use_system_chrome = False
 
