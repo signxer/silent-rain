@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.7.9
+- fix(网络自学): worker共享课程池并按需补充课程
+- chore: VERSION 1.7.8
+- docs: CHANGELOG 1.7.8
+# 更新日志
+
 ## 1.7.8
 - chore: VERSION 1.7.8
 - chore: 欢迎页副标题、URL提示、脚本注释、日志文件名去品牌化
