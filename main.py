@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 
 # Windows需要ProactorEventLoop才能支持subprocess等
 if platform.system() == "Windows":
@@ -1731,6 +1731,255 @@ class AutoLearner:
             return True
         except Exception as e:
             debug(f"[工作线程 {worker_id+1}] 视频播放异常: {e}")
+            return False
+
+    async def find_and_play_trainingcamp_video(self, page: Page, worker_id: int, progress_callback=None):
+        """学习训练营页面中的自定义视频组件，并通过平台进度和完成状态确认结果。"""
+        prefix = f"[工作线程 {worker_id+1}] 训练营"
+        snapshot_js = r"""() => {
+            const done = document.querySelector('.traincamp-journey-study-done span');
+            const pageDone = !!done && /恭喜您，已完成/.test(done.innerText || '');
+            const components = [...document.querySelectorAll('.traincamp-progress-data')].map((progressEl, index) => {
+                let wrapper = progressEl;
+                while (wrapper && ![...wrapper.classList].some(c => /^comp-item-\d+$/.test(c))) wrapper = wrapper.parentElement;
+                if (!wrapper) return null;
+                const componentClass = [...wrapper.classList].find(c => /^comp-item-\d+$/.test(c));
+                const player = wrapper.querySelector('[id^="player-con"]');
+                const video = player && player.querySelector('video, audio');
+                let threshold = 95;
+                const nodes = [wrapper, ...wrapper.querySelectorAll('*')];
+                for (const node of nodes) {
+                    const vm = node.__vue__;
+                    if (vm && Number.isFinite(Number(vm.videoProcess)) && Number(vm.videoProcess) > 0) {
+                        threshold = Number(vm.videoProcess);
+                        break;
+                    }
+                }
+                const parsed = parseFloat((progressEl.innerText || '').replace('%', '').trim());
+                return {
+                    index,
+                    componentClass,
+                    playerId: player ? player.id : '',
+                    progress: Number.isFinite(parsed) ? parsed : 0,
+                    threshold,
+                    hasMedia: !!video,
+                    currentTime: video && Number.isFinite(video.currentTime) ? video.currentTime : -1,
+                    paused: video ? video.paused : true
+                };
+            }).filter(Boolean);
+            return { pageDone, doneText: done ? (done.innerText || '').trim() : '', components };
+        }"""
+
+        async def snapshot():
+            try:
+                return await page.evaluate(snapshot_js)
+            except Exception:
+                return {"pageDone": False, "doneText": "", "components": []}
+
+        try:
+            if not re.search(r"#/traincamp/study/", page.url):
+                debug(f"{prefix} 当前页面不是训练营课程页: {page.url}")
+                return False
+
+            # 等 Vue 路由及训练营组件完成渲染，已完成的课程可以直接跳过。
+            for _ in range(30):
+                state = await snapshot()
+                if state.get("pageDone"):
+                    if progress_callback:
+                        progress_callback(100)
+                    debug(f"{prefix} 页面已由平台标记完成")
+                    return True
+                if state.get("components"):
+                    break
+                if self._stop_event.is_set():
+                    return False
+                await page.wait_for_timeout(1000)
+
+            state = await snapshot()
+            components = state.get("components") or []
+            if not components:
+                debug(f"{prefix} 未找到训练营视频/音频进度组件")
+                return False
+
+            refresh_count = 0
+            for component in components:
+                component_class = component.get("componentClass")
+                if not component_class:
+                    continue
+
+                # 已达到训练营组件阈值的内容无需重复播放。
+                threshold = float(component.get("threshold") or 95)
+                if float(component.get("progress") or 0) >= threshold:
+                    continue
+
+                wrapper = page.locator(f".{component_class}").first
+                try:
+                    await wrapper.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+                player_id = component.get("playerId") or ""
+
+                # 训练营的阿里播放器按组件 ID 挂载。滚动到组件后等待播放器实例化。
+                media_ready = False
+                for _ in range(30):
+                    current_state = await snapshot()
+                    match = next((x for x in current_state.get("components", [])
+                                  if x.get("componentClass") == component_class), None)
+                    if current_state.get("pageDone"):
+                        if progress_callback:
+                            progress_callback(100)
+                        return True
+                    if match and match.get("hasMedia"):
+                        component = match
+                        player_id = match.get("playerId") or player_id
+                        media_ready = True
+                        break
+                    if self._stop_event.is_set():
+                        return False
+                    await page.wait_for_timeout(1000)
+                if not media_ready or not player_id:
+                    debug(f"{prefix} 组件 {component_class} 没有加载出播放器")
+                    return False
+
+                # 调用播放器内部 video.play()，不直接改写平台进度；平台组件会自行上报学习进度。
+                try:
+                    await page.evaluate("""(id) => {
+                        const player = document.getElementById(id);
+                        const media = player && player.querySelector('video, audio');
+                        if (!media) return false;
+                        if (media.paused || media.ended) {
+                            const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
+                            if (playButton) playButton.click();
+                            const result = media.play();
+                            if (result && result.catch) result.catch(() => {});
+                        }
+                        return true;
+                    }""", player_id)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+
+                last_progress = float(component.get("progress") or 0)
+                last_local_time = -1.0
+                stall_count = 0
+                component_complete = False
+                for _ in range(120 * 4):
+                    if self._stop_event.is_set():
+                        return False
+                    await page.wait_for_timeout(10000)
+                    current_state = await snapshot()
+                    if current_state.get("pageDone"):
+                        if progress_callback:
+                            progress_callback(100)
+                        return True
+                    match = next((x for x in current_state.get("components", [])
+                                  if x.get("componentClass") == component_class), None)
+                    if not match:
+                        debug(f"{prefix} 页面组件在播放期间消失")
+                        return False
+
+                    pct = float(match.get("progress") or 0)
+                    if progress_callback:
+                        component_progress = sum(
+                            min(1.0, float(item.get("progress") or 0) / float(item.get("threshold") or 95))
+                            for item in current_state["components"]
+                        )
+                        progress_callback(min(99.0, component_progress * 100 / len(current_state["components"])))
+                    if pct >= float(match.get("threshold") or threshold):
+                        component_complete = True
+                        break
+
+                    local_time = float(match.get("currentTime") or -1)
+                    advanced = pct != last_progress or (local_time >= 0 and local_time != last_local_time)
+                    last_progress = pct
+                    last_local_time = local_time
+                    if advanced:
+                        stall_count = 0
+                        continue
+
+                    stall_count += 1
+                    if match.get("paused"):
+                        # 播放器偶尔因浏览器策略暂停，尝试用播放器控件恢复。
+                        try:
+                            await page.evaluate("""(id) => {
+                                const player = document.getElementById(id);
+                                const media = player && player.querySelector('video, audio');
+                                if (media && media.paused) {
+                                    const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
+                                    if (playButton) playButton.click();
+                                    const result = media.play();
+                                    if (result && result.catch) result.catch(() => {});
+                                }
+                            }""", player_id)
+                        except Exception:
+                            pass
+                    if stall_count >= 18:
+                        if refresh_count >= 3:
+                            debug(f"{prefix} 组件 {component_class} 连续停滞，重试后仍无进度")
+                            return False
+                        refresh_count += 1
+                        debug(f"{prefix} 播放进度停滞，刷新课程页重试 ({refresh_count}/3)")
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=20000)
+                            await page.wait_for_timeout(5000)
+                            if not re.search(r"#/traincamp/study/", page.url):
+                                return False
+                            refreshed = await snapshot()
+                            component = next((x for x in refreshed.get("components", [])
+                                              if x.get("componentClass") == component_class), component)
+                            player_id = component.get("playerId") or player_id
+                            try:
+                                await page.locator(f".{component_class}").first.scroll_into_view_if_needed(timeout=5000)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(2000)
+                            await page.evaluate("""(id) => {
+                                const player = document.getElementById(id);
+                                const media = player && player.querySelector('video, audio');
+                                if (media) {
+                                    const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
+                                    if (playButton) playButton.click();
+                                    const result = media.play();
+                                    if (result && result.catch) result.catch(() => {});
+                                }
+                            }""", player_id)
+                        except Exception as e:
+                            debug(f"{prefix} 刷新课程页失败: {e}")
+                            return False
+                        stall_count = 0
+
+                if not component_complete:
+                    debug(f"{prefix} 组件 {component_class} 未达到平台学习阈值")
+                    return False
+
+            # 视频组件会先记录自身完成；训练营还需要点击页面的“完成学习”，再由平台确认课程完成。
+            state = await snapshot()
+            if state.get("pageDone"):
+                if progress_callback:
+                    progress_callback(100)
+                return True
+            done_button = page.locator(".traincamp-journey-study-done span").first
+            try:
+                if await done_button.count() > 0:
+                    await done_button.scroll_into_view_if_needed(timeout=3000)
+                    label = (await done_button.inner_text(timeout=2000)).strip()
+                    if "完成学习" in label:
+                        await done_button.click(timeout=5000)
+            except Exception as e:
+                debug(f"{prefix} 点击完成学习失败: {e}")
+
+            # clickFinish 完成后页面会将按钮文案更新为已完成；等待异步响应并确认。
+            for _ in range(15):
+                await page.wait_for_timeout(1000)
+                state = await snapshot()
+                if state.get("pageDone"):
+                    if progress_callback:
+                        progress_callback(100)
+                    return True
+            debug(f"{prefix} 视频进度已上报，但平台尚未确认课程完成 ({state.get('doneText', '')})")
+            return False
+        except Exception as e:
+            debug(f"{prefix} 播放异常: {e}")
             return False
 
     async def _check_video_time(self, page: Page) -> float:
@@ -3530,37 +3779,99 @@ class AutoLearner:
             console.print(f"已完成 {len(completed_ws_ids)}/{len(ws_progress)} 个专题班", style="green")
         return completed_ws_ids
 
-    async def _learn_course_urls(self, urls: List[str], workers: int,
+    async def _collect_trainingcamp_courses(self, page: Page, camp_id: str, log_callback=None) -> List[Dict]:
+        """从训练营详情页读取模块中的课程页，并生成可直接学习的路由。"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        camp_url = f"https://u.ccb.com/trainingcamp/#/traincampdetail/{camp_id}/away"
+        try:
+            await page.goto(camp_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_selector(".traincamp-journey", timeout=20000)
+            await page.wait_for_function("""() => {
+                const root = document.querySelector('.traincamp-journey');
+                const vm = root && root.__vue__;
+                return !!(vm && Array.isArray(vm.dataList) && vm.dataList.length);
+            }""", timeout=20000)
+            pages = await page.evaluate("""() => {
+                const root = document.querySelector('.traincamp-journey');
+                const vm = root && root.__vue__;
+                if (!vm || !Array.isArray(vm.dataList)) return [];
+                const result = [];
+                vm.dataList.forEach((module, moduleIndex) => {
+                    (module.beanList || []).forEach((course, courseIndex) => {
+                        const finished = course && (course.finishFlag === 1 ||
+                            course.finishFlag === '1' || course.finishFlag === true);
+                        if (!course || !course.id || !course.pageName ||
+                            course.hideFlag === 1 || course.hideFlag === '1' || finished) return;
+                        result.push({
+                            id: String(course.id),
+                            title: String(course.pageName).trim(),
+                            moduleIndex,
+                            courseIndex
+                        });
+                    });
+                });
+                return result;
+            }""")
+        except Exception as e:
+            _log(f"训练营课程列表加载失败 ({camp_id}): {e}", "yellow")
+            return []
+
+        course_tasks = []
+        for item in pages or []:
+            course_id = str(item.get("id", "")).strip()
+            title = str(item.get("title", "")).strip()
+            if not course_id or not title:
+                continue
+            course_url = (
+                f"https://u.ccb.com/trainingcamp/#/traincamp/study/{camp_id}/{course_id}"
+                f"?moduleIndex={item['moduleIndex']}&courseIndex={item['courseIndex']}"
+            )
+            course_tasks.append({"url": course_url, "title": title})
+
+        _log(f"训练营 {camp_id}: 找到 {len(course_tasks)} 个课程页面", "green" if course_tasks else "yellow")
+        return course_tasks
+
+    async def _learn_course_urls(self, urls: List[Union[str, Dict]], workers: int,
                                  _log, _progress, _hours):
         """手动模式：直接打开课程详情URL学习（无需专题班）"""
         nw = min(workers, len(urls))
         _log(f"共 {len(urls)} 个课程URL待学习，使用 {nw} 个线程", "blue")
 
         async def cworker(wid, wp, task_urls):
-            for url in task_urls:
+            for task in task_urls:
                 # 用户变更配置：停止
                 if self._stop_event.is_set():
                     break
-                title = (url.split("id=")[-1][:40] if "id=" in url else url[:40])
+                if isinstance(task, dict):
+                    url = task.get("url", "")
+                    title = task.get("title") or url[:40]
+                else:
+                    url = task
+                    title = (url.split("id=")[-1][:40] if "id=" in url else url[:40])
                 _log(f"[线程{wid+1}] 打开课程: {url}", "blue")
                 _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "加载中"})
                 try:
                     await wp.goto(url, wait_until="domcontentloaded", timeout=20000)
                     await wp.wait_for_timeout(5000)
-                    # 点击学习按钮（若详情页需要）
-                    for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
-                        try:
-                            sb = wp.locator(f"text={kw}").first
-                            if await sb.count() > 0:
-                                await sb.click()
-                                await wp.wait_for_timeout(5000)
-                                break
-                        except:
-                            pass
+                    is_trainingcamp = bool(re.search(r"https?://[^/]+/trainingcamp/#/traincamp/study/", url))
+                    if not is_trainingcamp:
+                        # 旧课程详情页需要先点击学习按钮；训练营路由已经直接进入组件学习页。
+                        for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
+                            try:
+                                sb = wp.locator(f"text={kw}").first
+                                if await sb.count() > 0:
+                                    await sb.click()
+                                    await wp.wait_for_timeout(5000)
+                                    break
+                            except:
+                                pass
                     def on_progress(pct):
                         _progress({"wid": wid, "course": title,
                                    "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
-                    play_ok = await self.find_and_play_video(wp, wid, on_progress)
+                    if is_trainingcamp:
+                        play_ok = await self.find_and_play_trainingcamp_video(wp, wid, on_progress)
+                    else:
+                        play_ok = await self.find_and_play_video(wp, wid, on_progress)
                     if play_ok:
                         _progress({"wid": wid, "course": title, "progress": "100%", "eta": "-", "status": "✓ 完成"})
                         _log(f"[线程{wid+1}] 完成: {title}", "green")
@@ -3610,10 +3921,24 @@ class AutoLearner:
 
         page = self.pages[0]
 
-        # 区分专题班URL与课程URL（GUI 同时宣称支持两者）
+        # 区分专题班、训练营详情与课程URL。
         workshop_ids = []
+        trainingcamp_ids = []
         course_urls = []
         for url in urls:
+            study_match = re.search(r"#/traincamp/study/([^/?#]+)/([^/?#]+)", url)
+            if study_match:
+                if url not in course_urls:
+                    course_urls.append(url)
+                continue
+
+            camp_match = re.search(r"#/traincampdetail/([^/?#]+)", url)
+            if camp_match:
+                camp_id = camp_match.group(1)
+                if camp_id not in trainingcamp_ids:
+                    trainingcamp_ids.append(camp_id)
+                continue
+
             m = re.search(r'id=([a-f0-9\-]+)', url)
             if not m:
                 continue
@@ -3625,13 +3950,33 @@ class AutoLearner:
                 if uid not in workshop_ids:
                     workshop_ids.append(uid)
 
+        # 训练营详情页中的课程页使用 /traincamp/study/{campId}/{courseId} 路由。
+        for camp_id in trainingcamp_ids:
+            _log(f"正在采集训练营课程: {camp_id}", "blue")
+            course_urls.extend(await self._collect_trainingcamp_courses(page, camp_id, _log))
+
         # 课程URL：直接打开课程页学习（不走专题班流程）
         if course_urls:
-            await self._learn_course_urls(course_urls, workers, _log, _progress, _hours)
+            deduplicated_urls = []
+            course_url_indexes = {}
+            for task in course_urls:
+                url = task.get("url", "") if isinstance(task, dict) else task
+                if not url:
+                    continue
+                if url not in course_url_indexes:
+                    course_url_indexes[url] = len(deduplicated_urls)
+                    deduplicated_urls.append(task)
+                elif isinstance(task, dict) and not isinstance(deduplicated_urls[course_url_indexes[url]], dict):
+                    # 详情页采集到的标题比单独粘贴课程路由更完整。
+                    deduplicated_urls[course_url_indexes[url]] = task
+            await self._learn_course_urls(deduplicated_urls, workers, _log, _progress, _hours)
 
         if not workshop_ids:
             if not course_urls:
-                _log("未从URL中提取到有效的专题班/课程ID", "red")
+                if trainingcamp_ids:
+                    _log("训练营中未获取到可学习课程", "yellow")
+                else:
+                    _log("未从URL中提取到有效的专题班/训练营/课程ID", "red")
             return
 
         _log(f"共 {len(workshop_ids)} 个专题班待学习", "blue")

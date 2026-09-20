@@ -229,7 +229,7 @@ class WelcomeScreen(QWidget):
         self._feat_cards = []
         feats = [
             ("自动模式", "按学时目标自动寻找课程学习，支持标签筛选与断点续学"),
-            ("手动模式", "粘贴指定课程或专题班 URL，精确学习"),
+            ("手动模式", "粘贴专题班、训练营或课程 URL，精确学习"),
             ("智能稳定", "视频卡住自动刷新重试 · 变更配置即停旧任务 · 学时查询节流"),
         ]
         for title, desc in feats:
@@ -916,7 +916,7 @@ class ModeScreen(QWidget):
         m_layout = QVBoxLayout()
         m_layout.setSpacing(6)
         m_layout.setContentsMargins(0, 0, 0, 0)
-        m_desc = BodyLabel("指定专题班或课程 URL，精确学习")
+        m_desc = BodyLabel("指定专题班、训练营或课程 URL，精确学习")
         m_desc.setFixedHeight(30)
         m_layout.addWidget(m_desc)
         m_hint = CaptionLabel("适合：学习特定课程、补学指定内容")
@@ -1014,7 +1014,7 @@ class ManualScreen(QWidget):
         title = TitleLabel("手动指定课程")
         layout.addWidget(title)
 
-        subtitle = BodyLabel("输入专题班或课程的URL，每行一个")
+        subtitle = BodyLabel("输入专题班、训练营或课程URL，每行一个")
         subtitle.setStyleSheet("color: #888;")
         layout.addWidget(subtitle)
 
@@ -1030,12 +1030,13 @@ class ManualScreen(QWidget):
         self.text_urls.setPlaceholderText(
             "粘贴URL，每行一个，例如：\n"
             "https://u.ccb.com/workshop/#/myworkshop/detail?id=xxx\n"
-            "https://u.ccb.com/workshop/#/detail?id=xxx"
+            "https://u.ccb.com/workshop/#/detail?id=xxx\n"
+            "https://u.ccb.com/trainingcamp/#/traincampdetail/训练营ID/away"
         )
         self.text_urls.setMinimumHeight(200)
         i_layout.addWidget(self.text_urls)
 
-        hint = CaptionLabel("支持专题班详情页URL，会自动提取其中的课程")
+        hint = CaptionLabel("支持专题班、训练营详情页和课程页URL；详情页会自动提取课程")
         hint.setStyleSheet("color: #888;")
         i_layout.addWidget(hint)
 
