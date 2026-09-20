@@ -71,8 +71,12 @@ python3 gui.py
 | 训练营考试 | 开关，默认关闭 |
 | API Key | DeepSeek 开放平台申请的 Key（<https://platform.deepseek.com>），保存时做混淆处理 |
 | 模型 | 默认 `deepseek-flash`，可换成 `deepseek-v4-pro` 等 |
-| 深度思考 | 打开后请求带 `thinking`，答题更稳但更慢 |
-| 测试连接 | 保存前先验证 Key 与模型是否可用 |
+| 深度思考 | 思考模式开关。关闭=快速作答（显式传 `thinking=disabled`，更快更省）；打开=思考模式 + `reasoning_effort=high`（更准但更慢） |
+| 测试连接 | 保存前先验证 Key 与模型是否可用（会分别按当前开关的模式测试） |
+
+> `deepseek-flash` 的思考模式**默认是打开的**（且推理强度默认 high），所以程序会显式传
+> `thinking=disabled/enabled`：否则"快速作答"其实仍在思考，既慢又容易把输出预算耗在思维链上。
+> 思维链 tokens 同样计入 `max_tokens`，程序按题量估算预算并在被截断时自动放宽重试。
 
 只考一次：若提交后未通过，会记录日志并继续下一门课程，不自动重考。是否通过以**考试说明页刷新后**
 的考试记录为准（平台只在说明页显示成绩），成绩页取不到时才回退到交卷结果。
