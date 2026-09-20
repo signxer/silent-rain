@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.9.0
+- feat(考试): DeepSeek 自动答题 + 训练营视频组件按 DOM 发现播放器
+- chore: VERSION 1.8.1
+- docs: CHANGELOG 1.8.1
+# 更新日志
+
 ## 1.8.1
 - chore: VERSION 1.8.1
 - fix(训练营): 保留播放器上报进度
