@@ -18,7 +18,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
-    QHeaderView, QScrollArea,
+    QHeaderView, QScrollArea, QFrame,
     QDialog, QLabel, QGraphicsOpacityEffect,
 )
 
@@ -27,7 +27,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     CardWidget, HeaderCardWidget, SimpleCardWidget,
     PrimaryPushButton, PushButton, ToolButton,
-    LineEdit, SpinBox, SwitchButton,
+    LineEdit, PasswordLineEdit, SpinBox, SwitchButton,
     RadioButton, CheckBox,
     TableWidget, ProgressBar, ProgressRing,
     PlainTextEdit,
@@ -38,7 +38,11 @@ from qfluentwidgets import (
     setTheme, Theme,
 )
 
-from main import AutoLearner, CONFIG_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH
+from main import (
+    AutoLearner, CONFIG_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH,
+    DEEPSEEK_DEFAULT_BASE_URL, DEEPSEEK_DEFAULT_MODEL, DeepSeekClient,
+    obfuscate_secret, deobfuscate_secret,
+)
 
 
 # ─── Async Thread ──────────────────────────────────────────────────
@@ -277,10 +281,14 @@ class WelcomeScreen(QWidget):
 
 
 class ConfigScreen(QWidget):
+    # 后台线程测试 DeepSeek 连接的结果（跨线程 → 主线程，QueuedConnection）
+    api_test_signal = Signal(bool, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._load_config()
         self._build_ui()
+        self.api_test_signal.connect(self._finish_test_api)
 
     def _load_config(self):
         self._saved = {}
@@ -292,7 +300,25 @@ class ConfigScreen(QWidget):
                 pass
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # 设置项会随功能增加而变多：整页放进滚动区，小窗口下也不会被裁切
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 只让滚动区/容器透明，避免影响卡片自身背景
+        scroll.setObjectName("configScroll")
+        scroll.setStyleSheet("#configScroll { border: none; background: transparent; }")
+        scroll.viewport().setStyleSheet("background: transparent;")
+        container = QWidget()
+        container.setObjectName("configContent")
+        container.setStyleSheet("#configContent { background: transparent; }")
+        scroll.setWidget(container)
+        root.addWidget(scroll)
+
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(40, 30, 40, 30)
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
@@ -301,7 +327,7 @@ class ConfigScreen(QWidget):
         title = TitleLabel("运行配置")
         layout.addWidget(title)
 
-        subtitle = BodyLabel("设置工作线程数和浏览器模式")
+        subtitle = BodyLabel("设置工作线程数、浏览器模式和考试自动答题")
         subtitle.setStyleSheet("color: #888;")
         layout.addWidget(subtitle)
 
@@ -408,6 +434,72 @@ class ConfigScreen(QWidget):
         browser_card.viewLayout.addLayout(card_layout)
         layout.addWidget(browser_card)
 
+        # Exam settings card (DeepSeek 自动答题)
+        exam_card = HeaderCardWidget(self)
+        exam_card.setTitle("考试自动答题（DeepSeek）")
+        exam_card.setBorderRadius(8)
+        exam_card.viewLayout.setContentsMargins(24, 8, 24, 16)
+        exam_layout = QVBoxLayout()
+        exam_layout.setSpacing(14)
+        exam_layout.setContentsMargins(0, 0, 0, 0)
+
+        row_exam_on = QHBoxLayout()
+        row_exam_on.setSpacing(12)
+        self.switch_exam = SwitchButton()
+        self.switch_exam.setChecked(bool(self._saved.get("exam_enabled", False)))
+        self.switch_exam.setOnText("自动答题")
+        self.switch_exam.setOffText("关闭")
+        row_exam_on.addWidget(_row_label("训练营考试"))
+        row_exam_on.addWidget(self.switch_exam)
+        row_exam_on.addStretch()
+        exam_layout.addLayout(row_exam_on)
+
+        row_key = QHBoxLayout()
+        row_key.setSpacing(12)
+        row_key.addWidget(_row_label("API Key"))
+        self.input_api_key = PasswordLineEdit()
+        self.input_api_key.setPlaceholderText("sk-...  （DeepSeek 开放平台申请）")
+        self.input_api_key.setText(deobfuscate_secret(self._saved.get("deepseek_api_key", "")))
+        self.input_api_key.setFixedWidth(320)
+        self.input_api_key.setFixedHeight(32)
+        row_key.addWidget(self.input_api_key)
+        row_key.addStretch()
+        exam_layout.addLayout(row_key)
+
+        row_model = QHBoxLayout()
+        row_model.setSpacing(12)
+        row_model.addWidget(_row_label("模型"))
+        self.input_model = LineEdit()
+        self.input_model.setPlaceholderText(DEEPSEEK_DEFAULT_MODEL)
+        self.input_model.setText(self._saved.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL)
+        self.input_model.setFixedWidth(180)
+        self.input_model.setFixedHeight(32)
+        row_model.addWidget(self.input_model)
+        row_model.addSpacing(6)
+        self.switch_thinking = SwitchButton()
+        self.switch_thinking.setChecked(bool(self._saved.get("deepseek_thinking", False)))
+        self.switch_thinking.setOnText("深度思考")
+        self.switch_thinking.setOffText("快速作答")
+        row_model.addWidget(self.switch_thinking)
+        row_model.addSpacing(10)
+        self.btn_test_api = PushButton("测试连接")
+        self.btn_test_api.setFixedWidth(84)
+        self.btn_test_api.setFixedHeight(32)
+        self.btn_test_api.clicked.connect(self._on_test_api)
+        row_model.addWidget(self.btn_test_api)
+        row_model.addStretch()
+        exam_layout.addLayout(row_model)
+
+        exam_hint = CaptionLabel(
+            "  开启后，训练营课程页里的「随堂测试」会用 DeepSeek 自动答题并提交；"
+            "考试记录只取一次，未通过会记录日志后继续下一门")
+        exam_hint.setStyleSheet("color: #888;")
+        exam_hint.setWordWrap(True)
+        exam_layout.addWidget(exam_hint)
+
+        exam_card.viewLayout.addLayout(exam_layout)
+        layout.addWidget(exam_card)
+
         layout.addStretch()
 
         # Start button
@@ -437,11 +529,63 @@ class ConfigScreen(QWidget):
         if path:
             self.input_chrome_path.setText(path)
 
+    def _on_test_api(self):
+        """后台线程测试 DeepSeek API Key 是否可用"""
+        api_key = self.input_api_key.text().strip()
+        model = self.input_model.text().strip() or DEEPSEEK_DEFAULT_MODEL
+        thinking = self.switch_thinking.isChecked()
+        if not api_key:
+            InfoBar.warning("提示", "请先填写 DeepSeek API Key", parent=self,
+                            position=InfoBarPosition.TOP, duration=3000)
+            return
+
+        self.btn_test_api.setEnabled(False)
+        self.btn_test_api.setText("测试中")
+
+        def _work():
+            message = ""
+            ok = False
+            try:
+                client = DeepSeekClient(api_key=api_key, model=model,
+                                        base_url=DEEPSEEK_DEFAULT_BASE_URL,
+                                        thinking=thinking, timeout=45)
+                loop = asyncio.new_event_loop()
+                try:
+                    reply = loop.run_until_complete(client.chat(
+                        [{"role": "user", "content": "只回复两个字：正常"}],
+                        json_mode=False, max_tokens=16, retries=1))
+                    ok = True
+                    message = f"模型 {client.model} 响应正常：{reply.strip()[:20]}"
+                finally:
+                    loop.close()
+            except Exception as e:
+                message = str(e)[:180]
+            self.api_test_signal.emit(ok, message)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _finish_test_api(self, ok, message):
+        self.btn_test_api.setEnabled(True)
+        self.btn_test_api.setText("测试连接")
+        if ok:
+            InfoBar.success("连接成功", message, parent=self,
+                            position=InfoBarPosition.TOP, duration=4000)
+        else:
+            InfoBar.error("连接失败", message, parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+
     def _on_start(self):
         workers = self.spin_workers.value()
         headless = self.switch_headless.isChecked()
         browser = "chrome" if self.switch_browser.isChecked() else "chromium"
         chrome_path = self.input_chrome_path.text().strip() if self.switch_browser.isChecked() else ""
+        exam_enabled = self.switch_exam.isChecked()
+        api_key = self.input_api_key.text().strip()
+        model = self.input_model.text().strip() or DEEPSEEK_DEFAULT_MODEL
+        thinking = self.switch_thinking.isChecked()
+        if exam_enabled and not api_key:
+            InfoBar.warning("提示", "已开启考试自动答题，但未填写 DeepSeek API Key", parent=self,
+                            position=InfoBarPosition.TOP, duration=4000)
         try:
             cfg = {}
             if os.path.exists(CONFIG_PATH):
@@ -451,6 +595,14 @@ class ConfigScreen(QWidget):
             cfg["headless"] = headless
             cfg["browser"] = browser
             cfg["chrome_path"] = chrome_path
+            cfg["exam_enabled"] = exam_enabled
+            cfg["deepseek_model"] = model
+            cfg["deepseek_thinking"] = thinking
+            cfg["deepseek_base_url"] = DEEPSEEK_DEFAULT_BASE_URL
+            if api_key:
+                cfg["deepseek_api_key"] = obfuscate_secret(api_key)
+            elif not exam_enabled:
+                cfg.pop("deepseek_api_key", None)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
@@ -460,6 +612,10 @@ class ConfigScreen(QWidget):
         win.cfg_headless = headless
         win.cfg_browser = browser
         win.cfg_chrome_path = chrome_path
+        win.cfg_exam_enabled = exam_enabled
+        win.cfg_deepseek_api_key = api_key
+        win.cfg_deepseek_model = model
+        win.cfg_deepseek_thinking = thinking
         win.next_screen()
 
 
@@ -1413,6 +1569,18 @@ class DashboardScreen(QWidget):
             cfg_chrome_path = getattr(win, "cfg_chrome_path", "")
             log("正在初始化浏览器...")
             learner = AutoLearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
+            # 考试自动答题：只有开启且配置了 Key 时才生效
+            learner.apply_exam_settings({
+                "exam_enabled": getattr(win, "cfg_exam_enabled", False),
+                "deepseek_api_key": getattr(win, "cfg_deepseek_api_key", ""),
+                "deepseek_model": getattr(win, "cfg_deepseek_model", ""),
+                "deepseek_base_url": DEEPSEEK_DEFAULT_BASE_URL,
+                "deepseek_thinking": getattr(win, "cfg_deepseek_thinking", False),
+            })
+            if learner.exam_enabled and not learner.deepseek_api_key:
+                log("已开启考试自动答题，但未配置 DeepSeek API Key，将跳过考试", "yellow")
+            elif learner.exam_enabled:
+                log(f"考试自动答题已开启（模型 {learner.deepseek_model}）", "blue")
             self._learner = learner  # 保存引用用于退出时清理
             await learner.init(
                 log_callback=log, chrome_path=cfg_chrome_path,
@@ -2560,6 +2728,11 @@ class MainWindow(_BaseWindow):
         self.cfg_tags = []
         self.cfg_mode = "auto"
         self.cfg_manual_urls = []
+        # 考试自动答题（DeepSeek）
+        self.cfg_exam_enabled = False
+        self.cfg_deepseek_api_key = ""
+        self.cfg_deepseek_model = DEEPSEEK_DEFAULT_MODEL
+        self.cfg_deepseek_thinking = False
 
         # 创建子界面
         self._createSubInterfaces()
@@ -2884,6 +3057,11 @@ del "%~f0"
                 else:
                     self.cfg_online_goal = cfg["study_goal"]
             self.cfg_tags = cfg.get("selected_tags", [])
+            # 考试自动答题（DeepSeek）
+            self.cfg_exam_enabled = bool(cfg.get("exam_enabled", False))
+            self.cfg_deepseek_api_key = deobfuscate_secret(cfg.get("deepseek_api_key", ""))
+            self.cfg_deepseek_model = cfg.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL
+            self.cfg_deepseek_thinking = bool(cfg.get("deepseek_thinking", False))
             # 加载账号
             creds_path = USER_CREDENTIALS_PATH
             if os.path.exists(creds_path):

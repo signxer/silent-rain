@@ -29,3 +29,6 @@ dist/
 build/
 *.spec
 .env
+
+# 工具临时目录
+.dsh-vision-toolkit/

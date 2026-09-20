@@ -230,6 +230,229 @@ async def async_input(prompt: str, default: str = "y", timeout: int = 5,
         return default
 
 
+# ─── DeepSeek 自动答题 ──────────────────────────────────────────────
+#
+# 训练营课程页里的「随堂测试」是一个 cuWebExam 组件，点击「开始考试」会打开
+# OTE 考试中心（/ote/#/exampreview?examArrangeID=...），再由页面自身跳到
+# 答题页（/ote/#/userexam?arrangeId=...&userExamMapId=...）。
+# 答题页把题目挂在 Vue 实例上（questionsList），提交走两个接口：
+#   POST {api}/ote/user/logAnswers/{userExamId}
+#   POST {api}/ote/web/userexam/{userExamId}/submit?arrangeId=&userExamMapId=
+# 因此本模块只负责：读题 → 问 DeepSeek → 回填并提交，全部复用页面自身的登录态。
+
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
+# OTE 接口域名（页面用 axios 实例固定指向 api.u.ccb.com/v1/）
+OTE_API_BASE = "https://api.u.ccb.com/v1"
+
+# 训练营视频学习节奏：轮询间隔 / 本地播完后等待平台结算的时间
+TRAINCAMP_POLL_SECONDS = 10
+TRAINCAMP_LOCAL_SETTLE_SECONDS = 180
+
+EXAM_SYSTEM_PROMPT = """你是中国建设银行在线学习平台的考试答题助手，需要判断题目的正确答案。
+只输出一个 JSON 对象（json），不要输出解释、不要包裹代码块。
+
+输出格式示例：
+{"answers":[{"index":1,"choices":["A"]},{"index":2,"choices":["A","C"]},{"index":3,"blanks":["答案文本","第二个空"]},{"index":4,"text":"问答题的作答内容"}]}
+
+规则：
+1. 单选题用 choices，只包含 1 个选项字母。
+2. 多选题用 choices，包含所有正确选项字母。
+3. 判断题用 choices，只包含 1 个选项字母（按题目给出的选项字母作答，A/B 即为该题的两个选项）。
+4. 填空题用 blanks，按空的顺序给出每个空的答案文本。
+5. 问答题用 text，给出条理清晰的作答内容（可含要点，200 字以内）。
+6. 每道题都必须给出答案，index 必须与题目编号一致，不能遗漏或新增题目。
+7. 若某题信息不足，也要按最可能的正确答案作答。"""
+
+
+class DeepSeekError(Exception):
+    """DeepSeek 接口调用失败"""
+
+
+# 配置里的密钥做一层混淆（与账号密码同一套 XOR+base64），避免明文落盘
+_SECRET_PREFIX = "enc:"
+
+
+def obfuscate_secret(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return _SECRET_PREFIX + AutoLearner._xor_crypt(value)
+    except Exception:
+        return value
+
+
+def deobfuscate_secret(value: str) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str) and value.startswith(_SECRET_PREFIX):
+        try:
+            return AutoLearner._xor_decrypt(value[len(_SECRET_PREFIX):])
+        except Exception:
+            return ""
+    return value
+
+
+def exam_settings_from_config(cfg: Dict) -> Dict:
+    """从 moisten_config.json 里取出考试答题相关设置（密钥自动解密）。"""
+    cfg = cfg or {}
+    return {
+        "exam_enabled": bool(cfg.get("exam_enabled", False)),
+        "deepseek_api_key": deobfuscate_secret(cfg.get("deepseek_api_key", "")),
+        "deepseek_model": cfg.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL,
+        "deepseek_base_url": cfg.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL,
+        "deepseek_thinking": bool(cfg.get("deepseek_thinking", False)),
+    }
+class DeepSeekClient:
+    """DeepSeek Chat Completions 客户端（OpenAI 兼容，仅用标准库实现）。"""
+
+    def __init__(self, api_key: str, model: str = DEEPSEEK_DEFAULT_MODEL,
+                 base_url: str = DEEPSEEK_DEFAULT_BASE_URL,
+                 thinking: bool = False, timeout: float = 180.0):
+        self.api_key = (api_key or "").strip()
+        self.model = (model or DEEPSEEK_DEFAULT_MODEL).strip() or DEEPSEEK_DEFAULT_MODEL
+        self.base_url = (base_url or DEEPSEEK_DEFAULT_BASE_URL).rstrip("/")
+        self.thinking = bool(thinking)
+        self.timeout = timeout
+
+    def _post(self, path: str, payload: dict) -> dict:
+        """同步 POST（在线程池里跑，避免阻塞事件循环）"""
+        import urllib.error
+        import urllib.request
+
+        url = f"{self.base_url}{path}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            raise DeepSeekError(f"HTTP {e.code}: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise DeepSeekError(f"网络错误: {e.reason}") from e
+
+    async def chat(self, messages: List[Dict], json_mode: bool = True,
+                   max_tokens: int = 8192, retries: int = 3) -> str:
+        """调用 /chat/completions，返回首条回复文本；失败抛出 DeepSeekError。"""
+        if not self.api_key:
+            raise DeepSeekError("未配置 DeepSeek API Key")
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if self.thinking:
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = "high"
+
+        loop = asyncio.get_event_loop()
+        last_err = None
+        for attempt in range(max(1, retries)):
+            try:
+                data = await loop.run_in_executor(None, self._post, "/chat/completions", payload)
+                choices = data.get("choices") or []
+                content = ((choices[0] or {}).get("message") or {}).get("content") if choices else ""
+                if content and content.strip():
+                    return content
+                last_err = DeepSeekError("接口返回空内容")
+            except DeepSeekError as e:
+                last_err = e
+                # 400/401/403 属于配置错误，重试无意义
+                msg = str(e)
+                if msg.startswith("HTTP 4") and "429" not in msg:
+                    raise
+            except Exception as e:
+                last_err = DeepSeekError(str(e))
+            if attempt < retries - 1:
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise last_err or DeepSeekError("调用失败")
+
+    async def answer_exam(self, questions: List[Dict], log=None) -> Dict[int, Dict]:
+        """把题目交给 DeepSeek，返回 {题目编号: {"choices": [...], "blanks": [...], "text": "..."}}"""
+        _log = log or (lambda msg, style="": None)
+        if not questions:
+            return {}
+
+        user_payload = {"questions": questions}
+        user_prompt = (
+            "请作答以下试题，并按要求输出 JSON（json）：\n"
+            + json.dumps(user_payload, ensure_ascii=False, indent=1)
+        )
+        messages = [
+            {"role": "system", "content": EXAM_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        last_err = None
+        for attempt in range(2):
+            raw = await self.chat(messages, json_mode=True)
+            parsed = _parse_exam_json(raw)
+            if parsed:
+                return parsed
+            last_err = DeepSeekError("返回内容无法解析为 JSON")
+            messages = messages + [
+                {"role": "assistant", "content": raw[:2000]},
+                {"role": "user", "content": "上一次输出不是合法 JSON。请只输出 JSON 对象，"
+                                           "格式：{\"answers\":[{\"index\":1,\"choices\":[\"A\"]}]}"},
+            ]
+        raise last_err or DeepSeekError("答题结果解析失败")
+
+
+def _parse_exam_json(raw: str) -> Dict[int, Dict]:
+    """从模型输出里提取 {题目编号: 答案}，兼容代码块/多余文字。"""
+    if not raw:
+        return {}
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        data = json.loads(text[start:end + 1])
+    except Exception:
+        return {}
+    items = data.get("answers") if isinstance(data, dict) else None
+    if items is None and isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        return {}
+
+    result: Dict[int, Dict] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        choices = item.get("choices") or item.get("choice") or []
+        if isinstance(choices, str):
+            choices = [c for c in re.split(r"[,，、\s]+", choices) if c]
+        choices = [str(c).strip().upper() for c in choices if str(c).strip()]
+        blanks = item.get("blanks") or []
+        if isinstance(blanks, str):
+            blanks = [blanks]
+        blanks = [str(b).strip() for b in blanks]
+        text = item.get("text") or item.get("answer") or ""
+        if isinstance(text, list):
+            text = " ".join(str(t) for t in text)
+        result[index] = {"choices": choices, "blanks": blanks, "text": str(text).strip()}
+    return result
+
+
 class AutoLearner:
     def __init__(self, headless: bool = False, workers: int = 1, browser: str = "chromium"):
         self.headless = headless
@@ -251,6 +474,12 @@ class AutoLearner:
         self._hours_ttl = 60.0  # 学时缓存有效期（秒）
         self._hours_lock = None  # 懒创建 asyncio.Lock（避免在 __init__ 绑定事件循环）
         self.user_data = {}
+        # 考试自动答题（训练营随堂测试）：默认关闭，需在设置里配置 DeepSeek API Key
+        self.exam_enabled = False
+        self.deepseek_api_key = ""
+        self.deepseek_model = DEEPSEEK_DEFAULT_MODEL
+        self.deepseek_base_url = DEEPSEEK_DEFAULT_BASE_URL
+        self.deepseek_thinking = False
 
     async def init(self, log_callback=None, chrome_path="", download_callback=None):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
@@ -306,7 +535,11 @@ class AutoLearner:
         _kill_playwright_chrome()
 
         # 复用上方已启动的 playwright 实例（不再重复 start，避免驱动进程泄漏）
-        launch_opts = {"headless": self.headless}
+        # --autoplay-policy：训练营视频靠脚本拉起播放，默认策略会拦截无用户手势的自动播放
+        launch_opts = {
+            "headless": self.headless,
+            "args": ["--autoplay-policy=no-user-gesture-required"],
+        }
         use_system_chrome = False
 
         if self.browser_type == "chrome":
@@ -1733,59 +1966,239 @@ class AutoLearner:
             debug(f"[工作线程 {worker_id+1}] 视频播放异常: {e}")
             return False
 
-    async def find_and_play_trainingcamp_video(self, page: Page, worker_id: int, progress_callback=None):
-        """学习训练营页面中的自定义视频组件，并通过平台进度和完成状态确认结果。"""
-        prefix = f"[工作线程 {worker_id+1}] 训练营"
-        snapshot_js = r"""() => {
-            const done = document.querySelector('.traincamp-journey-study-done span');
-            const pageDone = !!done && /恭喜您，已完成/.test(done.innerText || '');
-            const components = [...document.querySelectorAll('.traincamp-progress-data')].map((progressEl, index) => {
-                let wrapper = progressEl;
-                while (wrapper && ![...wrapper.classList].some(c => /^comp-item-\d+$/.test(c))) wrapper = wrapper.parentElement;
-                if (!wrapper) return null;
-                const componentClass = [...wrapper.classList].find(c => /^comp-item-\d+$/.test(c));
-                const player = wrapper.querySelector('[id^="player-con"]');
-                const video = player && player.querySelector('video, audio');
-                let threshold = 95;
-                const nodes = [wrapper, ...wrapper.querySelectorAll('*')];
-                for (const node of nodes) {
-                    const vm = node.__vue__;
-                    if (vm && Number.isFinite(Number(vm.videoProcess)) && Number(vm.videoProcess) > 0) {
-                        threshold = Number(vm.videoProcess);
-                        break;
-                    }
+    # 训练营课程页的媒体状态快照。
+    # 注意：学习进度条（.traincamp-progress-data）只在 componentCode 为 cuVideo/cuAudio
+    # 时渲染；cuCase（课程包/案例）会渲染同一个阿里播放器却没有任何进度条，
+    # 所以这里以 DOM 为准发现播放器，进度同时读「页面 / 组件 / 服务器」三个来源。
+    _TRAINCAMP_MEDIA_JS = r"""() => {
+        const doneEl = document.querySelector('.traincamp-journey-study-done span');
+        const doneText = doneEl ? (doneEl.innerText || '').trim() : '';
+        const pageDone = /恭喜您，已完成/.test(doneText);
+
+        // 页面级组件列表（平台返回的 videoProgress / progress / finishFlag）
+        let pageVm = null;
+        for (const node of document.querySelectorAll('[id^="traincamp-journey-module-item-"]')) {
+            let cur = node;
+            while (cur) {
+                if (cur.__vue__ && Array.isArray(cur.__vue__.compMapList)) { pageVm = cur.__vue__; break; }
+                cur = cur.parentElement;
+            }
+            if (pageVm) break;
+        }
+        const itemById = {};
+        const itemByClass = {};
+        if (pageVm) {
+            (pageVm.compMapList || []).forEach((item, i) => {
+                if (item && item.id !== undefined) itemById[String(item.id)] = item;
+                itemByClass['comp-item-' + i] = item;
+            });
+        }
+
+        const wrappers = [...document.querySelectorAll('[class*="comp-item-"]')].filter(el => {
+            const cn = el.className;
+            return typeof cn === 'string' && /(^|\s)comp-item-\d+(\s|$)/.test(cn);
+        });
+
+        const seen = new Set();
+        const components = [];
+        const allCodes = [];
+        for (const wrapper of wrappers) {
+            const cls = (String(wrapper.className).match(/comp-item-\d+/) || [''])[0];
+            if (!cls || seen.has(cls)) continue;
+            seen.add(cls);
+
+            const playerEl = wrapper.querySelector('[id^="player-con"]');
+            let mediaEl = wrapper.querySelector('video, audio');
+            if (!mediaEl && playerEl) mediaEl = playerEl.querySelector('video, audio');
+
+            // 组件 Vue 实例：视频/音频组件都带 player 或 resourceDetail
+            let vm = null;
+            const nodes = [wrapper, ...wrapper.querySelectorAll('*')];
+            for (const node of nodes) {
+                const v = node.__vue__;
+                if (!v) continue;
+                if ((v.player && typeof v.player.play === 'function') || v.resourceDetail) { vm = v; break; }
+            }
+
+            const item = (vm && vm.id !== undefined && itemById[String(vm.id)]) || itemByClass[cls] || null;
+            if (item && item.componentCode) allCodes.push(item.componentCode);
+
+            const domPctEl = wrapper.querySelector('.traincamp-progress-data');
+            const domPct = domPctEl ? parseFloat((domPctEl.innerText || '').replace('%', '').trim()) : NaN;
+
+            let hasPlayerApi = false, playerTime = -1, playerDuration = 0;
+            if (vm && vm.player && typeof vm.player.getCurrentTime === 'function') {
+                hasPlayerApi = true;
+                try { playerTime = Number(vm.player.getCurrentTime()); } catch (e) { playerTime = -1; }
+                try { playerDuration = Number(vm.player.getDuration()); } catch (e) { playerDuration = 0; }
+            }
+            const mediaTime = (mediaEl && isFinite(mediaEl.currentTime)) ? mediaEl.currentTime : -1;
+            const mediaDuration = (mediaEl && isFinite(mediaEl.duration)) ? mediaEl.duration : 0;
+
+            const candidates = [
+                Number.isFinite(domPct) ? domPct : null,
+                (item && Number.isFinite(Number(item.videoProgress))) ? Number(item.videoProgress) : null,
+                (item && Number.isFinite(Number(item.progress))) ? Number(item.progress) : null,
+                (vm && Number.isFinite(Number(vm.studySchedule))) ? Number(vm.studySchedule) : null
+            ].filter(v => v !== null);
+            const platformPct = candidates.length ? Math.max.apply(null, candidates) : 0;
+
+            components.push({
+                componentClass: cls,
+                componentCode: (item && item.componentCode) || '',
+                componentId: (vm && vm.id !== undefined) ? String(vm.id) : '',
+                resourceName: (vm && vm.resourceDetail && vm.resourceDetail.resourceName) || '',
+                status: (vm && vm.status) || '',
+                threshold: (vm && Number.isFinite(Number(vm.videoProcess)) && Number(vm.videoProcess) > 0)
+                    ? Number(vm.videoProcess) : 95,
+                platformPct: platformPct,
+                finishedFlag: !!wrapper.querySelector('.finish-flag-img') ||
+                    !!(item && (Number(item.progress) >= 100 || item.finishFlag === 1 || item.finishFlag === '1')),
+                hasPlayerEl: !!playerEl,
+                playerId: playerEl ? playerEl.id : '',
+                hasPlayerApi: hasPlayerApi,
+                hasMedia: !!mediaEl,
+                mediaTime: mediaTime,
+                mediaDuration: mediaDuration,
+                playerTime: playerTime,
+                playerDuration: playerDuration,
+                paused: mediaEl ? !!mediaEl.paused : true,
+                ended: mediaEl ? !!mediaEl.ended : false,
+                readyState: mediaEl ? mediaEl.readyState : -1,
+                errorCode: (mediaEl && mediaEl.error) ? mediaEl.error.code : 0,
+                coverVisible: !!(wrapper.querySelector('.prism-cover, .prism-big-play-btn')
+                    && !wrapper.querySelector('.prism-cover[style*="display: none"]'))
+            });
+        }
+        return {
+            pageDone: pageDone,
+            doneText: doneText,
+            isPreview: !!(pageVm && pageVm.isPreview),
+            courseId: pageVm ? pageVm.courseId : '',
+            iframes: [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean).slice(0, 5),
+            codes: allCodes,
+            components: components
+        };
+    }"""
+
+    # 播放：优先用组件自己的播放器 API（阿里播放器/cyberplayer），再兜底 HTML5 元素
+    _TRAINCAMP_PLAY_JS = r"""(componentClass) => {
+        const wrapper = document.querySelector('.' + componentClass);
+        if (!wrapper) return {ok: false, reason: 'wrapper-missing'};
+        const out = {ok: false, via: '', clicked: false, muted: false, reason: ''};
+
+        const box = wrapper.querySelector('[id^="player-con"]');
+        const media = (box && box.querySelector('video, audio')) || wrapper.querySelector('video, audio');
+        const isPaused = !media || media.paused || media.ended;
+
+        // 阿里播放器的封面/大播放按钮会挡住 video，先点掉（仅在暂停时点，避免切到暂停）
+        if (isPaused) {
+            const bigBtn = wrapper.querySelector('.prism-big-play-btn, .prism-play-btn');
+            if (bigBtn) { try { bigBtn.click(); out.clicked = true; } catch (e) {} }
+        }
+
+        let vm = null;
+        for (const node of [wrapper, ...wrapper.querySelectorAll('*')]) {
+            const v = node.__vue__;
+            if (v && v.player && typeof v.player.play === 'function') { vm = v; break; }
+        }
+        if (vm) {
+            try { vm.player.play(); out.via = 'player-api'; out.ok = true; } catch (e) { out.reason = String(e); }
+        }
+
+        if (media) {
+            if (media.paused || media.ended) {
+                let promise = null;
+                try { media.muted = false; } catch (e) {}
+                try { promise = media.play(); } catch (e) { out.reason = String(e); }
+                if (promise && promise.catch) {
+                    promise.catch(() => {
+                        // 自动播放被拦截时退回静音播放（平台按播放时长计进度，静音同样有效）
+                        try { media.muted = true; out.muted = true; media.play(); } catch (e) {}
+                    });
                 }
-                const parsed = parseFloat((progressEl.innerText || '').replace('%', '').trim());
-                return {
-                    index,
-                    componentClass,
-                    playerId: player ? player.id : '',
-                    progress: Number.isFinite(parsed) ? parsed : 0,
-                    threshold,
-                    hasMedia: !!video,
-                    currentTime: video && Number.isFinite(video.currentTime) ? video.currentTime : -1,
-                    paused: video ? video.paused : true
-                };
-            }).filter(Boolean);
-            return { pageDone, doneText: done ? (done.innerText || '').trim() : '', components };
-        }"""
+                out.ok = true;
+                out.via = out.via ? out.via + '+element' : 'element';
+            } else {
+                out.ok = true;
+                out.via = out.via ? out.via + '+playing' : 'playing';
+            }
+        }
+        const cover = wrapper.querySelector('.prism-cover');
+        if (cover) { try { cover.style.display = 'none'; } catch (e) {} }
+        if (!out.ok) out.reason = out.reason || '未找到播放器元素';
+        return out;
+    }"""
+
+    async def find_and_play_trainingcamp_video(self, page: Page, worker_id: int,
+                                               progress_callback=None, log_callback=None):
+        """学习训练营课程页里的视频/音频组件，由平台确认课程完成。
+
+        组件类型不止 cuVideo/cuAudio（cuCase 课程包同样渲染阿里播放器且没有进度条），
+        因此按 DOM 发现播放器；进度取「页面 compMapList 的 videoProgress / 组件
+        studySchedule / 进度条文本」的最大值作为平台进度，本地播放位置只用于卡顿判断。
+        """
+        prefix = f"[工作线程 {worker_id+1}] 训练营"
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
 
         async def snapshot():
             try:
-                return await page.evaluate(snapshot_js)
-            except Exception:
-                return {"pageDone": False, "doneText": "", "components": []}
+                return await page.evaluate(self._TRAINCAMP_MEDIA_JS)
+            except Exception as e:
+                debug(f"{prefix} 读取页面状态失败: {e}")
+                return {"pageDone": False, "doneText": "", "components": [], "codes": []}
+
+        def media_components(state):
+            return [c for c in (state.get("components") or [])
+                    if c.get("hasMedia") or c.get("hasPlayerEl") or c.get("hasPlayerApi")]
 
         def report_progress(state):
-            components = state.get("components") or []
+            components = media_components(state)
             if not progress_callback or not components:
                 return
-            component_progress = sum(
-                min(1.0, float(item.get("progress") or 0) / float(item.get("threshold") or 95))
+            total = sum(
+                min(1.0, float(item.get("platformPct") or 0) / float(item.get("threshold") or 95))
                 for item in components
             )
             # 只有训练营页面确认完成后才报告 100%，避免课程行显示成功但平台未完成。
-            progress_callback(min(99.0, component_progress * 100 / len(components)))
+            progress_callback(min(99.0, total * 100 / len(components)))
+
+        def local_position(component):
+            values = []
+            for key in ("mediaTime", "playerTime"):
+                try:
+                    value = float(component.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value == value:  # 排除 NaN
+                    values.append(value)
+            return max(values) if values else -1.0
+
+        def local_duration(component):
+            values = []
+            for key in ("mediaDuration", "playerDuration"):
+                try:
+                    value = float(component.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value == value and value > 0:
+                    values.append(value)
+            return max(values) if values else 0.0
+
+        def diagnose(components, state):
+            if not components:
+                codes = "、".join(state.get("codes") or []) or "无"
+                iframes = "、".join(state.get("iframes") or [])
+                _log(f"{prefix} 未发现可播放的视频/音频组件（组件类型：{codes}）"
+                     f"{'，页面含 iframe' if iframes else ''}"
+                     f"{'，当前为预览模式（preview=1）不记录进度' if state.get('isPreview') else ''}", "yellow")
+                debug(f"{prefix} 组件类型: {codes}；iframe: {iframes}；URL: {page.url}")
+            for c in components:
+                debug(f"{prefix} 组件 {c.get('componentClass')} [{c.get('componentCode')}] "
+                      f"{c.get('resourceName')} status={c.get('status')} "
+                      f"playerEl={c.get('hasPlayerEl')} media={c.get('hasMedia')} "
+                      f"readyState={c.get('readyState')} err={c.get('errorCode')} "
+                      f"平台进度={c.get('platformPct')}")
 
         try:
             if not re.search(r"#/traincamp/study/", page.url):
@@ -1793,137 +2206,151 @@ class AutoLearner:
                 return False
 
             # 等 Vue 路由及训练营组件完成渲染，已完成的课程可以直接跳过。
+            state = await snapshot()
             for _ in range(30):
-                state = await snapshot()
                 if state.get("pageDone"):
                     if progress_callback:
                         progress_callback(100)
                     debug(f"{prefix} 页面已由平台标记完成")
                     return True
-                if state.get("components"):
+                if media_components(state):
                     break
                 if self._stop_event.is_set():
                     return False
                 await page.wait_for_timeout(1000)
+                state = await snapshot()
 
-            state = await snapshot()
-            components = state.get("components") or []
+            components = media_components(state)
             report_progress(state)
             if not components:
-                debug(f"{prefix} 未找到训练营视频/音频进度组件，当前URL: {page.url}")
+                diagnose(components, state)
                 return False
 
+            if state.get("isPreview"):
+                debug(f"{prefix} 当前是预览模式，平台不会记录进度")
+            diagnose(components, state)
+
             refresh_count = 0
+            pending_components = []   # 本地已播完/停滞但平台尚未结算的组件
             for component in components:
                 component_class = component.get("componentClass")
                 if not component_class:
                     continue
 
-                # 已达到训练营组件阈值的内容无需重复播放。
                 threshold = float(component.get("threshold") or 95)
-                if float(component.get("progress") or 0) >= threshold:
-                    continue
+                if float(component.get("platformPct") or 0) >= threshold or component.get("finishedFlag"):
+                    continue  # 平台已记录达标，无需重复播放
 
                 wrapper = page.locator(f".{component_class}").first
                 try:
                     await wrapper.scroll_into_view_if_needed(timeout=5000)
                 except Exception:
                     pass
-                player_id = component.get("playerId") or ""
 
-                # 训练营的阿里播放器按组件 ID 挂载。滚动到组件后等待播放器实例化。
+                # 等待播放器与 video 元素挂载（cuCase 等组件要等接口返回播放地址）
                 media_ready = False
                 for _ in range(30):
                     current_state = await snapshot()
-                    match = next((x for x in current_state.get("components", [])
-                                  if x.get("componentClass") == component_class), None)
                     if current_state.get("pageDone"):
                         if progress_callback:
                             progress_callback(100)
                         return True
+                    match = next((x for x in media_components(current_state)
+                                  if x.get("componentClass") == component_class), None)
                     if match and match.get("hasMedia"):
                         component = match
-                        player_id = match.get("playerId") or player_id
                         media_ready = True
                         break
+                    if match and (match.get("hasPlayerEl") or match.get("hasPlayerApi")):
+                        component = match
                     if self._stop_event.is_set():
                         return False
                     await page.wait_for_timeout(1000)
-                if not media_ready or not player_id:
-                    debug(f"{prefix} 组件 {component_class} 没有加载出播放器")
-                    return False
 
-                # 调用播放器内部 video.play()，不直接改写平台进度；平台组件会自行上报学习进度。
                 try:
-                    await page.evaluate("""(id) => {
-                        const player = document.getElementById(id);
-                        const media = player && player.querySelector('video, audio');
-                        if (!media) return false;
-                        if (media.paused || media.ended) {
-                            const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
-                            if (playButton) playButton.click();
-                            const result = media.play();
-                            if (result && result.catch) result.catch(() => {});
-                        }
-                        return true;
-                    }""", player_id)
-                except Exception:
-                    pass
+                    play_result = await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
+                except Exception as e:
+                    play_result = {"ok": False, "reason": str(e)}
+                if not media_ready:
+                    _log(f"{prefix} 组件 {component_class} 没有挂载出播放器"
+                         f"（{play_result.get('reason') or '无媒体元素'}），跳过该组件", "yellow")
+                    debug(f"{prefix} 组件 {component_class} 播放结果 {play_result}")
+                else:
+                    debug(f"{prefix} 组件 {component_class} 开始播放 via={play_result.get('via')} "
+                          f"{'（静音兜底）' if play_result.get('muted') else ''}")
                 await page.wait_for_timeout(1500)
 
-                last_progress = float(component.get("progress") or 0)
-                last_local_time = -1.0
+                last_progress = float(component.get("platformPct") or 0)
+                last_local = local_position(component)
                 stall_count = 0
+                # 本地是否已播到阈值：一旦达成就不复位，避免播完后被重新拉起时反复重置
+                local_reached = False
+                local_reached_since = None
                 component_complete = False
                 for _ in range(120 * 4):
                     if self._stop_event.is_set():
                         return False
-                    await page.wait_for_timeout(10000)
+                    await page.wait_for_timeout(TRAINCAMP_POLL_SECONDS * 1000)
                     current_state = await snapshot()
                     if current_state.get("pageDone"):
                         if progress_callback:
                             progress_callback(100)
                         return True
-                    match = next((x for x in current_state.get("components", [])
+                    match = next((x for x in media_components(current_state)
                                   if x.get("componentClass") == component_class), None)
                     if not match:
                         debug(f"{prefix} 页面组件在播放期间消失")
                         return False
 
-                    pct = float(match.get("progress") or 0)
+                    pct = float(match.get("platformPct") or 0)
                     report_progress(current_state)
-                    if pct >= float(match.get("threshold") or threshold):
+                    if pct >= float(match.get("threshold") or threshold) or match.get("finishedFlag"):
                         component_complete = True
                         break
 
-                    local_time = float(match.get("currentTime") or -1)
-                    advanced = pct != last_progress or (local_time >= 0 and local_time != last_local_time)
+                    position = local_position(match)
+                    duration = local_duration(match)
+                    advanced = pct != last_progress or (position >= 0 and position != last_local)
                     last_progress = pct
-                    last_local_time = local_time
+                    last_local = position
+
+                    if not local_reached and duration > 0 and position > 0 \
+                            and position / duration * 100 >= threshold:
+                        local_reached = True
+                    if match.get("ended") and position > 0:
+                        local_reached = True
+
+                    # 本地已播到阈值但平台还没结算：给平台结算时间（postProgress 有间隔），
+                    # 超时后交由页面「完成学习」由平台判定，绝不再从头重播。
+                    if local_reached:
+                        if local_reached_since is None:
+                            local_reached_since = time.time()
+                        elif time.time() - local_reached_since > TRAINCAMP_LOCAL_SETTLE_SECONDS:
+                            _log(f"{prefix} 组件 {component_class} 本地已播完"
+                                 f"（{position:.0f}/{duration:.0f}秒），平台进度仍为 {pct:.0f}%，"
+                                 f"交由「完成学习」判定", "yellow")
+                            pending_components.append(component_class)
+                            break
+
                     if advanced:
                         stall_count = 0
                         continue
 
                     stall_count += 1
-                    if match.get("paused"):
-                        # 播放器偶尔因浏览器策略暂停，尝试用播放器控件恢复。
+                    # 只在「播放中途暂停」时重新拉起；已播完的媒体重播会把进度打回 0
+                    if not match.get("ended") and (match.get("paused") or not match.get("hasMedia")) \
+                            and not local_reached:
                         try:
-                            await page.evaluate("""(id) => {
-                                const player = document.getElementById(id);
-                                const media = player && player.querySelector('video, audio');
-                                if (media && media.paused) {
-                                    const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
-                                    if (playButton) playButton.click();
-                                    const result = media.play();
-                                    if (result && result.catch) result.catch(() => {});
-                                }
-                            }""", player_id)
+                            await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
                         except Exception:
                             pass
                     if stall_count >= 18:
                         if refresh_count >= 3:
+                            _log(f"{prefix} 组件 {component_class} 播放进度停滞"
+                                 f"（平台进度 {pct:.0f}%），交由「完成学习」判定", "yellow")
                             debug(f"{prefix} 组件 {component_class} 连续停滞，重试后仍无进度")
-                            return False
+                            pending_components.append(component_class)
+                            break
                         refresh_count += 1
                         debug(f"{prefix} 播放进度停滞，刷新课程页重试 ({refresh_count}/3)")
                         try:
@@ -1932,32 +2359,30 @@ class AutoLearner:
                             if not re.search(r"#/traincamp/study/", page.url):
                                 return False
                             refreshed = await snapshot()
-                            component = next((x for x in refreshed.get("components", [])
-                                              if x.get("componentClass") == component_class), component)
-                            player_id = component.get("playerId") or player_id
+                            refreshed_match = next(
+                                (x for x in media_components(refreshed)
+                                 if x.get("componentClass") == component_class), None)
+                            if refreshed_match:
+                                component = refreshed_match
                             try:
                                 await page.locator(f".{component_class}").first.scroll_into_view_if_needed(timeout=5000)
                             except Exception:
                                 pass
                             await page.wait_for_timeout(2000)
-                            await page.evaluate("""(id) => {
-                                const player = document.getElementById(id);
-                                const media = player && player.querySelector('video, audio');
-                                if (media) {
-                                    const playButton = player.querySelector('.prism-big-play-btn, .prism-play-btn');
-                                    if (playButton) playButton.click();
-                                    const result = media.play();
-                                    if (result && result.catch) result.catch(() => {});
-                                }
-                            }""", player_id)
+                            await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
                         except Exception as e:
                             debug(f"{prefix} 刷新课程页失败: {e}")
                             return False
                         stall_count = 0
 
-                if not component_complete:
+                if not component_complete and component_class not in pending_components:
+                    _log(f"{prefix} 组件 {component_class} 未达到平台学习阈值", "yellow")
                     debug(f"{prefix} 组件 {component_class} 未达到平台学习阈值")
                     return False
+
+            if pending_components:
+                _log(f"{prefix} {len(pending_components)} 个组件本地已播完但平台未结算，"
+                     f"交由「完成学习」由平台判定", "yellow")
 
             # 视频组件会先记录自身完成；训练营还需要点击页面的“完成学习”，再由平台确认课程完成。
             state = await snapshot()
@@ -1984,10 +2409,574 @@ class AutoLearner:
                         progress_callback(100)
                     return True
             debug(f"{prefix} 视频进度已上报，但平台尚未确认课程完成 ({state.get('doneText', '')})")
+            _log(f"{prefix} 视频已播放，但平台未确认课程完成（{state.get('doneText', '')}）", "yellow")
             return False
         except Exception as e:
-            debug(f"{prefix} 播放异常: {e}")
+            debug(f"{prefix} 播放异常: {e}\n{traceback.format_exc()}")
+            _log(f"{prefix} 播放异常: {e}", "red")
             return False
+
+    # ─── 训练营随堂测试（考试）自动答题 ────────────────────────────────
+
+    _TRAINCAMP_COMPONENTS_JS = r"""() => {
+        const items = document.querySelectorAll('[id^="traincamp-journey-module-item-"]');
+        let vm = null;
+        for (const node of items) {
+            let cur = node;
+            while (cur) {
+                if (cur.__vue__ && Array.isArray(cur.__vue__.compMapList)) { vm = cur.__vue__; break; }
+                cur = cur.parentElement;
+            }
+            if (vm) break;
+        }
+        if (!vm) return null;
+        const components = (vm.compMapList || []).map((item, i) => {
+            const cfg = (item.componentConfig && item.componentConfig.data_config) || [];
+            let resources = [];
+            try {
+                const dataNode = cfg.find(c => c.code === 'data');
+                const listNode = dataNode && (dataNode.list || []).find(l => l.prop_key === 'dataList');
+                const value = listNode && listNode.value;
+                resources = (value && value[0] && value[0].list) || [];
+            } catch (e) { resources = []; }
+            return {
+                index: i,
+                componentCode: item.componentCode || '',
+                componentName: item.componentName || '',
+                resources: resources.map(r => ({
+                    pcUrl: (r && r.pcUrl) || '',
+                    name: (r && (r.resourceName || r.name)) || '',
+                    requiredFlag: (r && r.resourceConfig) ? r.resourceConfig.requiredFlag : null,
+                    examDate: (r && r.resourceConfig) ? (r.resourceConfig.examDate || '') : ''
+                }))
+            };
+        });
+        return { components };
+    }"""
+
+    _EXAM_PREVIEW_JS = r"""() => {
+        const el = document.querySelector('.exam_exampreview');
+        const vm = el && el.__vue__;
+        if (!vm) return null;
+        const m = vm.userExamMap || {};
+        return {
+            arrangeName: m.arrangeName || '',
+            btnText: vm.btnTextT || '',
+            btnEnabled: !!vm.btnStatus && !!vm.isShowBtn,
+            lblMsg: vm.lblMsg || '',
+            isAppExam: !!m.isAppExam,
+            isShowBtn: !!vm.isShowBtn,
+            userExamMapID: vm.userExamMapID || '',
+            examArrangeID: vm.examArrangeID || ''
+        };
+    }"""
+
+    _EXAM_QUESTIONS_JS = r"""() => {
+        const findVm = () => {
+            const root = document.querySelector('.practiceing');
+            if (root && root.__vue__ && Array.isArray(root.__vue__.questionsList)) return root.__vue__;
+            const all = document.querySelectorAll('div');
+            for (const el of all) {
+                const vm = el.__vue__;
+                if (vm && Array.isArray(vm.questionsList) && vm.userExamId) return vm;
+            }
+            return null;
+        };
+        const vm = findVm();
+        if (!vm) return null;
+        const strip = (html) => {
+            const d = document.createElement('div');
+            d.innerHTML = html == null ? '' : String(html);
+            return (d.innerText || d.textContent || '').replace(/\s+/g, ' ').trim();
+        };
+        return {
+            userExamId: vm.userExamId,
+            arrangeId: vm.arrangeId,
+            userExamMapId: vm.userExamMapId,
+            uniqueId: vm.uniqueId,
+            arrangeName: vm.arrangeName || '',
+            maxScore: vm.maxScore,
+            passScore: vm.passScore,
+            totalQuestionQty: vm.totalQuestionQty,
+            questions: (vm.questionsList || []).map(q => {
+                const raw = q.QuestionType === 'Judge' ? q.JudgeItems : q.ChoiceItems;
+                const options = (raw || []).map(o => ({
+                    id: o.ID, code: o.ItemCode, text: strip(o.ItemContent)
+                }));
+                return {
+                    id: q.ID,
+                    index: q.OrderIndex,
+                    type: q.QuestionType,
+                    content: strip(q.QuestionContent),
+                    hasImage: /<img/i.test(String(q.QuestionContent || '')),
+                    options: options,
+                    blankCount: (q.FillInItems || []).length
+                };
+            })
+        };
+    }"""
+
+    _EXAM_SUBMIT_JS = r"""async ({ apiBase, userExamId, arrangeId, userExamMapId, payload }) => {
+        const clean = (location.hash.split('#/')[1] || '').split('?')[0];
+        const cp = btoa(location.pathname + '#/' + clean);
+        const headers = {
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json;charset=UTF-8',
+            'token': window.localStorage.getItem('token') || '',
+            'CParam1': cp,
+            'CParam2': cp,
+            'source': '501'
+        };
+        const body = JSON.stringify(payload);
+        const out = {};
+        const q = 'arrangeId=' + encodeURIComponent(arrangeId) +
+                  '&userExamMapId=' + encodeURIComponent(userExamMapId);
+        try {
+            const r = await fetch(apiBase + '/ote/user/logAnswers/' + userExamId,
+                { method: 'POST', headers, body, mode: 'cors', credentials: 'omit' });
+            out.logStatus = r.status;
+        } catch (e) { out.logError = String(e); }
+        try {
+            const r = await fetch(apiBase + '/ote/web/userexam/' + userExamId + '/submit?' + q,
+                { method: 'POST', headers, body, mode: 'cors', credentials: 'omit' });
+            out.submitStatus = r.status;
+            try { out.body = await r.json(); } catch (e) { out.body = null; }
+        } catch (e) { out.submitError = String(e); }
+        return out;
+    }"""
+
+    _EXAM_RESULT_JS = r"""() => {
+        const el = document.querySelector('.finishContainer');
+        const vm = el && el.__vue__;
+        if (!vm) return null;
+        const m = vm.userExamMap || {};
+        return {
+            examName: m.examName || '',
+            userStatus: m.userStatus || '',
+            submitTime: m.submitTime || '',
+            isShowScore: m.isShowScore,
+            score: m.score,
+            isPass: m.isPass,
+            isAllowRepeat: m.isAllowRepeat,
+            examTimes: m.examTimes,
+            usedExamTimes: m.usedExamTimes
+        };
+    }"""
+
+    async def _confirm_trainingcamp_finish(self, page: Page, worker_id: int) -> bool:
+        """点训练营课程页的「完成学习」并等待平台确认（用于没有视频组件的纯考试页）"""
+        prefix = f"[工作线程 {worker_id+1}] 训练营"
+        done_js = r"""() => {
+            const d = document.querySelector('.traincamp-journey-study-done span');
+            return !!(d && /恭喜您，已完成/.test(d.innerText || ''));
+        }"""
+        try:
+            if await page.evaluate(done_js):
+                return True
+            button = page.locator(".traincamp-journey-study-done span").first
+            if await button.count() == 0:
+                return False
+            await button.scroll_into_view_if_needed(timeout=3000)
+            label = (await button.inner_text(timeout=2000)).strip()
+            if "完成学习" not in label:
+                return await page.evaluate(done_js)
+            await button.click(timeout=5000)
+            for _ in range(15):
+                await page.wait_for_timeout(1000)
+                if await page.evaluate(done_js):
+                    return True
+            return False
+        except Exception as e:
+            debug(f"{prefix} 点击完成学习失败: {e}")
+            return False
+
+    def apply_exam_settings(self, settings: Dict) -> None:
+        """把考试答题设置写入 learner（GUI 与命令行共用）"""
+        settings = settings or {}
+        self.exam_enabled = bool(settings.get("exam_enabled", False))
+        self.deepseek_api_key = settings.get("deepseek_api_key", "") or ""
+        self.deepseek_model = settings.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL
+        self.deepseek_base_url = settings.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL
+        self.deepseek_thinking = bool(settings.get("deepseek_thinking", False))
+
+    async def _trainingcamp_components(self, page: Page) -> Optional[List[Dict]]:
+        """读取训练营课程页的组件列表（含 cuExam 考试组件）"""
+        try:
+            data = await page.evaluate(self._TRAINCAMP_COMPONENTS_JS)
+        except Exception as e:
+            debug(f"读取训练营组件失败: {e}")
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data.get("components") or []
+
+    async def solve_trainingcamp_exams(self, page: Page, worker_id: int, log_callback=None) -> Dict:
+        """处理训练营课程页中的考试组件，返回统计信息。
+
+        返回 {found, passed, failed, skipped, errors, all_ok, page_has_media}
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        prefix = f"[工作线程 {worker_id+1}] 考试"
+        state = {"found": 0, "passed": 0, "failed": 0, "skipped": 0,
+                 "errors": 0, "all_ok": True, "page_has_media": False}
+
+        if not self.exam_enabled:
+            return state
+        if not self.deepseek_api_key:
+            _log(f"{prefix} 已开启自动答题但未配置 DeepSeek API Key，跳过考试", "yellow")
+            state["all_ok"] = False
+            state["errors"] += 1
+            return state
+
+        components = await self._trainingcamp_components(page)
+        if components is None:
+            return state
+
+        media_codes = {"cuVideo", "cuAudio", "cuCase", "cuCampLive"}
+        state["page_has_media"] = any(
+            (c.get("componentCode") or "") in media_codes for c in components
+        )
+
+        exam_tasks: List[Dict] = []
+        for comp in components:
+            if (comp.get("componentCode") or "") not in ("cuExam", "cuWebExam"):
+                continue
+            for res in (comp.get("resources") or []):
+                url = (res.get("pcUrl") or "").strip()
+                if not url:
+                    continue
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = "https://u.ccb.com" + url
+                name = (res.get("name") or comp.get("componentName") or "随堂测试").strip()
+                exam_tasks.append({
+                    "url": url,
+                    "name": name,
+                    "examDate": res.get("examDate") or "",
+                    "required": res.get("requiredFlag"),
+                })
+
+        state["found"] = len(exam_tasks)
+        if not exam_tasks:
+            return state
+
+        _log(f"{prefix} 本课程页发现 {len(exam_tasks)} 场考试，开始自动答题", "blue")
+        for task in exam_tasks:
+            if self._stop_event.is_set():
+                state["all_ok"] = False
+                return state
+            try:
+                result = await self._solve_one_exam(task, worker_id, _log)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                debug(f"{prefix} 异常: {e}\n{traceback.format_exc()}")
+                result = {"status": "error", "detail": str(e)}
+            status = result.get("status")
+            if status == "passed":
+                state["passed"] += 1
+                _log(f"{prefix} 「{task['name']}」已完成：{result.get('detail', '')}", "green")
+            elif status == "failed":
+                state["failed"] += 1
+                state["all_ok"] = False
+                _log(f"{prefix} 「{task['name']}」未通过：{result.get('detail', '')}", "red")
+            elif status == "skipped":
+                state["skipped"] += 1
+                _log(f"{prefix} 「{task['name']}」跳过：{result.get('detail', '')}", "yellow")
+            else:
+                state["errors"] += 1
+                state["all_ok"] = False
+                _log(f"{prefix} 「{task['name']}」答题失败：{result.get('detail', '')}", "red")
+
+        summary = (f"考试处理完成：通过 {state['passed']}，未通过 {state['failed']}，"
+                   f"跳过 {state['skipped']}，异常 {state['errors']}")
+        _log(f"{prefix} {summary}", "green" if state["all_ok"] else "yellow")
+        return state
+
+    _EXAM_PREVIEW_RESULT_JS = r"""() => {
+        const el = document.querySelector('.exam_exampreview');
+        const vm = el && el.__vue__;
+        if (!vm) return null;
+        const m = vm.userExamMap || {};
+        const records = (Array.isArray(vm.examSubList) ? vm.examSubList : []).map(r => ({
+            submitTime: r.submitTime || '',
+            status: r.status || '',
+            score: (typeof r.score === 'number') ? r.score : null,
+            isPass: (r.isPass === true || r.isPass === 'true' || r.isPass === 1) ? true
+                   : (r.isPass === false || r.isPass === 'false' || r.isPass === 0) ? false : null
+        }));
+        return {
+            arrangeName: m.arrangeName || '',
+            btnText: vm.btnTextT || '',
+            lastStatus: m.lastStatus || '',
+            isShowScore: m.isShowScore,
+            examTimes: m.examTimes,
+            usedExamTimes: m.usedExamTimes,
+            isAllowRepeat: !!m.isAllowRepeat,
+            records: records
+        };
+    }"""
+
+    async def _read_exam_result_from_preview(self, exam_page, task: Dict, meta: Dict,
+                                             _log) -> Optional[Dict]:
+        """刷新考试说明页读取是否通过（平台在这里显示考试记录与成绩）。
+
+        提交后答题页不会自动刷新成绩，说明页重新加载才会拿到最新记录，
+        这也是页面自身的“再考一次 / 已完成”按钮状态来源。
+        """
+        arrange_id = meta.get("arrangeId") or ""
+        map_id = meta.get("userExamMapId") or ""
+        base = task["url"].split("?")[0]
+        url = f"{base}?examArrangeID={arrange_id}&userExamMapID={map_id}&hideFooter=true"
+        try:
+            await exam_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await exam_page.wait_for_selector(".exam_exampreview", state="attached", timeout=30000)
+        except Exception as e:
+            debug(f"打开考试说明页失败: {e}")
+            return None
+
+        for _ in range(20):
+            try:
+                data = await exam_page.evaluate(self._EXAM_PREVIEW_RESULT_JS)
+            except Exception:
+                data = None
+            if data and (data.get("records") or data.get("lastStatus")):
+                return data
+            await exam_page.wait_for_timeout(1000)
+        return None
+
+    @staticmethod
+    def _exam_result_from_records(data: Dict) -> Optional[Dict]:
+        """把说明页的考试记录翻译成 {status, detail}；无有效记录返回 None。"""
+        records = [r for r in (data.get("records") or []) if r.get("status") == "Done"]
+        last_status = (data.get("lastStatus") or "").strip()
+        if not records:
+            if last_status in ("Submited", "Marking", "Evaluating"):
+                return {"status": "passed", "detail": f"已交卷待批阅（{last_status}）"}
+            return None
+
+        latest = records[0]
+        bits = []
+        if latest.get("submitTime"):
+            bits.append(f"交卷 {latest['submitTime']}")
+        if data.get("isShowScore") and latest.get("score") is not None:
+            bits.append(f"得分 {latest['score']}")
+        if latest.get("isPass") is True:
+            bits.append("已通过")
+            return {"status": "passed", "detail": "，".join(bits)}
+        if latest.get("isPass") is False:
+            bits.append("未通过")
+            return {"status": "failed", "detail": "，".join(bits)}
+        bits.append(f"状态 {last_status or '未知'}")
+        return {"status": "passed", "detail": "，".join(bits)}
+
+    async def _solve_one_exam(self, task: Dict, worker_id: int, _log) -> Dict:
+        """在独立标签页里完成一场考试：说明页 → 开始考试 → AI 答题 → 提交 → 读成绩"""
+        prefix = f"[工作线程 {worker_id+1}] 考试"
+        if not self.context:
+            return {"status": "error", "detail": "浏览器上下文不可用"}
+
+        exam_page = await self.context.new_page()
+        try:
+            await exam_page.goto(task["url"], wait_until="domcontentloaded", timeout=30000)
+            try:
+                await exam_page.wait_for_selector(".exam_exampreview", timeout=30000)
+            except Exception:
+                return {"status": "error", "detail": f"考试说明页未正常加载: {task['url']}"}
+            await exam_page.wait_for_timeout(1500)
+
+            preview = None
+            for _ in range(20):
+                try:
+                    preview = await exam_page.evaluate(self._EXAM_PREVIEW_JS)
+                except Exception:
+                    preview = None
+                if preview:
+                    break
+                if self._stop_event.is_set():
+                    return {"status": "skipped", "detail": "已请求停止"}
+                await exam_page.wait_for_timeout(1000)
+            if not preview:
+                return {"status": "error", "detail": "未能读取考试说明数据"}
+            if not preview.get("isShowBtn"):
+                return {"status": "skipped",
+                        "detail": preview.get("lblMsg") or "当前不可考试（可能已过期或已完成）"}
+            if not preview.get("btnEnabled"):
+                return {"status": "skipped",
+                        "detail": f"按钮不可用（{preview.get('btnText') or '未知状态'}）"}
+            if preview.get("isAppExam"):
+                return {"status": "skipped", "detail": "该考试仅支持手机扫码"}
+
+            # 点「开始考试」。checkmanage 返回非 200 时平台会弹确认框。
+            start_btn = exam_page.locator(".exam-start-btn").first
+            if await start_btn.count() == 0:
+                return {"status": "error", "detail": "未找到「开始考试」按钮"}
+            await start_btn.click(timeout=15000)
+            await exam_page.wait_for_timeout(1200)
+            for _ in range(3):
+                try:
+                    confirm = exam_page.locator(
+                        ".el-message-box__btns button.el-button--primary").first
+                    if await confirm.count() > 0 and await confirm.is_visible():
+                        await confirm.click(timeout=3000)
+                        break
+                except Exception:
+                    pass
+                await exam_page.wait_for_timeout(800)
+
+            try:
+                await exam_page.wait_for_function(
+                    "() => location.hash.indexOf('/userexam') >= 0", timeout=30000)
+            except Exception:
+                return {"status": "error", "detail": "未能进入答题页"}
+
+            # 等答题页把题目拉回来（init → getQuestionList）
+            try:
+                await exam_page.wait_for_function(
+                    "() => { const r = document.querySelector('.practiceing');"
+                    " return !!(r && r.__vue__ && Array.isArray(r.__vue__.questionsList)"
+                    " && r.__vue__.questionsList.length && r.__vue__.userExamId); }",
+                    timeout=60000)
+            except Exception:
+                return {"status": "error", "detail": "答题页题目加载超时"}
+
+            paper = await exam_page.evaluate(self._EXAM_QUESTIONS_JS)
+            if not paper or not paper.get("questions"):
+                return {"status": "error", "detail": "未能读取试卷题目"}
+
+            questions = paper["questions"]
+            _log(f"{prefix} 试卷「{paper.get('arrangeName') or task['name']}」"
+                 f"{len(questions)} 题，正在请求 DeepSeek 作答...", "blue")
+
+            ai_questions = [{
+                "index": q["index"],
+                "type": q["type"],
+                "content": q["content"],
+                "options": [{"code": o["code"], "text": o["text"]} for o in q["options"]],
+                "blankCount": q.get("blankCount") or 0,
+            } for q in questions]
+
+            model = DeepSeekClient(
+                api_key=self.deepseek_api_key,
+                model=self.deepseek_model,
+                base_url=self.deepseek_base_url,
+                thinking=self.deepseek_thinking,
+            )
+            ai_answers = await model.answer_exam(ai_questions, log=_log)
+            if not ai_answers:
+                return {"status": "error", "detail": "DeepSeek 未返回可用答案"}
+
+            payload_answers = []
+            unanswered = 0
+            for q in questions:
+                ai = ai_answers.get(q["index"]) or {}
+                qtype = q["type"]
+                if qtype == "FillIn":
+                    blanks = [b for b in (ai.get("blanks") or []) if b.strip()]
+                    answer = blanks if blanks else [""]
+                elif qtype == "QuestionAndAnswer":
+                    answer = [ai.get("text") or ""]
+                else:
+                    code_map = {}
+                    for o in q["options"]:
+                        code_map[str(o["code"]).strip().upper()] = o["id"]
+                    ids = [code_map[c] for c in (ai.get("choices") or []) if c in code_map]
+                    if qtype in ("SingleChoice", "Judge"):
+                        ids = ids[:1]
+                    if not ids and q["options"]:
+                        # 兜底：至少选第一项，避免整题留空
+                        ids = [q["options"][0]["id"]]
+                    answer = ids
+                if not answer or all((not str(a).strip()) for a in answer):
+                    unanswered += 1
+                    continue
+                payload_answers.append({
+                    "answer": answer,
+                    "questionId": q["id"],
+                    "index": q["index"],
+                    "questionType": "QuestionAnswer" if qtype == "QuestionAndAnswer" else qtype,
+                })
+
+            submit_payload = {
+                "submitType": 0,
+                "uniqueId": paper.get("uniqueId") or "",
+                "usedTime": 0,
+                "answers": payload_answers,
+            }
+            if unanswered:
+                _log(f"{prefix} 有 {unanswered} 题未能作答，将按未答提交", "yellow")
+
+            result = await exam_page.evaluate(self._EXAM_SUBMIT_JS, {
+                "apiBase": OTE_API_BASE,
+                "userExamId": paper.get("userExamId"),
+                "arrangeId": paper.get("arrangeId"),
+                "userExamMapId": paper.get("userExamMapId"),
+                "payload": submit_payload,
+            })
+            status_code = (result or {}).get("submitStatus")
+            if not status_code or int(status_code) >= 400:
+                return {"status": "error",
+                        "detail": f"提交失败：{result}"}
+            _log(f"{prefix} 已提交 {len(payload_answers)} 题答案（HTTP {status_code}）", "green")
+
+            # 平台交卷后需要在考试说明页刷新才能看到成绩与是否通过，优先读说明页；
+            # 取不到时再退回成绩页（examfinishedview）。
+            preview_result = await self._read_exam_result_from_preview(
+                exam_page, task, {"arrangeId": paper.get("arrangeId"),
+                                  "userExamMapId": paper.get("userExamMapId")}, _log)
+            if preview_result:
+                outcome = self._exam_result_from_records(preview_result)
+                if outcome:
+                    debug(f"{prefix} 说明页记录: {preview_result}")
+                    if outcome["status"] == "failed" and preview_result.get("isAllowRepeat"):
+                        debug(f"{prefix} 该考试允许重考（{preview_result.get('usedExamTimes')}/"
+                              f"{preview_result.get('examTimes')}），按设置不自动重考")
+                    return outcome
+
+            finished_url = (
+                "https://u.ccb.com/ote/#/examfinishedview"
+                f"?userExamId={paper.get('userExamId')}"
+                f"&examArrangeID={paper.get('arrangeId')}"
+                f"&userExamMapID={paper.get('userExamMapId')}&hideFooter=true"
+            )
+            try:
+                await exam_page.goto(finished_url, wait_until="domcontentloaded", timeout=30000)
+                await exam_page.wait_for_selector(".finishContainer", state="attached", timeout=20000)
+                score = None
+                for _ in range(20):
+                    try:
+                        score = await exam_page.evaluate(self._EXAM_RESULT_JS)
+                    except Exception:
+                        score = None
+                    if score:
+                        break
+                    await exam_page.wait_for_timeout(1000)
+            except Exception as e:
+                debug(f"{prefix} 读取成绩失败: {e}")
+                score = None
+
+            if not score:
+                return {"status": "passed", "detail": "答案已提交（未取到成绩，请到考试记录中确认）"}
+
+            user_status = score.get("userStatus") or ""
+            detail_bits = [f"状态 {user_status or '未知'}"]
+            if score.get("submitTime"):
+                detail_bits.append(f"交卷 {score['submitTime']}")
+            if score.get("isShowScore") and score.get("score") is not None:
+                detail_bits.append(f"得分 {score['score']}")
+            detail = "，".join(detail_bits)
+
+            if user_status == "Done":
+                if score.get("isPass"):
+                    return {"status": "passed", "detail": detail}
+                return {"status": "failed", "detail": detail + "（未通过，请查看答卷）"}
+            return {"status": "passed", "detail": detail + "（待批阅）"}
+        finally:
+            try:
+                await exam_page.close()
+            except Exception:
+                pass
 
     async def _check_video_time(self, page: Page) -> float:
         """读取本地视频 currentTime（停滞检测用：平台%滞后时仍能判断在播）"""
@@ -3883,12 +4872,32 @@ class AutoLearner:
                         last_reported_progress[0] = max(0.0, min(99.0, float(pct)))
                         _progress({"wid": wid, "course": title,
                                    "progress": f"{last_reported_progress[0]:.0f}%", "eta": "-", "status": "学习中"})
+                    # 训练营课程页里的「随堂测试」考试组件：先答题再继续视频学习，
+                    # 避免平台因考试未完成而拒绝标记课程完成。
+                    exam_state = None
+                    if is_trainingcamp and self.exam_enabled:
+                        _progress({"wid": wid, "course": title, "progress": "-",
+                                   "eta": "-", "status": "考试答题中"})
+                        exam_state = await self.solve_trainingcamp_exams(wp, wid, _log)
                     if is_trainingcamp:
-                        play_ok = await self.find_and_play_trainingcamp_video(wp, wid, on_progress)
+                        play_ok = await self.find_and_play_trainingcamp_video(
+                            wp, wid, on_progress, log_callback=_log)
                     else:
                         play_ok = await self.find_and_play_video(wp, wid, on_progress)
+                    # 纯考试课程页（没有视频/音频组件）以考试结果作为完成依据
+                    exam_only = bool(
+                        exam_state and not exam_state.get("page_has_media")
+                        and exam_state.get("found") and exam_state.get("all_ok")
+                    )
+                    status_text = "✓ 完成"
+                    if not play_ok and is_trainingcamp and exam_only:
+                        # 没有视频组件，find_and_play_trainingcamp_video 会直接返回失败；
+                        # 这里补点页面的「完成学习」，让平台确认课程完成。
+                        play_ok = await self._confirm_trainingcamp_finish(wp, wid)
+                        status_text = "✓ 考试完成"
                     if play_ok:
-                        _progress({"wid": wid, "course": title, "progress": "100%", "eta": "-", "status": "✓ 完成"})
+                        _progress({"wid": wid, "course": title, "progress": "100%",
+                                   "eta": "-", "status": status_text})
                         _log(f"[线程{wid+1}] 完成: {title}", "green")
                     else:
                         progress_text = (
@@ -4200,7 +5209,10 @@ def cli(ctx):
 @click.option("--workers", default=1, help="同时学习的页面数量")
 @click.option("--target-hours", default=0.0, help="目标学习学时，0表示不限制")
 @click.option("--tags", multiple=True, help="要学习的标签，例如：党的创新理论教育 党性教育")
-def start(headless, workers, target_hours, tags):
+@click.option("--exam/--no-exam", "exam", default=None,
+              help="训练营考试是否用 DeepSeek 自动答题（默认读配置）")
+@click.option("--deepseek-key", default="", help="临时指定 DeepSeek API Key（覆盖配置）")
+def start(headless, workers, target_hours, tags, exam, deepseek_key):
     """开始自动学习"""
     async def run():
         # 运行时询问worker数量和headless配置
@@ -4260,6 +5272,26 @@ def start(headless, workers, target_hours, tags):
         learner = AutoLearner(headless=_h, workers=_w)
         learner.target_hours = target_hours
         learner.tags_to_learn = list(tags)
+
+        # 考试自动答题：命令行参数优先，其次读配置文件
+        try:
+            _ec = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+                    _ec = json.load(_f)
+            _exam_settings = exam_settings_from_config(_ec)
+            if exam is not None:
+                _exam_settings["exam_enabled"] = bool(exam)
+            if deepseek_key:
+                _exam_settings["deepseek_api_key"] = deepseek_key
+            learner.apply_exam_settings(_exam_settings)
+            if learner.exam_enabled:
+                if learner.deepseek_api_key:
+                    console.print(f"考试自动答题已开启（模型 {learner.deepseek_model}）", style="blue")
+                else:
+                    console.print("考试自动答题已开启，但未配置 DeepSeek API Key，将跳过考试", style="yellow")
+        except Exception:
+            pass
 
         try:
             await learner.init()
