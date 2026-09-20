@@ -303,17 +303,50 @@ def exam_settings_from_config(cfg: Dict) -> Dict:
         "deepseek_base_url": cfg.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL,
         "deepseek_thinking": bool(cfg.get("deepseek_thinking", False)),
     }
+def _exam_max_tokens(question_count: int, thinking: bool) -> int:
+    """按题量估算答题输出预算。
+
+    思考模式下思维链也算进 max_tokens，所以必须额外留出推理预算，
+    否则容易出现「推理写完、JSON 被截断/为空」。
+    """
+    questions = max(1, int(question_count or 0))
+    budget = 1024 + 320 * questions          # JSON 答案本身
+    if thinking:
+        budget += 2048 + 1200 * min(questions, 30)   # 思维链预算
+    return max(2048, min(65536, budget))
+
+
 class DeepSeekClient:
     """DeepSeek Chat Completions 客户端（OpenAI 兼容，仅用标准库实现）。"""
 
     def __init__(self, api_key: str, model: str = DEEPSEEK_DEFAULT_MODEL,
                  base_url: str = DEEPSEEK_DEFAULT_BASE_URL,
-                 thinking: bool = False, timeout: float = 180.0):
+                 thinking: bool = False, timeout: float = 180.0,
+                 reasoning_effort: str = "high"):
         self.api_key = (api_key or "").strip()
         self.model = (model or DEEPSEEK_DEFAULT_MODEL).strip() or DEEPSEEK_DEFAULT_MODEL
         self.base_url = (base_url or DEEPSEEK_DEFAULT_BASE_URL).rstrip("/")
         self.thinking = bool(thinking)
+        # deepseek-flash「思考模式默认打开且 effort 默认 high」，所以开关必须显式传：
+        # 关闭时传 disabled（否则省不下时间与 token），打开时再给推理强度。
+        self.reasoning_effort = reasoning_effort if reasoning_effort in ("low", "high", "max") else "high"
         self.timeout = timeout
+
+    def _build_payload(self, messages: List[Dict], json_mode: bool, max_tokens: int) -> Dict:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+        if self.thinking:
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = self.reasoning_effort
+        else:
+            payload["thinking"] = {"type": "disabled"}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     def _post(self, path: str, payload: dict) -> dict:
         """同步 POST（在线程池里跑，避免阻塞事件循环）"""
@@ -341,41 +374,59 @@ class DeepSeekClient:
 
     async def chat(self, messages: List[Dict], json_mode: bool = True,
                    max_tokens: int = 8192, retries: int = 3) -> str:
-        """调用 /chat/completions，返回首条回复文本；失败抛出 DeepSeekError。"""
+        """调用 /chat/completions，返回首条回复文本；失败抛出 DeepSeekError。
+
+        注意：思考模式下思维链（reasoning_content）同样计入 max_tokens，
+        预算不足会出现「有思维链但 content 为空、finish_reason=length」的情况，
+        这里会自动放宽预算重试一次。
+        """
         if not self.api_key:
             raise DeepSeekError("未配置 DeepSeek API Key")
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "max_tokens": max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if self.thinking:
-            payload["thinking"] = {"type": "enabled"}
-            payload["reasoning_effort"] = "high"
 
+        budget = max(64, int(max_tokens))
         loop = asyncio.get_event_loop()
         last_err = None
-        for attempt in range(max(1, retries)):
+        attempt = 0
+        while attempt < max(1, retries):
+            attempt += 1
+            payload = self._build_payload(messages, json_mode, budget)
             try:
                 data = await loop.run_in_executor(None, self._post, "/chat/completions", payload)
-                choices = data.get("choices") or []
-                content = ((choices[0] or {}).get("message") or {}).get("content") if choices else ""
-                if content and content.strip():
-                    return content
-                last_err = DeepSeekError("接口返回空内容")
             except DeepSeekError as e:
                 last_err = e
                 # 400/401/403 属于配置错误，重试无意义
                 msg = str(e)
                 if msg.startswith("HTTP 4") and "429" not in msg:
                     raise
+                await asyncio.sleep(1.5 * attempt)
+                continue
             except Exception as e:
                 last_err = DeepSeekError(str(e))
-            if attempt < retries - 1:
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.5 * attempt)
+                continue
+
+            choices = data.get("choices") or []
+            choice = choices[0] if choices else {}
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            finish = choice.get("finish_reason") or ""
+            usage = data.get("usage") or {}
+            reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+
+            if content.strip():
+                return content
+
+            if finish == "length":
+                last_err = DeepSeekError(
+                    f"输出被 max_tokens={budget} 截断（推理占用 {reasoning_tokens or 0} tokens）")
+                # 思维链吃满预算：放宽后再试一次
+                budget = min(65536, budget * 4)
+            elif reasoning:
+                last_err = DeepSeekError("只返回了思维链，没有最终答案")
+            else:
+                last_err = DeepSeekError("接口返回空内容")
+            await asyncio.sleep(1.5 * attempt)
         raise last_err or DeepSeekError("调用失败")
 
     async def answer_exam(self, questions: List[Dict], log=None) -> Dict[int, Dict]:
@@ -396,7 +447,8 @@ class DeepSeekClient:
 
         last_err = None
         for attempt in range(2):
-            raw = await self.chat(messages, json_mode=True)
+            budget = _exam_max_tokens(len(questions), self.thinking)
+            raw = await self.chat(messages, json_mode=True, max_tokens=budget)
             parsed = _parse_exam_json(raw)
             if parsed:
                 return parsed

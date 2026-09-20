@@ -596,14 +596,17 @@ class ConfigScreen(QWidget):
             try:
                 client = DeepSeekClient(api_key=api_key, model=model,
                                         base_url=DEEPSEEK_DEFAULT_BASE_URL,
-                                        thinking=thinking, timeout=45)
+                                        thinking=thinking, timeout=60)
                 loop = asyncio.new_event_loop()
                 try:
+                    # 预算不能太小：思考模式下思维链也计入 max_tokens，
+                    # 太小会出现「只推理、没答案」而被误判为 Key 不可用
                     reply = loop.run_until_complete(client.chat(
                         [{"role": "user", "content": "只回复两个字：正常"}],
-                        json_mode=False, max_tokens=16, retries=1))
+                        json_mode=False, max_tokens=512, retries=1))
                     ok = True
-                    message = f"模型 {client.model} 响应正常：{reply.strip()[:20]}"
+                    mode = "深度思考" if thinking else "快速作答"
+                    message = f"模型 {client.model}（{mode}）响应正常：{reply.strip()[:20]}"
                 finally:
                     loop.close()
             except Exception as e:
