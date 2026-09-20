@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.8.0
+- feat(训练营): 支持自定义播放器学习流程
+- chore: VERSION 1.7.9
+- docs: CHANGELOG 1.7.9
+# 更新日志
+
 ## 1.7.9
 - fix(网络自学): worker共享课程池并按需补充课程
 - chore: VERSION 1.7.8
