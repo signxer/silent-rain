@@ -2310,7 +2310,8 @@ class AutoLearner:
         _progress = progress_callback or (lambda d: None)
         _hours = hours_callback or (lambda d: None)
 
-        page = self.pages[0]
+        # 使用独立列表页采集课程，避免与学习中的 worker 页面争用。
+        page = await self.context.new_page()
         _log(f"网络自学: 从课程列表加载 {list_url}", "blue")
         try:
             await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
@@ -2318,6 +2319,10 @@ class AutoLearner:
         except Exception as e:
             _log(f"课程列表加载失败: {e}", "red")
             self.last_stats = (0, 0)
+            try:
+                await page.close()
+            except Exception:
+                pass
             return False
 
         # 检查登录态，Session过期则等待用户重新登录
@@ -2346,64 +2351,151 @@ class AutoLearner:
                     await page.wait_for_timeout(5000)
                 except:
                     self.last_stats = (0, 0)
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
                     return False
         except:
             pass
 
-        # 分页采集课程标题（记录所在页码，供worker定位）
-        # O3 断点续学：跳过已学过的课程
+        # 网络自学使用共享队列；worker 消费完当前课程后会继续取课。
+        # 队列将空时，单独的列表页串行翻页并补充新课程。
         done_titles = self.load_completed_course_titles()
         if done_titles:
             _log(f"已有 {len(done_titles)} 门课程学过，将跳过", "blue")
-        courses = []          # [{"page": int, "title": str}, ...]
         seen_titles = set()
-        MAX_PAGES = 20
-        for pg in range(1, MAX_PAGES + 1):
+        seen_pages = set()
+        page_num = 1
+        no_more_pages = False
+        course_queue = asyncio.Queue()
+        fetch_lock = asyncio.Lock()
+        goal_reached = asyncio.Event()
+        prefetch_tasks = set()
+
+        async def collect_current_page():
+            nonlocal no_more_pages
             try:
                 await page.wait_for_selector("a.p-cursor[title]", timeout=15000)
-            except:
-                break
+            except Exception:
+                _log(f"课程列表第 {page_num} 页未加载出课程", "yellow")
+                no_more_pages = True
+                return 0
             cards = page.locator("a.p-cursor[title]")
             cnt = await cards.count()
             if cnt == 0:
-                break
-            added = 0
+                _log(f"课程列表第 {page_num} 页没有课程", "yellow")
+                no_more_pages = True
+                return 0
+
+            titles = []
             for i in range(cnt):
                 try:
-                    t = (await cards.nth(i).get_attribute("title") or "").strip()
-                except:
-                    t = ""
-                if t and t not in seen_titles and t[:60] not in done_titles:
-                    seen_titles.add(t)
-                    courses.append({"page": pg, "title": t[:60]})
-                    added += 1
-            _log(f"课程列表 第 {pg} 页: {cnt} 门（新增 {added}）", "blue")
-            if pg >= MAX_PAGES:
-                break
-            # 翻到下一页
+                    title = (await cards.nth(i).get_attribute("title") or "").strip()
+                except Exception:
+                    title = ""
+                if title:
+                    titles.append(title)
+
+            # 防止翻页点击未生效时重复扫描当前页。
+            fingerprint = tuple(titles)
+            if fingerprint in seen_pages:
+                _log("课程列表翻页后内容未变化，停止继续采集", "yellow")
+                no_more_pages = True
+                return 0
+            seen_pages.add(fingerprint)
+
+            added = 0
+            for title in titles:
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                if title[:60] in done_titles:
+                    continue
+                course_queue.put_nowait({"page": page_num, "title": title[:60]})
+                added += 1
+            _log(f"课程列表第 {page_num} 页: {cnt} 门（新增 {added}）", "blue")
+            return added
+
+        async def fetch_more_courses(force=False):
+            nonlocal page_num, no_more_pages
+            async with fetch_lock:
+                if self._stop_event.is_set() or goal_reached.is_set() or no_more_pages:
+                    return 0
+                if course_queue.qsize() > 0 and not force:
+                    return course_queue.qsize()
+
+                while not no_more_pages and not self._stop_event.is_set():
+                    try:
+                        nxt = page.locator("[class*=page-next]:not([class*=page_disabled])")
+                        if await nxt.count() == 0:
+                            no_more_pages = True
+                            return 0
+                        await nxt.first.click()
+                        await page.wait_for_timeout(4000)
+                        page_num += 1
+                    except Exception as e:
+                        _log(f"翻到下一页失败: {e}", "yellow")
+                        no_more_pages = True
+                        return 0
+
+                    added = await collect_current_page()
+                    if added > 0:
+                        _log(f"课程池新增 {added} 门课程", "green")
+                        return added
+
+                return 0
+
+        async def prefetch_courses():
             try:
-                nxt = page.locator("[class*=page-next]:not([class*=page_disabled])")
-                if await nxt.count() == 0:
-                    break
-                await nxt.first.click()
-                await page.wait_for_timeout(4000)
-            except:
+                await fetch_more_courses()
+            except Exception as e:
+                _log(f"补充课程失败: {e}", "yellow")
+
+        def schedule_prefetch():
+            task = asyncio.create_task(prefetch_courses())
+            prefetch_tasks.add(task)
+            task.add_done_callback(prefetch_tasks.discard)
+
+        await collect_current_page()
+        # 启动时尽量给每个 worker 一门课；之后再按需补充，避免提前扫完所有页面。
+        while course_queue.qsize() < self.workers and not no_more_pages:
+            before = course_queue.qsize()
+            await fetch_more_courses(force=True)
+            if course_queue.qsize() == before and not no_more_pages:
                 break
 
-        if not courses:
+        if course_queue.qsize() == 0:
             _log("课程列表未获取到课程", "yellow")
             self.last_stats = (0, 0)
+            try:
+                await page.close()
+            except Exception:
+                pass
             return False
-        _log(f"共采集 {len(courses)} 门课程", "bold blue")
 
-        nw = min(self.workers, len(courses))
-        _log(f"使用 {nw} 个线程学习 {len(courses)} 门课程", "bold blue")
+        nw = min(self.workers, course_queue.qsize())
+        _log(f"课程池初始采集 {course_queue.qsize()} 门课程，启动 {nw} 个线程", "bold blue")
 
         ok_count = [0]
         fail_count = [0]
 
-        async def cworker(wid: int, wp: Page, tasks: List[dict]):
-            for task in tasks:
+        async def course_task_stream():
+            while not self._stop_event.is_set() and not goal_reached.is_set():
+                try:
+                    task = course_queue.get_nowait()
+                    if course_queue.empty() and not no_more_pages:
+                        # 趁 worker 正在学习当前课程时预取下一页，减少池空后的等待。
+                        schedule_prefetch()
+                    yield task
+                    continue
+                except asyncio.QueueEmpty:
+                    added = await fetch_more_courses()
+                    if added <= 0:
+                        return
+
+        async def cworker(wid: int, wp: Page):
+            async for task in course_task_stream():
                 # 用户变更配置：停止取新课程
                 if self._stop_event.is_set():
                     break
@@ -2514,17 +2606,14 @@ class AutoLearner:
                         _log(f"网络自学进度: {cur:.1f}/{self.study_goal} 学时", "blue")
                         if cur >= self.study_goal:
                             _log(f"✓ 网络自学目标已达成!", "bold green")
+                            goal_reached.set()
                             raise GoalReached()
                     except GoalReached:
                         raise
                     except Exception:
                         pass
 
-        tasks = []
-        for wid in range(nw):
-            aidx = [courses[j] for j in range(wid, len(courses), nw)]
-            tasks.append(asyncio.create_task(cworker(wid, self.pages[wid], aidx)))
-            await asyncio.sleep(3)
+        tasks = [asyncio.create_task(cworker(wid, self.pages[wid])) for wid in range(nw)]
         try:
             await asyncio.gather(*tasks)
         except GoalReached:
@@ -2534,6 +2623,13 @@ class AutoLearner:
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except:
+                pass
+        finally:
+            if prefetch_tasks:
+                await asyncio.gather(*list(prefetch_tasks), return_exceptions=True)
+            try:
+                await page.close()
+            except Exception:
                 pass
         self.last_stats = (ok_count[0], fail_count[0])
         _log(f"网络自学阶段完成: 成功 {ok_count[0]} 门, 失败 {fail_count[0]} 门", "bold green")
