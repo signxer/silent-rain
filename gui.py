@@ -5,6 +5,7 @@ import json
 import os
 import re
 import urllib.request
+import urllib.error
 import platform
 import sys
 import threading
@@ -146,6 +147,53 @@ DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json"
 REPO_NAME = "signxer/silent-rain"
 
+# GitHub 加速代理（前缀拼接即可加速公开资源，见 https://gh-proxy.com/docs/github-accelerator）。
+# 国内直连 github.com / raw.githubusercontent.com 经常超时，因此默认走加速节点，不通再退回直连。
+GH_PROXY_PREFIXES = ("https://gh-proxy.com/", "https://gh-proxy.org/")
+_GITHUB_HOSTS = ("https://github.com/", "https://raw.githubusercontent.com/",
+                 "https://api.github.com/", "https://objects.githubusercontent.com/")
+
+
+def with_gh_proxies(url: str) -> list:
+    """返回该 URL 的候选地址：加速节点优先，GitHub 直连兜底。
+
+    非 GitHub 资源（如 GitHub Pages）不加代理，原样返回。
+    """
+    if not url or not url.startswith(_GITHUB_HOSTS):
+        return [url]
+    return [p + url for p in GH_PROXY_PREFIXES] + [url]
+
+
+def _probe_download_url(url: str, timeout: float = 8.0) -> bool:
+    """轻量探测下载源是否可达：拿到任何 HTTP 响应都算通，只有网络错误算不通。
+
+    死节点上直接丢一个大文件下载会卡满超时，所以先用 HEAD 探一下。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Moisten"}, method="HEAD")
+        urllib.request.urlopen(req, timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True  # 有响应（例如 405 不支持 HEAD）说明链路是通的
+    except Exception:
+        return False
+
+
+def _download_source_label(url: str) -> str:
+    """给下载源起个用户能看懂的名字（进度框里显示）"""
+    for prefix in GH_PROXY_PREFIXES:
+        if url.startswith(prefix):
+            return f"加速节点 {prefix.split('//', 1)[-1].strip('/')}"
+    return "GitHub 直连"
+
+
+def update_download_candidates(url: str, probe=None) -> list:
+    """下载候选顺序：可达的加速节点 → 可达的直连 → 其余（保证顺序里仍有兜底）。"""
+    probe = probe or _probe_download_url
+    ordered = with_gh_proxies(url)
+    reachable = [u for u in ordered if probe(u)]
+    return reachable + [u for u in ordered if u not in reachable]
+
 
 def _ver_tuple(v):
     """版本号转数字元组用于比较（1.10.0 > 1.7.0）"""
@@ -175,8 +223,8 @@ def _looks_like_executable(path) -> bool:
 def check_for_update():
     """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志, 下载URL)"""
     data = None
-    # 先试直连，失败走代理
-    for url in [RELEASES_JSON_URL, f"https://gh-proxy.com/{RELEASES_JSON_URL}"]:
+    # 加速节点优先，不通再退回 GitHub 直连
+    for url in with_gh_proxies(RELEASES_JSON_URL):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Moisten"})
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -2899,18 +2947,19 @@ class MainWindow(_BaseWindow):
                     except Exception:
                         pass  # 目录不可写（如 Program Files），退回临时目录+bat方案
 
-                # 候选下载源：直连优先；直连失败再走代理
-                candidates = [url]
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "Moisten"}, method="HEAD")
-                    urllib.request.urlopen(req, timeout=10).close()
-                except Exception:
-                    candidates.append(f"https://gh-proxy.com/{url}")
+                # 候选下载源：gh-proxy 加速节点优先（国内直连 GitHub 经常超时），
+                # 加速不通再退回直连；先 HEAD 探测一次，避免在死节点上空等超时
+                candidates = update_download_candidates(url)
+                if not candidates:
+                    raise RuntimeError("下载地址无效")
 
-                # 下载 + 完整性校验（大小一致 + 可执行文件头），失败自动重试
+                # 下载 + 完整性校验（大小一致 + 可执行文件头），失败自动重试/换源
                 ok = False
                 last_err = ""
                 for dl_url in candidates:
+                    source = _download_source_label(dl_url)
+                    QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection,
+                                             Q_ARG(str, f"{source}：正在连接..."))
                     for attempt in range(3):
                         if cancel_flag[0]:
                             return
@@ -2952,7 +3001,8 @@ class MainWindow(_BaseWindow):
                     if ok:
                         break
                 if not ok:
-                    raise RuntimeError(f"下载失败: {last_err}")
+                    tried = "、".join(_download_source_label(u) for u in candidates)
+                    raise RuntimeError(f"下载失败（已尝试 {tried}）: {last_err}")
 
                 QMetaObject.invokeMethod(lbl_status, "setText", Qt.QueuedConnection, Q_ARG(str, "下载完成，正在安装..."))
                 QMetaObject.invokeMethod(progress_bar, "setValue", Qt.QueuedConnection, Q_ARG(int, 100))

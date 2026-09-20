@@ -34,6 +34,11 @@ Mac 用户也可运行 `./setup.sh` 一键安装。
 
 从 [Releases](https://github.com/signxer/silent-rain/releases) 下载对应平台的可执行文件（发布仓库：https://github.com/signxer/Moisten）。
 
+**下载与自动更新走加速节点**：检查更新和下载新版本时默认拼 [gh-proxy](https://gh-proxy.com/docs/github-accelerator)
+加速前缀（`https://gh-proxy.com/<github地址>`，备用 `gh-proxy.org`），节点不通会自动退回 GitHub 直连，
+无需手动配置。下载期间进度框会显示当前用的是「加速节点」还是「GitHub 直连」；
+代理返回错误页或文件不完整会被完整性校验拦下并自动换源重试。
+
 **打包版本不内置浏览器**：首次使用「内置 Chromium」模式时，应用会自动下载 Chromium 到系统缓存目录（约 200MB，仅一次）；也可以改用系统已安装的 Chrome 浏览器，无需下载。
 
 **macOS 用户**：由于未进行 Apple 开发者签名，首次打开可能提示"已损坏"，需要在终端执行：
