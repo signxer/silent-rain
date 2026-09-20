@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.8.1
+- chore: VERSION 1.8.1
+- fix(训练营): 保留播放器上报进度
+- chore: VERSION 1.8.0
+- docs: CHANGELOG 1.8.0
+# 更新日志
+
 ## 1.8.0
 - feat(训练营): 支持自定义播放器学习流程
 - chore: VERSION 1.7.9
