@@ -1776,6 +1776,17 @@ class AutoLearner:
             except Exception:
                 return {"pageDone": False, "doneText": "", "components": []}
 
+        def report_progress(state):
+            components = state.get("components") or []
+            if not progress_callback or not components:
+                return
+            component_progress = sum(
+                min(1.0, float(item.get("progress") or 0) / float(item.get("threshold") or 95))
+                for item in components
+            )
+            # 只有训练营页面确认完成后才报告 100%，避免课程行显示成功但平台未完成。
+            progress_callback(min(99.0, component_progress * 100 / len(components)))
+
         try:
             if not re.search(r"#/traincamp/study/", page.url):
                 debug(f"{prefix} 当前页面不是训练营课程页: {page.url}")
@@ -1797,8 +1808,9 @@ class AutoLearner:
 
             state = await snapshot()
             components = state.get("components") or []
+            report_progress(state)
             if not components:
-                debug(f"{prefix} 未找到训练营视频/音频进度组件")
+                debug(f"{prefix} 未找到训练营视频/音频进度组件，当前URL: {page.url}")
                 return False
 
             refresh_count = 0
@@ -1879,12 +1891,7 @@ class AutoLearner:
                         return False
 
                     pct = float(match.get("progress") or 0)
-                    if progress_callback:
-                        component_progress = sum(
-                            min(1.0, float(item.get("progress") or 0) / float(item.get("threshold") or 95))
-                            for item in current_state["components"]
-                        )
-                        progress_callback(min(99.0, component_progress * 100 / len(current_state["components"])))
+                    report_progress(current_state)
                     if pct >= float(match.get("threshold") or threshold):
                         component_complete = True
                         break
@@ -3850,10 +3857,17 @@ class AutoLearner:
                     title = (url.split("id=")[-1][:40] if "id=" in url else url[:40])
                 _log(f"[线程{wid+1}] 打开课程: {url}", "blue")
                 _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "加载中"})
+                last_reported_progress = [None]
                 try:
                     await wp.goto(url, wait_until="domcontentloaded", timeout=20000)
                     await wp.wait_for_timeout(5000)
                     is_trainingcamp = bool(re.search(r"https?://[^/]+/trainingcamp/#/traincamp/study/", url))
+                    if is_trainingcamp:
+                        expected_route = url.split("#", 1)[-1].split("?", 1)[0].rstrip("/")
+                        actual_route = wp.url.split("#", 1)[-1].split("?", 1)[0].rstrip("/")
+                        _log(f"[线程{wid+1}] 训练营课程路由: {actual_route}", "blue")
+                        if actual_route != expected_route:
+                            _log(f"[线程{wid+1}] 训练营路由与目标不符，预期 {expected_route}", "yellow")
                     if not is_trainingcamp:
                         # 旧课程详情页需要先点击学习按钮；训练营路由已经直接进入组件学习页。
                         for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
@@ -3866,8 +3880,9 @@ class AutoLearner:
                             except:
                                 pass
                     def on_progress(pct):
+                        last_reported_progress[0] = max(0.0, min(99.0, float(pct)))
                         _progress({"wid": wid, "course": title,
-                                   "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
+                                   "progress": f"{last_reported_progress[0]:.0f}%", "eta": "-", "status": "学习中"})
                     if is_trainingcamp:
                         play_ok = await self.find_and_play_trainingcamp_video(wp, wid, on_progress)
                     else:
@@ -3876,13 +3891,21 @@ class AutoLearner:
                         _progress({"wid": wid, "course": title, "progress": "100%", "eta": "-", "status": "✓ 完成"})
                         _log(f"[线程{wid+1}] 完成: {title}", "green")
                     else:
-                        _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "未完成"})
+                        progress_text = (
+                            f"{last_reported_progress[0]:.0f}%"
+                            if last_reported_progress[0] is not None else "-"
+                        )
+                        _progress({"wid": wid, "course": title, "progress": progress_text, "eta": "-", "status": "未完成"})
                         _log(f"[线程{wid+1}] 未完成: {title}", "yellow")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     _log(f"[线程{wid+1}] 课程失败: {title} - {e}", "red")
-                    _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "异常"})
+                    progress_text = (
+                        f"{last_reported_progress[0]:.0f}%"
+                        if last_reported_progress[0] is not None else "-"
+                    )
+                    _progress({"wid": wid, "course": title, "progress": progress_text, "eta": "-", "status": "异常"})
                 # 检查学习目标（O1 节流：TTL 缓存）
                 if self.study_goal > 0:
                     try:
