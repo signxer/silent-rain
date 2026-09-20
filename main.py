@@ -1976,8 +1976,13 @@ class AutoLearner:
         const pageDone = /恭喜您，已完成/.test(doneText);
 
         // 页面级组件列表（平台返回的 videoProgress / progress / finishFlag）
+        // 目录项元素不一定存在（分组页/空页），所以多试几个锚点再向上找组件实例
         let pageVm = null;
-        for (const node of document.querySelectorAll('[id^="traincamp-journey-module-item-"]')) {
+        const anchors = [
+            ...document.querySelectorAll('[id^="traincamp-journey-module-item-"]'),
+            ...document.querySelectorAll('.traincamp-journey-module-list, .traincamp-journey, #app')
+        ];
+        for (const node of anchors) {
             let cur = node;
             while (cur) {
                 if (cur.__vue__ && Array.isArray(cur.__vue__.compMapList)) { pageVm = cur.__vue__; break; }
@@ -2065,7 +2070,10 @@ class AutoLearner:
                 paused: mediaEl ? !!mediaEl.paused : true,
                 ended: mediaEl ? !!mediaEl.ended : false,
                 readyState: mediaEl ? mediaEl.readyState : -1,
+                networkState: mediaEl ? mediaEl.networkState : -1,
                 errorCode: (mediaEl && mediaEl.error) ? mediaEl.error.code : 0,
+                mediaSrc: (mediaEl && (mediaEl.currentSrc || mediaEl.src)) || '',
+                hasPlayUrl: !!(vm && vm.videoInfo && vm.videoInfo.url),
                 coverVisible: !!(wrapper.querySelector('.prism-cover, .prism-big-play-btn')
                     && !wrapper.querySelector('.prism-cover[style*="display: none"]'))
             });
@@ -2075,6 +2083,20 @@ class AutoLearner:
             doneText: doneText,
             isPreview: !!(pageVm && pageVm.isPreview),
             courseId: pageVm ? pageVm.courseId : '',
+            // 页面组件清单（判断「真的没有组件」还是「组件没渲染出来」）
+            componentCount: pageVm ? (pageVm.compMapList || []).length : -1,
+            mapList: pageVm ? (pageVm.compMapList || []).map((item, i) => ({
+                i: i,
+                id: String(item.id),
+                code: item.componentCode || '',
+                name: item.componentName || '',
+                progress: Number(item.progress) || 0,
+                videoProgress: Number(item.videoProgress) || 0,
+                hasComponents: Array.isArray(item.componentList) && item.componentList.length > 0
+            })) : [],
+            wrapperCount: wrappers.length,
+            playerCount: document.querySelectorAll('[id^="player-con"]').length,
+            mediaCount: document.querySelectorAll('video, audio').length,
             iframes: [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean).slice(0, 5),
             codes: allCodes,
             components: components
@@ -2197,8 +2219,32 @@ class AutoLearner:
                 debug(f"{prefix} 组件 {c.get('componentClass')} [{c.get('componentCode')}] "
                       f"{c.get('resourceName')} status={c.get('status')} "
                       f"playerEl={c.get('hasPlayerEl')} media={c.get('hasMedia')} "
-                      f"readyState={c.get('readyState')} err={c.get('errorCode')} "
+                      f"readyState={c.get('readyState')} networkState={c.get('networkState')} "
+                      f"err={c.get('errorCode')} 有播放地址={c.get('hasPlayUrl')} "
+                      f"src={str(c.get('mediaSrc') or '')[:80]} "
                       f"平台进度={c.get('platformPct')}")
+            if not components:
+                debug(f"{prefix} 页面组件清单: {state.get('mapList')}；"
+                      f"comp-item 容器数={state.get('wrapperCount')} "
+                      f"播放器容器数={state.get('playerCount')} media={state.get('mediaCount')}")
+
+        async def handle_empty_page(state):
+            """列表页/分组标题页：自身没有组件，交给页面的「完成学习」由平台判定。"""
+            map_list = state.get("mapList") or []
+            if state.get("componentCount") == 0 or (state.get("componentCount") == -1 and not map_list):
+                _log(f"{prefix} 该课程页没有学习组件（可能是分组标题页），"
+                     f"直接提交「完成学习」由平台判定", "yellow")
+                if await self._confirm_trainingcamp_finish(page, worker_id):
+                    if progress_callback:
+                        progress_callback(100)
+                    return True
+                _log(f"{prefix} 平台未确认该页完成", "yellow")
+                return False
+            # 组件清单非空却没有渲染出来：属于页面/组件库加载失败，不能假装学完
+            _log(f"{prefix} 页面有 {state.get('componentCount')} 个组件但没有渲染出播放器"
+                 f"（comp-item 容器 {state.get('wrapperCount')} 个），本次跳过", "red")
+            debug(f"{prefix} 组件清单: {map_list}")
+            return False
 
         try:
             if not re.search(r"#/traincamp/study/", page.url):
@@ -2224,7 +2270,7 @@ class AutoLearner:
             report_progress(state)
             if not components:
                 diagnose(components, state)
-                return False
+                return await handle_empty_page(state)
 
             if state.get("isPreview"):
                 debug(f"{prefix} 当前是预览模式，平台不会记录进度")
@@ -4776,54 +4822,109 @@ class AutoLearner:
         return completed_ws_ids
 
     async def _collect_trainingcamp_courses(self, page: Page, camp_id: str, log_callback=None) -> List[Dict]:
-        """从训练营详情页读取模块中的课程页，并生成可直接学习的路由。"""
+        """从训练营详情页读取模块中的课程页，并生成可直接学习的路由。
+
+        目录项分两种（与 traincamp-journey 组件的点击逻辑一致）：
+        - 叶子页：带 componentList，点它进入课程学习页；
+        - 分组标题：没有 componentList，自身没有组件，真正要学的是它里面嵌套的子页
+          （子项点击走 /traincamp/study/{campId}/{子项id}?courseIndex=分组下标）。
+        只采集第一层会把分组标题当成课程页，打开后一个组件都没有 → 直接判「未完成」。
+        """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         camp_url = f"https://u.ccb.com/trainingcamp/#/traincampdetail/{camp_id}/away"
         try:
             await page.goto(camp_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_selector(".traincamp-journey", timeout=20000)
+            # 用 attached 而不是默认的 visible：目录为空时容器高度为 0，visible 会一直等
+            await page.wait_for_selector(".traincamp-journey", state="attached", timeout=20000)
             await page.wait_for_function("""() => {
                 const root = document.querySelector('.traincamp-journey');
                 const vm = root && root.__vue__;
                 return !!(vm && Array.isArray(vm.dataList) && vm.dataList.length);
             }""", timeout=20000)
-            pages = await page.evaluate("""() => {
+            collected = await page.evaluate("""() => {
                 const root = document.querySelector('.traincamp-journey');
                 const vm = root && root.__vue__;
                 if (!vm || !Array.isArray(vm.dataList)) return [];
                 const result = [];
-                vm.dataList.forEach((module, moduleIndex) => {
-                    (module.beanList || []).forEach((course, courseIndex) => {
-                        const finished = course && (course.finishFlag === 1 ||
-                            course.finishFlag === '1' || course.finishFlag === true);
-                        if (!course || !course.id || !course.pageName ||
-                            course.hideFlag === 1 || course.hideFlag === '1' || finished) return;
-                        result.push({
-                            id: String(course.id),
-                            title: String(course.pageName).trim(),
-                            moduleIndex,
-                            courseIndex
-                        });
+                const modules = [];
+                const usable = (c) => !!(c && c.id && c.pageName) &&
+                    !(c.hideFlag === 1 || c.hideFlag === '1') &&
+                    !(c.finishFlag === 1 || c.finishFlag === '1' || c.finishFlag === true);
+                const push = (c, moduleIndex, courseIndex, kind) => {
+                    result.push({
+                        id: String(c.id),
+                        title: String(c.pageName).trim(),
+                        moduleIndex,
+                        courseIndex,
+                        kind
                     });
+                };
+                vm.dataList.forEach((module, moduleIndex) => {
+                    const summary = [];
+                    const skipTag = (c) => (c.finishFlag === 1 || c.finishFlag === '1' || c.finishFlag === true)
+                        ? '[已完成]'
+                        : ((c.hideFlag === 1 || c.hideFlag === '1') ? '[已隐藏]' : '');
+                    (module.beanList || []).forEach((item, courseIndex) => {
+                        if (!item) return;
+                        const children = (item.beanList || []).filter(Boolean);
+                        // componentList 非空 = 叶子页：点标题就进课程页（课程包也是这种，
+                        // 里面的小节由播放器顺序播放，不能当成独立页面去点）
+                        const isLeaf = !!(item.componentList && item.componentList.length);
+                        const tag = skipTag(item);
+                        if (isLeaf) {
+                            if (!tag && usable(item)) push(item, moduleIndex, courseIndex, 'leaf');
+                            summary.push((item.pageName || '?') + (tag || '[标题页]'));
+                            return;
+                        }
+                        if (children.length) {
+                            // 没有 componentList 但挂了子项 = 分组标题：真正要学的是里面的子页
+                            let added = 0;
+                            children.forEach((child) => {
+                                if (usable(child)) { push(child, moduleIndex, courseIndex, 'child'); added++; }
+                            });
+                            summary.push((item.pageName || '?') + (tag || ('[分组 ' + added + '/' + children.length + ' 个子页]')));
+                            return;
+                        }
+                        if (!tag && usable(item)) push(item, moduleIndex, courseIndex, 'item');
+                        summary.push((item.pageName || '?') + (tag || '[单独页]'));
+                    });
+                    modules.push('模块' + (moduleIndex + 1) + ': ' + summary.join('，'));
                 });
-                return result;
+                return {items: result, modules: modules};
             }""")
         except Exception as e:
             _log(f"训练营课程列表加载失败 ({camp_id}): {e}", "yellow")
             return []
 
+        if isinstance(collected, dict):
+            pages = collected.get("items") or []
+            module_lines = collected.get("modules") or []
+        else:
+            pages = collected or []
+            module_lines = []
+
+        for line in module_lines:
+            _log(f"训练营 {camp_id} 目录 · {line}", "blue")
+
         course_tasks = []
+        seen_ids = set()
+        kinds = {}
         for item in pages or []:
             course_id = str(item.get("id", "")).strip()
             title = str(item.get("title", "")).strip()
-            if not course_id or not title:
+            if not course_id or not title or course_id in seen_ids:
                 continue
+            seen_ids.add(course_id)
+            kinds[item.get("kind") or "item"] = kinds.get(item.get("kind") or "item", 0) + 1
             course_url = (
                 f"https://u.ccb.com/trainingcamp/#/traincamp/study/{camp_id}/{course_id}"
                 f"?moduleIndex={item['moduleIndex']}&courseIndex={item['courseIndex']}"
             )
             course_tasks.append({"url": course_url, "title": title})
 
+        if kinds:
+            detail = "、".join(f"{k} {v}" for k, v in kinds.items())
+            _log(f"训练营 {camp_id}: 目录项 {detail}", "blue")
         _log(f"训练营 {camp_id}: 找到 {len(course_tasks)} 个课程页面", "green" if course_tasks else "yellow")
         return course_tasks
 
