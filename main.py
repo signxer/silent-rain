@@ -2298,20 +2298,34 @@ class AutoLearner:
             debug(f"{prefix} 组件清单: {map_list}")
             return False
 
+        def at_threshold(component):
+            return bool(component) and (
+                float(component.get("platformPct") or 0) >= float(component.get("threshold") or 95)
+                or bool(component.get("finishedFlag")))
+
         try:
             if not re.search(r"#/traincamp/study/", page.url):
                 debug(f"{prefix} 当前页面不是训练营课程页: {page.url}")
                 return False
 
-            # 等 Vue 路由及训练营组件完成渲染，已完成的课程可以直接跳过。
+            # 等 Vue 路由及训练营组件完成渲染。
+            # 注意：页面被平台标记「已完成」不代表视频真的看过（例如考试先通过、
+            # 或上一次只考试没学视频），所以只对「已经达标的组件」放行，
+            # 没达标的仍然要播放，否则会出现「只考试、没看视频」。
             state = await snapshot()
             for _ in range(30):
-                if state.get("pageDone"):
+                components = media_components(state)
+                if components and all(at_threshold(c) for c in components):
                     if progress_callback:
                         progress_callback(100)
-                    debug(f"{prefix} 页面已由平台标记完成")
+                    debug(f"{prefix} 页面组件均已达标，无需重复学习")
                     return True
-                if media_components(state):
+                if state.get("pageDone") and not components:
+                    if progress_callback:
+                        progress_callback(100)
+                    debug(f"{prefix} 页面已由平台标记完成（没有媒体组件）")
+                    return True
+                if components:
                     break
                 if self._stop_event.is_set():
                     return False
@@ -2322,8 +2336,16 @@ class AutoLearner:
             report_progress(state)
             if not components:
                 diagnose(components, state)
+                if state.get("pageDone"):
+                    if progress_callback:
+                        progress_callback(100)
+                    return True
                 return await handle_empty_page(state)
 
+            if state.get("pageDone"):
+                pending = [c.get("componentClass") for c in components if not at_threshold(c)]
+                _log(f"{prefix} 页面已被平台标记完成，但仍有 {len(pending)} 个组件未达标，"
+                     f"继续补学视频：{'、'.join(pending)}", "yellow")
             if state.get("isPreview"):
                 debug(f"{prefix} 当前是预览模式，平台不会记录进度")
             diagnose(components, state)
@@ -2349,12 +2371,14 @@ class AutoLearner:
                 media_ready = False
                 for _ in range(30):
                     current_state = await snapshot()
-                    if current_state.get("pageDone"):
+                    current_match = next((x for x in media_components(current_state)
+                                          if x.get("componentClass") == component_class), None)
+                    # 平台标记完成且该组件已达标才算学完；未达标要继续播
+                    if current_state.get("pageDone") and at_threshold(current_match):
                         if progress_callback:
                             progress_callback(100)
                         return True
-                    match = next((x for x in media_components(current_state)
-                                  if x.get("componentClass") == component_class), None)
+                    match = current_match
                     if match and match.get("hasMedia"):
                         component = match
                         media_ready = True
@@ -2390,12 +2414,13 @@ class AutoLearner:
                         return False
                     await page.wait_for_timeout(TRAINCAMP_POLL_SECONDS * 1000)
                     current_state = await snapshot()
-                    if current_state.get("pageDone"):
+                    match = next((x for x in media_components(current_state)
+                                  if x.get("componentClass") == component_class), None)
+                    # 平台标记完成且当前组件已达标才提前收工（否则继续把视频学完）
+                    if current_state.get("pageDone") and at_threshold(match):
                         if progress_callback:
                             progress_callback(100)
                         return True
-                    match = next((x for x in media_components(current_state)
-                                  if x.get("componentClass") == component_class), None)
                     if not match:
                         debug(f"{prefix} 页面组件在播放期间消失")
                         return False
@@ -2660,6 +2685,25 @@ class AutoLearner:
             usedExamTimes: m.usedExamTimes
         };
     }"""
+
+    async def _trainingcamp_media_progress(self, page: Page) -> Optional[Dict]:
+        """页面上媒体组件的数量与达标情况（用于判断「视频是否真的学完」）"""
+        try:
+            state = await page.evaluate(self._TRAINCAMP_MEDIA_JS)
+        except Exception as e:
+            debug(f"读取训练营媒体状态失败: {e}")
+            return None
+        components = [c for c in (state.get("components") or [])
+                      if c.get("hasMedia") or c.get("hasPlayerEl") or c.get("hasPlayerApi")]
+        ready = bool(components) and all(
+            float(c.get("platformPct") or 0) >= float(c.get("threshold") or 95)
+            or c.get("finishedFlag") for c in components)
+        return {
+            "count": len(components),
+            "ready": ready,
+            "page_done": bool(state.get("pageDone")),
+            "progress": [round(float(c.get("platformPct") or 0)) for c in components],
+        }
 
     async def _confirm_trainingcamp_finish(self, page: Page, worker_id: int) -> bool:
         """点训练营课程页的「完成学习」并等待平台确认（用于没有视频组件的纯考试页）"""
@@ -5025,29 +5069,36 @@ class AutoLearner:
                         last_reported_progress[0] = max(0.0, min(99.0, float(pct)))
                         _progress({"wid": wid, "course": title,
                                    "progress": f"{last_reported_progress[0]:.0f}%", "eta": "-", "status": "学习中"})
-                    # 训练营课程页里的「随堂测试」考试组件：先答题再继续视频学习，
-                    # 避免平台因考试未完成而拒绝标记课程完成。
-                    exam_state = None
-                    if is_trainingcamp and self.exam_enabled:
-                        _progress({"wid": wid, "course": title, "progress": "-",
-                                   "eta": "-", "status": "考试答题中"})
-                        exam_state = await self.solve_trainingcamp_exams(wp, wid, _log)
+                    # 训练营课程页可能同时有多个视频和考试，顺序很关键：
+                    # 必须先看视频再做考试——平台有可能在考试通过后就把整页标记完成，
+                    # 先考试会让接下来的视频学习被「已完成」短路掉（一节视频都没看）。
                     if is_trainingcamp:
                         play_ok = await self.find_and_play_trainingcamp_video(
                             wp, wid, on_progress, log_callback=_log)
                     else:
                         play_ok = await self.find_and_play_video(wp, wid, on_progress)
-                    # 纯考试课程页（没有视频/音频组件）以考试结果作为完成依据
-                    exam_only = bool(
-                        exam_state and not exam_state.get("page_has_media")
-                        and exam_state.get("found") and exam_state.get("all_ok")
-                    )
+
+                    exam_state = None
+                    if is_trainingcamp and self.exam_enabled:
+                        _progress({"wid": wid, "course": title, "progress": "-",
+                                   "eta": "-", "status": "考试答题中"})
+                        exam_state = await self.solve_trainingcamp_exams(wp, wid, _log)
+
+                    exam_ok = bool(exam_state and exam_state.get("found")
+                                   and exam_state.get("all_ok"))
                     status_text = "✓ 完成"
-                    if not play_ok and is_trainingcamp and exam_only:
-                        # 没有视频组件，find_and_play_trainingcamp_video 会直接返回失败；
-                        # 这里补点页面的「完成学习」，让平台确认课程完成。
-                        play_ok = await self._confirm_trainingcamp_finish(wp, wid)
-                        status_text = "✓ 考试完成"
+                    if not play_ok and is_trainingcamp and exam_ok and self.exam_enabled:
+                        # 视频已学完但平台要求考试后才放行（或本身就是纯考试页）：
+                        # 补点「完成学习」由平台判定；视频确实没学完时不代替平台放行。
+                        media = await self._trainingcamp_media_progress(wp)
+                        if media and (media.get("ready") or media.get("count") == 0
+                                      or media.get("page_done")):
+                            if await self._confirm_trainingcamp_finish(wp, wid):
+                                play_ok = True
+                                status_text = ("✓ 考试完成" if media.get("count") == 0
+                                               else "✓ 完成")
+                        else:
+                            debug(f"[线程{wid+1}] 考试已完成但视频未达标，不代替平台放行: {media}")
                     if play_ok:
                         _progress({"wid": wid, "course": title, "progress": "100%",
                                    "eta": "-", "status": status_text})
