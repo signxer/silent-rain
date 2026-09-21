@@ -303,6 +303,18 @@ def exam_settings_from_config(cfg: Dict) -> Dict:
         "deepseek_base_url": cfg.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL,
         "deepseek_thinking": bool(cfg.get("deepseek_thinking", False)),
     }
+def _component_finished(component: Optional[Dict]) -> bool:
+    """训练营组件是否已被平台记录完成（进度到达阈值，或带完成标记）"""
+    if not component:
+        return False
+    try:
+        pct = float(component.get("platformPct") or 0)
+        threshold = float(component.get("threshold") or 95)
+    except (TypeError, ValueError):
+        return bool(component.get("finishedFlag"))
+    return pct >= threshold or bool(component.get("finishedFlag"))
+
+
 def _exam_max_tokens(question_count: int, thinking: bool) -> int:
     """按题量估算答题输出预算。
 
@@ -2080,6 +2092,30 @@ class AutoLearner:
             const item = (vm && vm.id !== undefined && itemById[String(vm.id)]) || itemByClass[cls] || null;
             if (item && item.componentCode) allCodes.push(item.componentCode);
 
+            // 组件类型决定用哪种方式完成它（与页面自身的上报逻辑对齐）：
+            //   media   视频/音频/直播     → 播到平台阈值
+            //   book    图书「开始阅读」    → 点一下即上报 componentDone
+            //   outlink 外链「由此进入」    → 点一下即上报 componentDone
+            //   read    图文/图片/外链课程  → 滚进视口即上报（组件自带 scrollIntoView 判定）
+            //   exam    随堂测试           → 走自动答题流程
+            //   manual  作业/投票/讨论      → 需要人工，跳过
+            // 组件根元素本身就是 .cuWeb-xxx（querySelector 不匹配自身），所以要先 matches 再看后代
+            const has = (sel) => {
+                try {
+                    if (wrapper.matches && wrapper.matches(sel)) return true;
+                } catch (e) {}
+                return !!wrapper.querySelector(sel);
+            };
+            let kind = 'other';
+            if (mediaEl || playerEl) kind = 'media';
+            else if (has('.cuWeb-book-btn')) kind = 'book';
+            else if (has('.cuWeb-outLink-img-box')) kind = 'outlink';
+            else if (has('.cuWeb-exam')) kind = 'exam';
+            else if (has('.cuWeb-text, .cuWeb-picture, iframe')) kind = 'read';
+            else if (has('.cuWeb-workPlan, .cuWeb-assigntask, .cuWeb-vote, .cuWeb-compr')) kind = 'manual';
+            else if (item && /Assigntask|WorkPlan|Vote|Compr/i.test(item.componentCode || '')) kind = 'manual';
+            else if (has('.cuWeb-comment, .cuWeb-discuss')) kind = 'other';
+
             const domPctEl = wrapper.querySelector('.traincamp-progress-data');
             const domPct = domPctEl ? parseFloat((domPctEl.innerText || '').replace('%', '').trim()) : NaN;
 
@@ -2102,6 +2138,7 @@ class AutoLearner:
 
             components.push({
                 componentClass: cls,
+                kind: kind,
                 componentCode: (item && item.componentCode) || '',
                 componentId: (vm && vm.id !== undefined) ? String(vm.id) : '',
                 resourceName: (vm && vm.resourceDetail && vm.resourceDetail.resourceName) || '',
@@ -2226,6 +2263,14 @@ class AutoLearner:
             return [c for c in (state.get("components") or [])
                     if c.get("hasMedia") or c.get("hasPlayerEl") or c.get("hasPlayerApi")]
 
+        def component_done(component):
+            """该组件是否已被平台记录完成"""
+            return _component_finished(component)
+
+        def components_of_kind(state, *kinds):
+            return [c for c in (state.get("components") or [])
+                    if c.get("kind") in kinds and not component_done(c)]
+
         def report_progress(state):
             components = media_components(state)
             if not progress_callback or not components:
@@ -2263,9 +2308,15 @@ class AutoLearner:
             if not components:
                 codes = "、".join(state.get("codes") or []) or "无"
                 iframes = "、".join(state.get("iframes") or [])
-                _log(f"{prefix} 未发现可播放的视频/音频组件（组件类型：{codes}）"
-                     f"{'，页面含 iframe' if iframes else ''}"
-                     f"{'，当前为预览模式（preview=1）不记录进度' if state.get('isPreview') else ''}", "yellow")
+                kinds = {c.get("kind") for c in (state.get("components") or [])}
+                if kinds & {"book", "outlink", "read"}:
+                    # 这页是图书/图文/外链，本来就没有播放器，不算异常
+                    debug(f"{prefix} 本页没有视频组件，改走点击/滚动完成（{codes}）")
+                else:
+                    _log(f"{prefix} 未发现可播放的视频/音频组件（组件类型：{codes}）"
+                         f"{'，页面含 iframe' if iframes else ''}"
+                         f"{'，当前为预览模式（preview=1）不记录进度' if state.get('isPreview') else ''}",
+                         "yellow")
                 debug(f"{prefix} 组件类型: {codes}；iframe: {iframes}；URL: {page.url}")
             for c in components:
                 debug(f"{prefix} 组件 {c.get('componentClass')} [{c.get('componentCode')}] "
@@ -2299,9 +2350,7 @@ class AutoLearner:
             return False
 
         def at_threshold(component):
-            return bool(component) and (
-                float(component.get("platformPct") or 0) >= float(component.get("threshold") or 95)
-                or bool(component.get("finishedFlag")))
+            return _component_finished(component)
 
         try:
             if not re.search(r"#/traincamp/study/", page.url):
@@ -2334,13 +2383,23 @@ class AutoLearner:
 
             components = media_components(state)
             report_progress(state)
+            all_components = state.get("components") or []
             if not components:
                 diagnose(components, state)
                 if state.get("pageDone"):
                     if progress_callback:
                         progress_callback(100)
                     return True
-                return await handle_empty_page(state)
+                if not any(c.get("kind") in ("book", "outlink", "read") for c in all_components):
+                    # 没有可自动完成的组件：要么是空页/分组页（交给平台的完成学习判定），
+                    # 要么只剩交作业/投票/讨论这类必须人工的组件（跳过，不报未完成）
+                    if all_components:
+                        codes = "、".join(sorted({(c.get("componentCode") or c.get("kind") or "")
+                                                  for c in all_components}))
+                        _log(f"{prefix} 本页组件都需要人工完成（{codes}），跳过", "yellow")
+                        return False
+                    return await handle_empty_page(state)
+                # 有图书/图文/外链等可自动完成的组件：继续走下面的点击与滚动流程
 
             if state.get("pageDone"):
                 pending = [c.get("componentClass") for c in components if not at_threshold(c)]
@@ -2507,8 +2566,89 @@ class AutoLearner:
                 _log(f"{prefix} {len(pending_components)} 个组件本地已播完但平台未结算，"
                      f"交由「完成学习」由平台判定", "yellow")
 
-            # 视频组件会先记录自身完成；训练营还需要点击页面的“完成学习”，再由平台确认课程完成。
+            # ── 图书 / 外链：点一下即完成 ────────────────────────────────
+            # 组件自身在点击时 emit componentDone → 页面调 studyHistoryCreate 记录完成，
+            # 所以「逐个点开始阅读」就等于学完；点开的新标签页看完就关掉。
             state = await snapshot()
+            for component in components_of_kind(state, "book", "outlink"):
+                if self._stop_event.is_set():
+                    return False
+                component_class = component.get("componentClass")
+                is_book = component.get("kind") == "book"
+                label = "开始阅读" if is_book else "由此进入"
+                target = (f".{component_class} .cuWeb-book-btn" if is_book
+                          else f".{component_class} .cuWeb-outLink-img-box")
+                try:
+                    await page.locator(f".{component_class}").first.scroll_into_view_if_needed(timeout=5000)
+                    button = page.locator(target).first
+                    if await button.count() == 0:
+                        debug(f"{prefix} 组件 {component_class} 未找到「{label}」入口")
+                        continue
+                    # 点击必须恰好发生一次：expect_event 只负责顺手接住 window.open 出来的标签页，
+                    # 接不到（内网外链只弹提示）也不能漏掉点击本身
+                    clicked = False
+                    popup = None
+                    try:
+                        async with page.expect_event("popup", timeout=6000) as popup_info:
+                            await button.click(timeout=5000)
+                            clicked = True
+                        popup = await popup_info.value
+                    except Exception as e:
+                        debug(f"{prefix} 组件 {component_class} 未捕获到新标签页({type(e).__name__})")
+                        if not clicked:
+                            await button.click(timeout=5000)
+                            clicked = True
+                    await page.wait_for_timeout(1200)
+                    await self._dismiss_page_dialog(page)
+                    await page.wait_for_timeout(2500)
+                    if popup is not None:
+                        try:
+                            await popup.close()
+                        except Exception:
+                            pass
+                    name = component.get("resourceName") or component.get("componentCode") or component_class
+                    # 点击后回读一次，确认平台真的记了完成，别让日志说谎
+                    latest_state = await snapshot()
+                    latest = next((c for c in (latest_state.get("components") or [])
+                                   if c.get("componentClass") == component_class), None)
+                    if _component_finished(latest):
+                        _log(f"{prefix} 已点「{label}」并记录完成：{name}", "green")
+                    else:
+                        _log(f"{prefix} 已点「{label}」，但平台尚未标记该组件完成：{name}", "yellow")
+                except Exception as e:
+                    debug(f"{prefix} 组件 {component_class} 点击「{label}」失败: {e}")
+                    _log(f"{prefix} 组件 {component_class} 点击「{label}」失败: {e}", "yellow")
+
+            # 图文/图片/外链课程组件：滚进视口就会上报完成（组件自带滚动判定）
+            state = await snapshot()
+            read_components = components_of_kind(state, "read")
+            if read_components:
+                _log(f"{prefix} 有 {len(read_components)} 个图文/图片组件未完成，逐个滚动到视口", "blue")
+            for component in read_components:
+                if self._stop_event.is_set():
+                    return False
+                component_class = component.get("componentClass")
+                try:
+                    await page.evaluate("""(cls) => {
+                        const el = document.querySelector('.' + cls);
+                        if (el) el.scrollIntoView({ block: 'center' });
+                    }""", component_class)
+                    await page.wait_for_timeout(300)
+                    await page.evaluate("() => window.scrollBy(0, 1)")  # 保证触发滚动事件
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    debug(f"{prefix} 组件 {component_class} 滚动到视口失败: {e}")
+
+            # 剩下的未完成组件里，哪些是必须人工的（如交作业）
+            state = await snapshot()
+            manual_pending = components_of_kind(state, "manual")
+            if manual_pending:
+                names = "、".join(sorted({c.get("componentCode") or c.get("componentClass")
+                                          for c in manual_pending}))
+                _log(f"{prefix} {len(manual_pending)} 个组件需要人工完成（{names}），已跳过", "yellow")
+            report_progress(state)
+
+            # 视频组件会先记录自身完成；训练营还需要点击页面的“完成学习”，再由平台确认课程完成。
             if state.get("pageDone"):
                 if progress_callback:
                     progress_callback(100)
@@ -2686,6 +2826,19 @@ class AutoLearner:
         };
     }"""
 
+    async def _dismiss_page_dialog(self, page: Page) -> bool:
+        """点掉 Element UI 的提示/确认弹窗（例如外链只能在内网访问的提示）"""
+        for selector in (".el-message-box__btns button.el-button--primary",
+                         ".el-message-box__btns button.el-button--default"):
+            try:
+                button = page.locator(selector).first
+                if await button.count() > 0 and await button.is_visible():
+                    await button.click(timeout=3000)
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _trainingcamp_media_progress(self, page: Page) -> Optional[Dict]:
         """页面上媒体组件的数量与达标情况（用于判断「视频是否真的学完」）"""
         try:
@@ -2703,6 +2856,16 @@ class AutoLearner:
             "ready": ready,
             "page_done": bool(state.get("pageDone")),
             "progress": [round(float(c.get("platformPct") or 0)) for c in components],
+            "books": [c.get("componentCode") for c in (state.get("components") or [])
+                      if c.get("kind") == "book"],
+            "reads": [c.get("componentClass") for c in (state.get("components") or [])
+                      if c.get("kind") == "read"],
+            "manual_pending": [c.get("componentCode") or c.get("componentClass")
+                               for c in (state.get("components") or [])
+                               if c.get("kind") == "manual" and not _component_finished(c)],
+            "automatable_pending": [c.get("componentClass") for c in (state.get("components") or [])
+                                    if c.get("kind") in ("media", "book", "outlink", "read")
+                                    and not _component_finished(c)],
         }
 
     async def _confirm_trainingcamp_finish(self, page: Page, worker_id: int) -> bool:
@@ -2894,8 +3057,9 @@ class AutoLearner:
         records = [r for r in (data.get("records") or []) if r.get("status") == "Done"]
         last_status = (data.get("lastStatus") or "").strip()
         if not records:
-            if last_status in ("Submited", "Marking", "Evaluating"):
+            if last_status in ("Submited", "Marking"):
                 return {"status": "passed", "detail": f"已交卷待批阅（{last_status}）"}
+            # NotStarted / Evaluating（考试进行中，按钮是「继续考试」）→ 没有结论，继续考
             return None
 
         latest = records[0]
@@ -2941,6 +3105,22 @@ class AutoLearner:
                 await exam_page.wait_for_timeout(1000)
             if not preview:
                 return {"status": "error", "detail": "未能读取考试说明数据"}
+
+            # 说明页会列出考试记录：已经通过就不用再考一次
+            # （允许重考的考试按钮会显示「再考一次」且可点，只靠按钮状态判断不出来）
+            try:
+                records = await exam_page.evaluate(self._EXAM_PREVIEW_RESULT_JS)
+            except Exception:
+                records = None
+            if records:
+                prior = self._exam_result_from_records(records)
+                if prior and "已通过" in (prior.get("detail") or ""):
+                    return {"status": "skipped",
+                            "detail": f"上次已通过（{prior['detail']}），不再重考"}
+                if prior and "待批阅" in (prior.get("detail") or ""):
+                    return {"status": "skipped",
+                            "detail": f"上次{prior['detail']}，不再重考"}
+
             if not preview.get("isShowBtn"):
                 return {"status": "skipped",
                         "detail": preview.get("lblMsg") or "当前不可考试（可能已过期或已完成）"}
@@ -5104,12 +5284,23 @@ class AutoLearner:
                                    "eta": "-", "status": status_text})
                         _log(f"[线程{wid+1}] 完成: {title}", "green")
                     else:
-                        progress_text = (
-                            f"{last_reported_progress[0]:.0f}%"
-                            if last_reported_progress[0] is not None else "-"
-                        )
-                        _progress({"wid": wid, "course": title, "progress": progress_text, "eta": "-", "status": "未完成"})
-                        _log(f"[线程{wid+1}] 未完成: {title}", "yellow")
+                        # 只剩「需要人工完成」的组件（如交作业）时不算失败，标记为需人工
+                        info = await self._trainingcamp_media_progress(wp) if is_trainingcamp else None
+                        manual_pending = (info or {}).get("manual_pending") or []
+                        blocked = (info or {}).get("automatable_pending") or []
+                        if manual_pending and not blocked:
+                            _progress({"wid": wid, "course": title, "progress": "-",
+                                       "eta": "-", "status": "⚠ 需人工"})
+                            _log(f"[线程{wid+1}] 跳过（需人工完成 {'、'.join(manual_pending)}）: {title}",
+                                 "yellow")
+                        else:
+                            progress_text = (
+                                f"{last_reported_progress[0]:.0f}%"
+                                if last_reported_progress[0] is not None else "-"
+                            )
+                            _progress({"wid": wid, "course": title, "progress": progress_text,
+                                       "eta": "-", "status": "未完成"})
+                            _log(f"[线程{wid+1}] 未完成: {title}", "yellow")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
