@@ -59,6 +59,7 @@ class AsyncThread(QThread):
     page_confirm_signal = Signal(int)  # last_page
     eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
     browser_download_signal = Signal(object)  # True=开始, str=进度文本, False=下载结束
+    exam_retry_signal = Signal(str, str)  # (考试名称, 失败原因) → 询问是否重考
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -142,6 +143,8 @@ def _get_version():
 
 CURRENT_VERSION = _get_version()
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
+# 考试未通过时询问是否重考的倒计时（秒）；倒计时内不操作 = 不重考
+EXAM_RETRY_TIMEOUT = 30
 
 
 RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json"
@@ -1308,6 +1311,8 @@ class DashboardScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tag_event = threading.Event()
+        self._exam_retry_event = threading.Event()
+        self._exam_retry_choice = False
         self._learn_start_time = None      # 学习开始时间
         self._progress_history = []         # [(timestamp, pct), ...]
         self._eta_seconds = None            # 最新预估剩余秒数
@@ -1487,7 +1492,7 @@ class DashboardScreen(QWidget):
     def _stop_current_learning(self):
         """停止正在运行的学习任务（配置变更/重新开始时调用）"""
         # 1) 解除可能阻塞 worker 的对话框等待
-        for ev in ("_tag_event", "_page_event"):
+        for ev in ("_tag_event", "_page_event", "_exam_retry_event"):
             ev_obj = getattr(self, ev, None)
             if ev_obj:
                 ev_obj.set()
@@ -1553,6 +1558,7 @@ class DashboardScreen(QWidget):
         self._worker.page_confirm_signal.connect(self._on_page_confirm)
         self._worker.eta_reset_signal.connect(self._on_eta_reset)
         self._worker.browser_download_signal.connect(self._on_browser_download)
+        self._worker.exam_retry_signal.connect(self._on_exam_retry)
         self._worker.start()
 
     def _init_table(self, workers):
@@ -1620,6 +1626,19 @@ class DashboardScreen(QWidget):
             cfg_chrome_path = getattr(win, "cfg_chrome_path", "")
             log("正在初始化浏览器...")
             learner = AutoLearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
+            # 考试没考成/没通过时弹窗询问是否重考（worker 线程通过信号回主线程弹窗）
+            async def _ask_exam_retry(exam_name, reason):
+                self._exam_retry_event.clear()
+                self._exam_retry_choice = False
+                thread.exam_retry_signal.emit(exam_name, reason or "")
+                finished = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._exam_retry_event.wait(EXAM_RETRY_TIMEOUT))
+                if not finished:
+                    log(f"「{exam_name}」重考确认超时（{EXAM_RETRY_TIMEOUT}秒未操作），不重考", "yellow")
+                    return False
+                return bool(self._exam_retry_choice)
+
+            learner.exam_retry_hook = _ask_exam_retry
             # 考试自动答题：只有开启且配置了 Key 时才生效
             learner.apply_exam_settings({
                 "exam_enabled": getattr(win, "cfg_exam_enabled", False),
@@ -2311,6 +2330,66 @@ class DashboardScreen(QWidget):
         self._eta_calc_time = None
         self._eta_timer.stop()
         self.lbl_eta.setText("")
+
+    def _on_exam_retry(self, exam_name, reason):
+        """考试没考成/没通过：弹窗问是否重考。倒计时结束未操作 = 不重考。"""
+        TIMEOUT = EXAM_RETRY_TIMEOUT
+        dlg = QDialog(self)
+        dlg.setWindowTitle("考试未通过")
+        dlg.setMinimumWidth(420)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(14)
+        layout.setContentsMargins(24, 22, 24, 20)
+
+        layout.addWidget(SubtitleLabel(f"「{exam_name}」未通过"))
+        info = BodyLabel(reason or "本次考试没有完成")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        hint = CaptionLabel(f"不操作将在 {TIMEOUT} 秒后按「不重考」继续，不阻塞学习")
+        hint.setStyleSheet("color: #888;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        layout.addStretch()
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+
+        btn_retry = PushButton("  重考一次")
+        btn_retry.setIcon(FIF.SYNC)
+        btn_retry.clicked.connect(lambda: dlg.done(1))
+        btn_layout.addWidget(btn_retry)
+
+        btn_skip = PrimaryPushButton(f"  不重考 ({TIMEOUT}s)")
+        btn_skip.setIcon(FIF.ACCEPT)
+        btn_skip.clicked.connect(lambda: dlg.done(0))
+        btn_layout.addWidget(btn_skip)
+
+        layout.addLayout(btn_layout)
+
+        countdown = [TIMEOUT]
+        timer = QTimer(dlg)
+        timer.setInterval(1000)
+
+        def tick():
+            countdown[0] -= 1
+            if countdown[0] <= 0:
+                timer.stop()
+                dlg.done(0)  # 超时按「不重考」
+            else:
+                btn_skip.setText(f"  不重考 ({countdown[0]}s)")
+
+        timer.timeout.connect(tick)
+        timer.start()
+        btn_retry.clicked.connect(timer.stop)
+        btn_skip.clicked.connect(timer.stop)
+
+        choice = dlg.exec()
+        self._exam_retry_choice = bool(choice == 1)
+        self._exam_retry_event.set()
 
     def _on_browser_download(self, status):
         """Chromium 下载进度提示：模态等待框，下载完成前阻止继续使用。

@@ -249,6 +249,25 @@ OTE_API_BASE = "https://api.u.ccb.com/v1"
 TRAINCAMP_POLL_SECONDS = 10
 TRAINCAMP_LOCAL_SETTLE_SECONDS = 180
 
+# 考试没考成/没通过时，最多允许用户手动选择重考的次数
+EXAM_RETRY_LIMIT = 3
+
+
+def _exam_needs_retake_choice(result: Optional[Dict]) -> bool:
+    """这次考试结果是否需要问用户「要不要重考」。
+
+    已通过、已交卷待批阅都算正常结果，不再打扰用户；
+    未通过、答题/提交异常、以及不可考试（过期/仅手机扫码等）都问一次。
+    """
+    result = result or {}
+    status = result.get("status")
+    detail = result.get("detail") or ""
+    if status in ("failed", "error"):
+        return True
+    if status == "skipped":
+        return not any(key in detail for key in ("已通过", "待批阅"))
+    return False
+
 EXAM_SYSTEM_PROMPT = """你是中国建设银行在线学习平台的考试答题助手，需要判断题目的正确答案。
 只输出一个 JSON 对象（json），不要输出解释、不要包裹代码块。
 
@@ -544,6 +563,8 @@ class AutoLearner:
         self.deepseek_model = DEEPSEEK_DEFAULT_MODEL
         self.deepseek_base_url = DEEPSEEK_DEFAULT_BASE_URL
         self.deepseek_thinking = False
+        # 考试没考成/没通过时询问是否重考的回调（GUI 注入；命令行/无界面时保持 None → 不重考）
+        self.exam_retry_hook = None
 
     async def init(self, log_callback=None, chrome_path="", download_callback=None):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
@@ -3117,6 +3138,35 @@ class AutoLearner:
             except Exception as e:
                 debug(f"{prefix} 异常: {e}\n{traceback.format_exc()}")
                 result = {"status": "error", "detail": str(e)}
+
+            # 只要这次没考成/没通过，就问用户要不要重考；
+            # 不回答（倒计时结束）按「不重考」处理，避免无人值守时卡住。
+            retakes = 0
+            while (_exam_needs_retake_choice(result) and self.exam_retry_hook
+                   and retakes < EXAM_RETRY_LIMIT and not self._stop_event.is_set()):
+                _log(f"{prefix} 「{task['name']}」未通过/未完成（{result.get('detail', '')}），"
+                     f"询问是否重考", "yellow")
+                try:
+                    again = await self.exam_retry_hook(task["name"], result.get("detail") or "")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    debug(f"{prefix} 重考确认失败: {e}")
+                    again = False
+                if not again:
+                    _log(f"{prefix} 已选择不重考「{task['name']}」", "yellow")
+                    break
+                retakes += 1
+                _log(f"{prefix} 按用户选择重考「{task['name']}」（第 {retakes}/{EXAM_RETRY_LIMIT} 次）",
+                     "blue")
+                try:
+                    result = await self._solve_one_exam(task, worker_id, _log)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    debug(f"{prefix} 重考异常: {e}\n{traceback.format_exc()}")
+                    result = {"status": "error", "detail": str(e)}
+
             status = result.get("status")
             if status == "passed":
                 state["passed"] += 1
