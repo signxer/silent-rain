@@ -3075,17 +3075,24 @@ class AutoLearner:
         )
 
         exam_tasks: List[Dict] = []
+        seen_urls = set()
         for comp in components:
-            if (comp.get("componentCode") or "") not in ("cuExam", "cuWebExam"):
-                continue
+            code = comp.get("componentCode") or ""
+            is_exam_component = code in ("cuExam", "cuWebExam")
             for res in (comp.get("resources") or []):
                 url = (res.get("pcUrl") or "").strip()
                 if not url:
+                    continue
+                # 认证考试之类的资源不一定叫 cuExam：只要指向考试中心（/ote/）就当考试处理
+                if not is_exam_component and "/ote/" not in url and "exampreview" not in url:
                     continue
                 if url.startswith("//"):
                     url = "https:" + url
                 elif url.startswith("/"):
                     url = "https://u.ccb.com" + url
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
                 name = (res.get("name") or comp.get("componentName") or "随堂测试").strip()
                 exam_tasks.append({
                     "url": url,
@@ -3280,10 +3287,15 @@ class AutoLearner:
                 await exam_page.wait_for_timeout(800)
 
             try:
+                # 正式答题是 /userexam，模拟自测（模拟考试）是 /shamexam：
+                # 两者数据结构与提交接口完全一致（getQuestionList/logAnswers/examSubmit），
+                # 只是路由名不同，所以这里都接受。
                 await exam_page.wait_for_function(
-                    "() => location.hash.indexOf('/userexam') >= 0", timeout=30000)
+                    "() => location.hash.indexOf('/userexam') >= 0"
+                    " || location.hash.indexOf('/shamexam') >= 0", timeout=30000)
             except Exception:
                 return {"status": "error", "detail": "未能进入答题页"}
+            debug(f"{prefix} 答题页路由: {exam_page.url}")
 
             # 等答题页把题目拉回来（init → getQuestionList）
             try:
