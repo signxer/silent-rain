@@ -2383,7 +2383,7 @@ class AutoLearner:
             # 或上一次只考试没学视频），所以只对「已经达标的组件」放行，
             # 没达标的仍然要播放，否则会出现「只考试、没看视频」。
             state = await snapshot()
-            for _ in range(30):
+            for poll in range(30):
                 components = media_components(state)
                 if components and all(at_threshold(c) for c in components):
                     if progress_callback:
@@ -2396,6 +2396,13 @@ class AutoLearner:
                     debug(f"{prefix} 页面已由平台标记完成（没有媒体组件）")
                     return True
                 if components:
+                    break
+                # 组件已经渲染出来了，但一个能自动完成的都没有（例如只有交作业的页面）：
+                # 再等下去也没有播放器会出现，直接进分类逻辑，别白等 30 秒占着 worker
+                if poll >= 1 and (state.get("wrapperCount") or 0) > 0 and not any(
+                        c.get("kind") in ("media", "book", "outlink", "read", "exam")
+                        for c in (state.get("components") or [])):
+                    debug(f"{prefix} 页面组件已渲染但没有可自动完成的组件，提前结束等待")
                     break
                 if self._stop_event.is_set():
                     return False
@@ -2419,6 +2426,8 @@ class AutoLearner:
                         codes = "、".join(sorted({(c.get("componentCode") or c.get("kind") or "")
                                                   for c in all_components}))
                         _log(f"{prefix} 本页组件都需要人工完成（{codes}），跳过", "yellow")
+                        # 同步写进调试日志：这类页面本来就该人工处理，避免看起来像失败
+                        debug(f"{prefix} 本页组件都需要人工完成（{codes}），跳过；URL: {page.url}")
                         return False
                     return await handle_empty_page(state)
                 # 有考试组件时不在这里下结论：考试流程跑完后再由平台的「完成学习」判定
@@ -2453,7 +2462,7 @@ class AutoLearner:
 
                 # 等待播放器与 video 元素挂载（cuCase 等组件要等接口返回播放地址）
                 media_ready = False
-                for _ in range(30):
+                for poll in range(30):
                     current_state = await snapshot()
                     current_match = next((x for x in media_components(current_state)
                                           if x.get("componentClass") == component_class), None)
@@ -2469,21 +2478,40 @@ class AutoLearner:
                         break
                     if match and (match.get("hasPlayerEl") or match.get("hasPlayerApi")):
                         component = match
+                    # 连播放地址都没有（组件拿不到播放源，播放器永远不会挂载）：
+                    # 别在这里等满 30 秒，更别进后面的停滞重试循环
+                    if poll >= 2 and match and not match.get("hasMedia") \
+                            and not match.get("hasPlayUrl") \
+                            and (current_state.get("mediaCount") or 0) == 0:
+                        _log(f"{prefix} 组件 {component_class} 没有播放地址"
+                             f"（平台进度 {float(match.get('platformPct') or 0):.0f}%），跳过不空等", "yellow")
+                        debug(f"{prefix} 组件 {component_class} 无播放地址: {match}")
+                        component = match
+                        media_ready = False
+                        break
                     if self._stop_event.is_set():
                         return False
                     await page.wait_for_timeout(1000)
+
+                # 没有播放器可播：记为待平台结算，不再进播放/停滞循环（否则要空转十几分钟）
+                if not media_ready:
+                    try:
+                        play_result = await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
+                    except Exception as e:
+                        play_result = {"ok": False, "reason": str(e)}
+                    _log(f"{prefix} 组件 {component_class} 没有挂载出播放器"
+                         f"（{play_result.get('reason') or '无媒体元素'}），跳过该组件", "yellow")
+                    debug(f"{prefix} 组件 {component_class} 播放结果 {play_result}")
+                    if component_class not in pending_components:
+                        pending_components.append(component_class)
+                    continue
 
                 try:
                     play_result = await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
                 except Exception as e:
                     play_result = {"ok": False, "reason": str(e)}
-                if not media_ready:
-                    _log(f"{prefix} 组件 {component_class} 没有挂载出播放器"
-                         f"（{play_result.get('reason') or '无媒体元素'}），跳过该组件", "yellow")
-                    debug(f"{prefix} 组件 {component_class} 播放结果 {play_result}")
-                else:
-                    debug(f"{prefix} 组件 {component_class} 开始播放 via={play_result.get('via')} "
-                          f"{'（静音兜底）' if play_result.get('muted') else ''}")
+                debug(f"{prefix} 组件 {component_class} 开始播放 via={play_result.get('via')} "
+                      f"{'（静音兜底）' if play_result.get('muted') else ''}")
                 await page.wait_for_timeout(1500)
 
                 last_progress = float(component.get("platformPct") or 0)
