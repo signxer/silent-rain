@@ -2411,7 +2411,8 @@ class AutoLearner:
                     if progress_callback:
                         progress_callback(100)
                     return True
-                if not any(c.get("kind") in ("book", "outlink", "read") for c in all_components):
+                if not any(c.get("kind") in ("book", "outlink", "read", "exam")
+                           for c in all_components):
                     # 没有可自动完成的组件：要么是空页/分组页（交给平台的完成学习判定），
                     # 要么只剩交作业/投票/讨论这类必须人工的组件（跳过，不报未完成）
                     if all_components:
@@ -2420,7 +2421,10 @@ class AutoLearner:
                         _log(f"{prefix} 本页组件都需要人工完成（{codes}），跳过", "yellow")
                         return False
                     return await handle_empty_page(state)
-                # 有图书/图文/外链等可自动完成的组件：继续走下面的点击与滚动流程
+                # 有考试组件时不在这里下结论：考试流程跑完后再由平台的「完成学习」判定
+                if not any(c.get("kind") in ("book", "outlink", "read") for c in all_components):
+                    _log(f"{prefix} 本页只有考试组件，交给考试流程处理", "blue")
+                    return False
 
             if state.get("pageDone"):
                 pending = [c.get("componentClass") for c in components if not at_threshold(c)]
@@ -2607,20 +2611,36 @@ class AutoLearner:
                     if await button.count() == 0:
                         debug(f"{prefix} 组件 {component_class} 未找到「{label}」入口")
                         continue
-                    # 点击必须恰好发生一次：expect_event 只负责顺手接住 window.open 出来的标签页，
-                    # 接不到（内网外链只弹提示）也不能漏掉点击本身
+                    # 页面上的遮罩（.v-modal）会拦住 pointer events，点击会一直超时：先清掉
+                    await self._clear_blocking_overlays(page, _log)
+                    # 点击必须恰好发生一次；expect_event 只是顺手接住 window.open 出来的标签页
                     clicked = False
                     popup = None
                     try:
-                        async with page.expect_event("popup", timeout=6000) as popup_info:
-                            await button.click(timeout=5000)
-                            clicked = True
+                        async with page.expect_event("popup", timeout=5000) as popup_info:
+                            try:
+                                await button.click(timeout=3500)
+                                clicked = True
+                            except Exception as e:
+                                # 遮罩清不掉时，用 JS 触发组件自身的 click（平台的处理逻辑一致）
+                                debug(f"{prefix} 组件 {component_class} 常规点击失败"
+                                      f"({type(e).__name__})，改用 JS 点击")
+                                if await self._clear_blocking_overlays(page, _log):
+                                    try:
+                                        await button.click(timeout=3000)
+                                        clicked = True
+                                    except Exception:
+                                        pass
+                                if not clicked:
+                                    clicked = await page.evaluate(self._JS_CLICK_JS, target)
                         popup = await popup_info.value
                     except Exception as e:
                         debug(f"{prefix} 组件 {component_class} 未捕获到新标签页({type(e).__name__})")
                         if not clicked:
-                            await button.click(timeout=5000)
-                            clicked = True
+                            clicked = await page.evaluate(self._JS_CLICK_JS, target)
+                    if not clicked:
+                        _log(f"{prefix} 组件 {component_class} 点不到「{label}」，跳过该组件", "yellow")
+                        continue
                     await page.wait_for_timeout(1200)
                     await self._dismiss_page_dialog(page)
                     await page.wait_for_timeout(2500)
@@ -2912,6 +2932,14 @@ class AutoLearner:
             vm.submit();
             return true;
         } catch (e) { return false; }
+    }"""
+
+    # 被遮罩挡住时的兜底：直接用 JS 触发元素自身的 click（走平台自己的处理逻辑）
+    _JS_CLICK_JS = r"""(selector) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.click();
+        return true;
     }"""
 
     async def _handle_video_quiz(self, page: Page, log=None) -> bool:
