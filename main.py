@@ -2522,6 +2522,8 @@ class AutoLearner:
                     # 只在「播放中途暂停」时重新拉起；已播完的媒体重播会把进度打回 0
                     if not match.get("ended") and (match.get("paused") or not match.get("hasMedia")) \
                             and not local_reached:
+                        # 弹窗遮罩（视频互动问答等）会挡住播放器并暂停视频，先清掉再拉起
+                        await self._clear_blocking_overlays(page, _log)
                         try:
                             await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
                         except Exception:
@@ -2653,24 +2655,11 @@ class AutoLearner:
                 if progress_callback:
                     progress_callback(100)
                 return True
-            done_button = page.locator(".traincamp-journey-study-done span").first
-            try:
-                if await done_button.count() > 0:
-                    await done_button.scroll_into_view_if_needed(timeout=3000)
-                    label = (await done_button.inner_text(timeout=2000)).strip()
-                    if "完成学习" in label:
-                        await done_button.click(timeout=5000)
-            except Exception as e:
-                debug(f"{prefix} 点击完成学习失败: {e}")
-
-            # clickFinish 完成后页面会将按钮文案更新为已完成；等待异步响应并确认。
-            for _ in range(15):
-                await page.wait_for_timeout(1000)
-                state = await snapshot()
-                if state.get("pageDone"):
-                    if progress_callback:
-                        progress_callback(100)
-                    return True
+            # 复用同一套健壮点击：先清遮挡弹窗、常规点击失败则 JS 触发、最多重试 3 次
+            if await self._confirm_trainingcamp_finish(page, worker_id, _log):
+                if progress_callback:
+                    progress_callback(100)
+                return True
             debug(f"{prefix} 视频进度已上报，但平台尚未确认课程完成 ({state.get('doneText', '')})")
             _log(f"{prefix} 视频已播放，但平台未确认课程完成（{state.get('doneText', '')}）", "yellow")
             return False
@@ -2868,9 +2857,133 @@ class AutoLearner:
                                     and not _component_finished(c)],
         }
 
-    async def _confirm_trainingcamp_finish(self, page: Page, worker_id: int) -> bool:
-        """点训练营课程页的「完成学习」并等待平台确认（用于没有视频组件的纯考试页）"""
+    # 视频里的「互动问答」弹窗：close-on-press-escape / close-on-click-modal 都是 false，
+    # 必答题连关闭按钮都没有，不处理会一直挡住页面（.v-modal 拦截点击）并让视频卡住。
+    _VIDEO_QUIZ_JS = r"""() => {
+        const root = document.querySelector('.answer');
+        const vm = root && root.__vue__;
+        if (!vm || typeof vm.submit !== 'function' || !vm.dialogvisible) return null;
+        const strip = (html) => {
+            const d = document.createElement('div');
+            d.innerHTML = html == null ? '' : String(html);
+            return (d.innerText || d.textContent || '').replace(/\s+/g, ' ').trim();
+        };
+        return {
+            type: vm.questionType,
+            typeName: vm.questionTypeName || '',
+            title: strip(vm.questionTitle),
+            isRequired: !!vm.isRequired,
+            answered: !!vm.answered,
+            options: (vm.optionList || []).map((o) => ({
+                id: o.id, text: strip(o.title || o.content || '')
+            }))
+        };
+    }"""
+
+    _VIDEO_QUIZ_APPLY_JS = r"""(payload) => {
+        const root = document.querySelector('.answer');
+        const vm = root && root.__vue__;
+        if (!vm) return false;
+        try {
+            if (payload.skip) { vm.close(); return true; }   // 平台自己的跳过流程（提交空答案后关闭）
+            if (payload.ids && payload.ids.length) vm.checkedQuiz = payload.ids;
+            if (payload.text) vm.text = payload.text;
+            vm.submit();
+            return true;
+        } catch (e) { return false; }
+    }"""
+
+    async def _handle_video_quiz(self, page: Page, log=None) -> bool:
+        """处理视频互动问答弹窗：配了 DeepSeek 就作答，否则按平台跳过流程关闭。"""
+        try:
+            quiz = await page.evaluate(self._VIDEO_QUIZ_JS)
+        except Exception:
+            return False
+        if not quiz:
+            return False
+        kinds = {0: "Judge", 1: "SingleChoice", 2: "MultiChoice", 3: "QuestionAndAnswer"}
+        try:
+            qtype = kinds.get(int(quiz.get("type")), "QuestionAndAnswer")
+        except (TypeError, ValueError):
+            qtype = "QuestionAndAnswer"
+
+        payload = {"skip": True}
+        if self.deepseek_api_key and quiz.get("options") and qtype != "QuestionAndAnswer":
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            question = {
+                "index": 1,
+                "type": qtype,
+                "content": quiz.get("title") or "",
+                "options": [{"code": letters[i] if i < len(letters) else str(i),
+                             "text": option.get("text") or ""}
+                            for i, option in enumerate(quiz.get("options") or [])],
+                "blankCount": 0,
+            }
+            try:
+                client = DeepSeekClient(api_key=self.deepseek_api_key, model=self.deepseek_model,
+                                        base_url=self.deepseek_base_url,
+                                        thinking=self.deepseek_thinking)
+                picked = ((await client.answer_exam([question], log=log)).get(1) or {}).get("choices") or []
+                ids = [quiz["options"][letters.index(c)]["id"] for c in picked
+                       if c in letters and letters.index(c) < len(quiz["options"])]
+                if ids:
+                    payload = {"ids": ids}
+            except Exception as e:
+                debug(f"视频互动问答作答失败: {e}")
+
+        try:
+            await page.evaluate(self._VIDEO_QUIZ_APPLY_JS, payload)
+        except Exception as e:
+            debug(f"视频互动问答处理失败: {e}")
+            return False
+        await page.wait_for_timeout(1200)
+        if log:
+            if payload.get("ids"):
+                log(f"训练营 视频互动问答已作答（{quiz.get('typeName') or qtype}）", "green")
+            else:
+                log("训练营 视频互动问答未作答，已按平台跳过流程关闭", "yellow")
+        return True
+
+    async def _clear_blocking_overlays(self, page: Page, log=None) -> bool:
+        """关掉挡住页面的 Element UI 弹窗/遮罩（视频互动问答、提示框等）。
+
+        这些遮罩（.v-modal）会拦截 pointer events，导致「完成学习」等按钮点不到。
+        """
+        try:
+            if await page.locator(".v-modal").count() == 0:
+                return False
+        except Exception:
+            return False
+        if await self._handle_video_quiz(page, log):
+            return True
+        for selector in (".el-dialog__headerbtn",
+                         ".el-dialog .jumpover",
+                         ".el-dialog__footer button.el-button--primary",
+                         ".el-message-box__btns button.el-button--primary",
+                         ".el-message-box__btns button.el-button--default"):
+            try:
+                button = page.locator(selector).first
+                if await button.count() > 0 and await button.is_visible():
+                    await button.click(timeout=2500)
+                    await page.wait_for_timeout(600)
+                    return True
+            except Exception:
+                continue
+        try:
+            await page.keyboard.press("Escape")  # Element UI 弹窗默认支持 ESC
+            await page.wait_for_timeout(600)
+            return True
+        except Exception:
+            return False
+
+    async def _confirm_trainingcamp_finish(self, page: Page, worker_id: int, log_callback=None) -> bool:
+        """点训练营课程页的「完成学习」并等待平台确认。
+
+        遮罩弹窗（.v-modal）会拦截 pointer events 让点击超时，所以每次点击前先清弹窗；
+        常规点击仍失败时，用 JS 直接触发页面自身的 click 处理（平台逻辑一致，只是绕过遮挡）。
+        """
         prefix = f"[工作线程 {worker_id+1}] 训练营"
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         done_js = r"""() => {
             const d = document.querySelector('.traincamp-journey-study-done span');
             return !!(d && /恭喜您，已完成/.test(d.innerText || ''));
@@ -2885,11 +2998,30 @@ class AutoLearner:
             label = (await button.inner_text(timeout=2000)).strip()
             if "完成学习" not in label:
                 return await page.evaluate(done_js)
-            await button.click(timeout=5000)
-            for _ in range(15):
-                await page.wait_for_timeout(1000)
-                if await page.evaluate(done_js):
-                    return True
+
+            for attempt in range(1, 4):
+                if self._stop_event.is_set():
+                    return False
+                # 弹窗遮罩会拦点击：先清掉（视频互动问答 / 提示框）
+                await self._clear_blocking_overlays(page, _log)
+                try:
+                    await button.click(timeout=5000)
+                except Exception as e:
+                    debug(f"{prefix} 完成学习点击失败({attempt}/3): {e}")
+                    try:
+                        await page.evaluate("""() => {
+                            const el = document.querySelector('.traincamp-journey-study-done span');
+                            if (el) el.click();
+                        }""")
+                    except Exception as e2:
+                        debug(f"{prefix} 完成学习 JS 点击也失败: {e2}")
+                for _ in range(8):
+                    await page.wait_for_timeout(1000)
+                    if await page.evaluate(done_js):
+                        return True
+                # 平台可能弹了错误提示（例如仍有组件未完成），关掉再重试
+                await self._dismiss_page_dialog(page)
+            debug(f"{prefix} 完成学习重试 {3} 次，平台仍未确认")
             return False
         except Exception as e:
             debug(f"{prefix} 点击完成学习失败: {e}")
@@ -5273,7 +5405,7 @@ class AutoLearner:
                         media = await self._trainingcamp_media_progress(wp)
                         if media and (media.get("ready") or media.get("count") == 0
                                       or media.get("page_done")):
-                            if await self._confirm_trainingcamp_finish(wp, wid):
+                            if await self._confirm_trainingcamp_finish(wp, wid, _log):
                                 play_ok = True
                                 status_text = ("✓ 考试完成" if media.get("count") == 0
                                                else "✓ 完成")
