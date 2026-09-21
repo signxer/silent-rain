@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.9.7
+- feat(考试): 支持认证考试与模拟自测（含 /shamexam 路由）
+- chore: VERSION 1.9.6
+- docs: CHANGELOG 1.9.6
+# 更新日志
+
 ## 1.9.6
 - fix(训练营): 弹窗遮罩挡住「完成学习」导致点击超时、课程误判未完成
 - chore: VERSION 1.9.5
