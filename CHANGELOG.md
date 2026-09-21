@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.9.8
+- feat(考试): 未通过时弹窗询问是否重考，倒计时不操作则默认不重考
+- chore: VERSION 1.9.7
+- docs: CHANGELOG 1.9.7
+# 更新日志
+
 ## 1.9.7
 - feat(考试): 支持认证考试与模拟自测（含 /shamexam 路由）
 - chore: VERSION 1.9.6
