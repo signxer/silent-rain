@@ -13,7 +13,7 @@ from datetime import datetime
 
 from PySide6.QtCore import (
     Qt, QThread, Signal, QSize, QTimer, QEventLoop,
-    QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve,
+    QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve, Property,
 )
 from PySide6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QPen, QBrush,
@@ -194,12 +194,14 @@ class _GoalRing(QWidget):
         self._bar_color = QColor("#1976F3")
         self.setMinimumSize(80, 80)
 
-    def value(self):
+    def getValue(self):
         return self._value
 
     def setValue(self, value):
         self._value = max(0, min(100, int(value)))
         self.update()
+
+    value = Property(int, getValue, setValue)
 
     def setCustomBarColor(self, primary, secondary=None):
         self._bar_color = QColor(primary)
@@ -2149,9 +2151,11 @@ class DashboardScreen(QWidget):
         header_view.setSectionResizeMode(2, QHeaderView.Fixed)
         header_view.setSectionResizeMode(3, QHeaderView.Fixed)
         header_view.setSectionResizeMode(4, QHeaderView.Fixed)
-        self.table.setColumnWidth(0, 70)
-        self.table.setColumnWidth(2, 360)
-        self.table.setColumnWidth(3, 165)
+        header_view.setFixedHeight(31)
+        self.table.setColumnWidth(0, 54)
+        # 进度与预计保持同宽，课程列使用剩余空间，避免长课程名被压缩。
+        self.table.setColumnWidth(2, 84)
+        self.table.setColumnWidth(3, 84)
         self.table.setColumnWidth(4, 180)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
         self.table.setSelectionMode(TableWidget.NoSelection)
@@ -2369,12 +2373,12 @@ class DashboardScreen(QWidget):
             bar.setFixedHeight(13)
             progress_cell = QWidget()
             progress_layout = QHBoxLayout(progress_cell)
-            progress_layout.setContentsMargins(10, 8, 10, 8)
-            progress_layout.setSpacing(10)
+            progress_layout.setContentsMargins(6, 4, 6, 4)
+            progress_layout.setSpacing(6)
             progress_layout.addWidget(bar, 1)
             percent_label = QLabel("0%")
             percent_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            percent_label.setMinimumWidth(32)
+            percent_label.setMinimumWidth(28)
             progress_layout.addWidget(percent_label)
             self.table.setCellWidget(i, 2, progress_cell)
             self._progress_bars.append(bar)
@@ -3072,7 +3076,7 @@ class DashboardScreen(QWidget):
         try:
             anim = QPropertyAnimation(self.progress_ring, b"value", self)
             anim.setDuration(400)
-            anim.setStartValue(self.progress_ring.value())
+            anim.setStartValue(self.progress_ring.value)
             anim.setEndValue(int(target))
             anim.setEasingCurve(QEasingCurve.OutCubic)
             anim.start(QPropertyAnimation.DeleteWhenStopped)
@@ -3385,6 +3389,7 @@ class DashboardScreen(QWidget):
                 if notes:
                     msg += f"\n\n更新内容:\n{notes}"
                 dlg = Dialog("发现新版本", msg, self)
+                style_moisten_dialog(dlg)
                 dlg.cancelButton.setText("稍后")
                 dlg.yesButton.setText("立即更新")
                 if dlg.exec():

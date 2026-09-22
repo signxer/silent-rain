@@ -1,180 +1,192 @@
-# 润物 Moisten
+<p align="center">
+  <img src="icon.png" width="112" height="112" alt="Moisten Logo">
+</p>
 
-> 随风潜入夜，润物细无声。—— 杜甫《春夜喜雨》
+<h1 align="center">润物 Moisten</h1>
 
-自动学习工具，支持 GUI 和命令行两种模式。
+<p align="center">
+  安静、可靠的在线学习自动化工作台
+</p>
 
-## 功能
+<p align="center">
+  <a href="https://github.com/signxer/silent-rain/releases"><img src="https://img.shields.io/github/v/release/signxer/silent-rain?style=flat-square&color=2b83f6" alt="Latest Release"></a>
+  <a href="https://github.com/signxer/silent-rain/blob/main/LICENSE"><img src="https://img.shields.io/github/license/signxer/silent-rain?style=flat-square&color=18b8b4" alt="License"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.9%2B-3776ab?style=flat-square" alt="Python 3.9+"></a>
+  <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/browser-Playwright-2ead33?style=flat-square" alt="Playwright"></a>
+</p>
 
-- **自动登录** — 记住账号密码（系统钥匙串存储），下次自动填充
-- **双模式学习** — 自动模式（按学时目标学习）/ 手动模式（指定专题班、训练营或课程 URL）
-- **训练营兼容** — 自动提取训练营课程，按组件平台进度学习并确认课程完成
-- **训练营视频播放** — 按页面 DOM 发现阿里播放器，兼容没有进度条的课程包/案例组件
-- **考试自动答题** — 训练营里的「随堂测试」用 DeepSeek 自动作答并交卷（设置里填 API Key 即可）
-- **双目标支持** — 集中培训、网络自学独立设置，支持「总学时」和「差额补修」两种计算方式
-- **网络自学走课程列表** — 网络自学从 `u.ccb.com/course/#/list/1` 直接找课程，不走专题班
-- **标签筛选** — 按标签筛选专题班，支持多选，记住上次选择
-- **多线程并发** — 可配置 1-20 个工作线程同时学习
-- **无头模式** — 后台运行，不显示浏览器界面
-- **断点续学** — 记住学习进度和页码，下次自动从上次位置继续
-- **Fluent Design 界面** — 基于 QFluentWidgets，支持深色/浅色主题自适应
+<p align="center">
+  <em>把重复的学习流程交给工具，把时间留给更重要的事情。</em>
+</p>
 
-## 安装（源码运行）
+---
+
+## ✨ 项目简介
+
+Moisten 是一个面向在线课程与内部培训场景的桌面自动化工具。它提供图形界面和命令行两种使用方式，用于管理课程目标、浏览器会话、学习进度和运行日志。
+
+项目强调三个体验：
+
+- **低打扰**：任务在后台运行，进度、状态和异常集中展示。
+- **可恢复**：自动保存配置、会话和进度，支持从中断位置继续。
+- **可控制**：自动模式与手动模式并存，学习过程可以随时暂停、停止或调整。
+
+## 🌊 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 双模式工作流 | 按目标自动安排学习，或直接输入课程地址进行精确学习 |
+| 课程组件处理 | 支持视频、音频、图文、图书、外链和常见测验组件 |
+| 断点续学 | 记录课程进度、页面位置和已完成内容，重启后可继续 |
+| 多任务并发 | 支持配置 1–20 个工作线程，并提供实时进度反馈 |
+| 无头运行 | 可在后台运行浏览器，适合长时间任务 |
+| 标签筛选 | 按课程标签筛选内容，并记住上次选择 |
+| 可选 AI 辅助 | 对兼容的 AI 接口进行连接测试，用于处理特定问答流程 |
+| 桌面工作台 | 亮色/深色主题、统一弹窗、进度卡片、日志面板和状态提示 |
+| 安全停止 | 变更配置或关闭窗口时，尽量在安全检查点停止当前任务 |
+
+## 🖥️ 界面预览
+
+Moisten 使用蓝青渐变、轻量卡片和清晰的信息层级，适配浅色与深色主题。
+
+<p align="center">
+  <img src="icon.png" width="72" alt="Moisten icon">
+</p>
+
+## 📦 获取与安装
+
+### 下载打包版本
+
+前往 [Moisten 下载页](https://signxer.github.io/Moisten/) 获取 Windows 或 macOS 版本。
+
+打包版本无需额外安装 Python 或浏览器运行环境，下载后即可启动。下载页默认使用 gh-proxy 加速公开 Release 文件，网络不可用时可改用直连地址。
+
+### 从源码运行
+
+环境要求：
+
+- Python 3.9 或更高版本
+- macOS、Windows 或 Linux
+- 使用内置浏览器模式时，需要 Playwright 浏览器运行文件
 
 ```bash
 git clone https://github.com/signxer/silent-rain.git
 cd silent-rain
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-Mac 用户也可运行 `./setup.sh` 一键安装。
-
-## 下载打包版本
-
-从 [Releases](https://github.com/signxer/silent-rain/releases) 下载对应平台的可执行文件（发布仓库：https://github.com/signxer/Moisten）。
-
-**下载与自动更新走加速节点**：检查更新和下载新版本时默认拼 [gh-proxy](https://gh-proxy.com/docs/github-accelerator)
-加速前缀（`https://gh-proxy.com/<github地址>`，备用 `gh-proxy.org`），节点不通会自动退回 GitHub 直连，
-无需手动配置。下载期间进度框会显示当前用的是「加速节点」还是「GitHub 直连」；
-代理返回错误页或文件不完整会被完整性校验拦下并自动换源重试。
-
-**打包版本不内置浏览器**：首次使用「内置 Chromium」模式时，应用会自动下载 Chromium 到系统缓存目录（约 200MB，仅一次）；也可以改用系统已安装的 Chrome 浏览器，无需下载。
-
-**macOS 用户**：由于未进行 Apple 开发者签名，首次打开可能提示"已损坏"，需要在终端执行：
+macOS/Linux 也可以使用一键脚本：
 
 ```bash
-xattr -cr /path/to/Moisten.app
+./setup.sh
 ```
 
-或右键 → 打开 → 仍然打开。当前构建为 Apple Silicon（M1/M2/M3/M4）版本，Intel Mac 暂不支持。
+## 🚀 使用方式
 
-## 使用
-
-### GUI 界面（推荐）
+### 图形界面
 
 ```bash
 python3 gui.py
 ```
 
-启动后按界面引导操作：配置 → 登录 → 选择模式 → 设置目标 → 开始学习。
+推荐流程：
 
-#### 考试自动答题
-
-训练营课程页里可能包含「随堂测试」考试组件。开启自动答题后，程序会打开考试说明页 →「开始考试」→
-读取试卷题目 → 调用 DeepSeek 作答 → 自动交卷，并把成绩写进日志。
-
-在「配置」页的 **考试自动答题（DeepSeek）** 卡片里：
-
-| 项 | 说明 |
-|----|------|
-| 训练营考试 | 开关，默认关闭 |
-| API Key | DeepSeek 开放平台申请的 Key（<https://platform.deepseek.com>），保存时做混淆处理 |
-| 模型 | 默认 `deepseek-flash`，可换成 `deepseek-v4-pro` 等 |
-| 深度思考 | 思考模式开关。关闭=快速作答（显式传 `thinking=disabled`，更快更省）；打开=思考模式 + `reasoning_effort=high`（更准但更慢） |
-| 测试连接 | 保存前先验证 Key 与模型是否可用（会分别按当前开关的模式测试） |
-
-> `deepseek-flash` 的思考模式**默认是打开的**（且推理强度默认 high），所以程序会显式传
-> `thinking=disabled/enabled`：否则"快速作答"其实仍在思考，既慢又容易把输出预算耗在思维链上。
-> 思维链 tokens 同样计入 `max_tokens`，程序按题量估算预算并在被截断时自动放宽重试。
-
-只考一次：若提交后未通过，会记录日志并继续下一门课程，不自动重考。是否通过以**考试说明页刷新后**
-的考试记录为准（平台只在说明页显示成绩），成绩页取不到时才回退到交卷结果。
-
-**没考成会弹窗问你要不要重考**：未通过、答题/提交异常、以及"当前不可考试（已过期/仅手机扫码）"等情况，
-界面会弹出「考试未通过」对话框问是否重考，**倒计时 30 秒内不操作就按「不重考」继续**（不会卡住学习，
-无人值守也安全）。选择重考会立刻再考一次，最多 3 次，每次都还会再问。已通过、已交卷待批阅这类正常结果
-不会打扰你。命令行模式没有界面，一律按"不重考"处理。
-
-**已经通过的考试不会再考一遍**：允许重考的考试，说明页按钮是可点的「再考一次」，只看按钮状态判断不出来，
-所以程序会先读说明页的考试记录——最新一次已通过就直接跳过（日志写明「上次已通过（…），不再重考」），
-已交卷待批阅也跳过，而「继续考试」（上次没考完）则按正常流程接着考。
-
-同一页既有多个视频又有考试时，顺序固定为「**先看视频 → 再考试 → 最后点完成学习**」：平台可能在
-考试通过后就把整页标记完成，若先考试，剩下的视频会被「已完成」短路掉（一节都没看）。同理，页面
-已经显示「恭喜您，已完成」时，程序只跳过**已达标**的组件，没看过的视频仍会补学并打印原因。
-
-### 训练营课程页的组件处理
-
-课程页上不同类型的组件，用与页面自身一致的方式完成：
-
-| 组件 | 页面上的表现 | 程序的处理 |
-|------|--------------|------------|
-| 视频/音频/直播 | 阿里播放器 + 进度条（课程包/案例没有进度条） | 播到平台阈值（组件 `videoProcess`，默认 95%） |
-| 视频内嵌「互动问答」 | 播放中弹出的必答弹窗，会暂停视频并挡住整页 | 配了 DeepSeek 就自动作答；答不了/没配则按平台「跳过」流程关闭，让视频继续 |
-| 图书 | 「开始阅读」按钮 | 逐个点击，点击即上报完成；点开的阅读页随后关闭 |
-| 外链 | 「由此进入」 | 同上点击完成；只在内网可访问时弹的提示会被自动关掉 |
-| 图文/图片/外链课程 | 滚动到视口就算完成 | 逐个滚动到视口触发上报 |
-| 随堂测试 / 认证考试 / 模拟自测 | 考试组件（资源地址指向考试中心） | 走自动答题流程；识别不看组件名，只看资源地址是否指向 `/ote/` |
-| 作业/投票/讨论 | 需要人工填写提交 | **跳过**，课程行标记「⚠ 需人工」，日志列出组件类型，1 秒内结束不占 worker |
-| 拿不到播放地址的视频 | 播放器容器在但一直没有 video 元素 | 判定为不可播，跳过并交由平台判定，不再空转十几分钟 |
-
-这些弹窗（Element UI 的 `.v-modal` 遮罩）会**拦截鼠标点击**，平台侧的「完成学习」按钮会被挡住点不到。
-程序在每次点击前先清弹窗，常规点击仍失败就用 JS 直接触发页面自身的 click 处理并最多重试 3 次，
-所以「平台明明已完成、日志却说未完成还占着 worker」的情况不会再出现。
-
-多个视频在同一页**顺序播放**（不新开标签页，也不同时播）；不同课程页由不同 worker 并行。
-可用的自动化方式只有「加 worker 数」，同一页多开反而会打乱平台按顺序打点的进度统计。
-
-目录项分两种（与页面自身的点击行为一致）：
-
-- **标题页** — 目录项带 `componentList`，点标题直接进课程页。课程包（CoursePackage）也是这一种，
-  里面的小节由播放器顺序播放，不会被当成独立页面去点。
-- **分组标题** — 目录项没有 `componentList` 但挂了子项，点标题只会展开；真正要学的是里面的子页，
-  程序会采集这些子页并按 `/traincamp/study/{campId}/{子页id}` 打开。
-
-启动时会打印目录结构，便于核对采集是否符合预期：
-
-```
-训练营 2045... 目录 · 模块1: AI 基础（分组 4/4 个子页），行业案例研习[标题页]
-训练营 2045...: 目录项 leaf 1、child 4
-```
-
-训练营课程页的视频组件也不止 `cuVideo`/`cuAudio`：`cuCase`（课程包、案例）会渲染同一个阿里播放器，
-但页面不显示学习进度条。程序按 DOM 发现播放器（`#player-con*` 或 `video/audio`），
-进度取「页面组件 videoProgress / 组件 studySchedule / 进度条文本」的最大值作为平台进度，
-本地播放位置只用于判断卡顿；没有进度条的组件同样能正常播放。
-
-如果某个课程页确实没有可播放组件，日志会打印该页的组件类型，便于排查：
-
-```
-[工作线程 1] 训练营 未发现可播放的视频/音频组件（组件类型：cuText、cuComment）
-[工作线程 1] 训练营 本页组件都需要人工完成（cuAssigntask），跳过
-```
+1. 设置浏览器模式、线程数和主题。
+2. 登录课程平台并保存会话。
+3. 选择自动模式或手动模式。
+4. 设置学习目标，或粘贴课程地址。
+5. 开始任务，在仪表盘查看进度和日志。
 
 ### 命令行
 
 ```bash
+# 启动任务
 python3 main.py start
+
+# 后台运行并使用 5 个工作线程
 python3 main.py start --headless --workers 5
-python3 main.py start --exam --deepseek-key sk-xxxx      # 训练营考试自动答题
-python3 main.py start --no-exam                          # 本轮关闭自动答题
+
+# 查看当前累计学时
 python3 main.py hours
 ```
 
-`--exam / --no-exam` 不传时读取界面里保存的配置。
+命令行参数未指定时，会读取图形界面保存的配置。
 
-## 数据文件
+## ⚙️ 配置说明
 
-打包版本数据存于用户数据目录（macOS：`~/Library/Application Support/Moisten`，Windows：`%APPDATA%\Moisten`），源码运行则存于项目目录：
+常用设置包括：
 
-| 文件 | 说明 |
-|------|------|
-| `moisten_config.json` | 运行配置（线程数、无头模式、学习目标、考试自动答题与 DeepSeek 密钥） |
-| `moisten_credentials.json` | 账号（密码存系统钥匙串，此文件仅存混淆兜底） |
-| `moisten_progress.json` | 学习进度和已完成专题班 |
-| `moisten_session.json` | 浏览器会话状态 |
-| `moisten_tags.json` | 标签筛选状态 |
+- **浏览器模式**：使用系统浏览器，或使用 Playwright 管理的内置浏览器。
+- **线程数量**：根据设备性能和网络情况设置并发数量。
+- **学习目标**：支持总目标和差额目标两种方式。
+- **手动课程**：每行输入一个课程、专题或训练页面地址。
+- **AI 辅助**：仅在明确需要时开启，并在设置页配置兼容接口的访问密钥。
+- **外观与动效**：支持浅色、深色和跟随系统，以及减少动效选项。
 
-## 打包
+## 🔐 数据与隐私
 
-GitHub Actions 在推送 `v*` 标签时自动打包 Windows EXE + macOS DMG 并同步发布到 Moisten 仓库：
+- 账号凭据优先保存到系统钥匙串。
+- 运行配置、会话状态和学习进度保存在本机用户数据目录。
+- 访问密钥不会写入 README、日志或源代码；提交代码前请确认没有把本地配置文件加入 Git。
+- 项目不会把学习进度主动上传到第三方服务。
+- 使用 AI 辅助功能时，请根据服务提供方的条款自行判断是否适合提交相关内容。
 
-```bash
-# 手动打包（需先 playwright install chromium 并配置浏览器路径）
-pyinstaller -F -w --icon=icon.ico --add-data="icon.png;." --add-data="VERSION;." --name=Moisten gui.py
+本地数据目录：
+
+| 平台 | 目录 |
+| --- | --- |
+| macOS | `~/Library/Application Support/Moisten` |
+| Windows | `%APPDATA%\\Moisten` |
+| Linux | `~/.config/Moisten` |
+
+## 🧩 项目结构
+
+```text
+silent-rain/
+├── gui.py          # PySide6/QFluentWidgets 图形界面
+├── main.py         # 自动化引擎与命令行入口
+├── ui_theme.py     # 主题、弹窗、导航和共享视觉组件
+├── icon.png        # 应用品牌图标
+├── icon.ico        # Windows 应用图标
+├── setup.sh        # macOS/Linux 安装脚本
+├── requirements.txt
+├── VERSION
+└── CHANGELOG.md
 ```
 
-## 许可证
+## 🛠️ 开发与构建
 
-MIT License
+运行静态检查：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/moisten-pycache python3 -m py_compile gui.py ui_theme.py main.py
+git diff --check
+```
+
+本地构建示例：
+
+```bash
+pyinstaller -F -w \
+  --icon=icon.ico \
+  --add-data="icon.png:." \
+  --add-data="VERSION:." \
+  --name=Moisten gui.py
+```
+
+发布版本由 Git 标签驱动。提交前请同步更新 `VERSION` 与 `CHANGELOG.md`，并确认浅色/深色主题、弹窗、下载更新流程均可用。
+
+## 📝 贡献指南
+
+欢迎通过 Issue 或 Pull Request 提交改进建议。提交前请：
+
+1. 保持功能描述与实际行为一致。
+2. 为新增配置提供默认值和兼容旧配置的处理。
+3. 运行编译检查与 `git diff --check`。
+4. 不提交账号、访问密钥、会话文件或本地运行数据。
+
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE) 开源。

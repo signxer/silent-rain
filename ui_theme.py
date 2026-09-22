@@ -214,7 +214,7 @@ def _stylesheet(t: ThemeTokens) -> str:
     QTableWidget {{ background: transparent; color: {t.text}; border: none; gridline-color: {t.border}; alternate-background-color: {table_alt}; }}
     QTableWidget::item {{ padding: 10px 8px; border-bottom: 1px solid {t.border}; }}
     QTableWidget::item:selected {{ background: {t.accent_soft}; color: {t.text}; }}
-    QHeaderView::section {{ background: {table_header}; color: {t.text_muted}; border: none; padding: 10px 8px; font-weight: 700; }}
+    QHeaderView::section {{ background: {table_header}; color: {t.text_muted}; border: none; padding: 5px 8px; font-weight: 700; }}
     QProgressBar {{ background: {progress_track}; color: {t.text}; border: none; border-radius: 7px; text-align: center; min-height: 14px; max-height: 14px; padding: 0; }}
     QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {progress_start}, stop:0.38 {progress_mid}, stop:0.72 #25BDBD, stop:1 {progress_end}); border-radius: 7px; margin: 0; }}
     QFrame#heroCard {{ background: transparent; border: none; border-radius: 20px; }}
@@ -261,6 +261,33 @@ def style_moisten_dialog(dialog):
         if button is not None:
             button.setObjectName(object_name)
 
+    # QFluentWidgets.Dialog 自带一个窗口标题标签，同时内容区还有一个标题标签。
+    # 隐藏前者，只保留内容标题，避免出现截图中的重复标题和过大的顶部留白。
+    if hasattr(dialog, "setTitleBarVisible"):
+        dialog.setTitleBarVisible(False)
+        window_title = getattr(dialog, "windowTitleLabel", None)
+        if window_title is not None:
+            window_title.hide()
+            window_title.setFixedHeight(0)
+        text_layout = getattr(dialog, "textLayout", None)
+        if text_layout is not None:
+            text_layout.setContentsMargins(24, 18, 24, 8)
+            text_layout.setSpacing(8)
+        button_group = getattr(dialog, "buttonGroup", None)
+        button_layout = getattr(dialog, "buttonLayout", None)
+        if button_group is not None:
+            button_group.setFixedHeight(64)
+        if button_layout is not None:
+            button_layout.setContentsMargins(24, 8, 24, 16)
+            button_layout.setSpacing(10)
+        # Dialog 基类初始化时锁定了默认尺寸；释放后按紧凑布局重新计算，
+        # 只固定高度，保留长更新说明所需的自适应宽度。
+        dialog.setMinimumSize(0, 0)
+        dialog.setMaximumSize(16777215, 16777215)
+        dialog.setMinimumWidth(380)
+        dialog.adjustSize()
+        dialog.setFixedHeight(max(180, dialog.sizeHint().height()))
+
     dialog.setStyleSheet(f"""
         QDialog#moistenDialog {{
             background: {tokens.surface};
@@ -273,7 +300,7 @@ def style_moisten_dialog(dialog):
         QDialog#moistenDialog QLabel#titleLabel,
         QDialog#moistenDialog SubtitleLabel {{
             color: {tokens.text};
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 800;
         }}
         QDialog#moistenDialog QLabel#contentLabel,
@@ -339,6 +366,12 @@ def style_moisten_dialog(dialog):
                 stop:0 {tokens.accent}, stop:1 {tokens.success});
         }}
     """)
+    if hasattr(dialog, "setTitleBarVisible"):
+        # 样式表会改变标题和正文的 sizeHint，再计算一次高度，避免按钮被推到过低位置。
+        dialog.setMinimumHeight(0)
+        dialog.setMaximumHeight(16777215)
+        dialog.adjustSize()
+        dialog.setFixedHeight(max(180, dialog.sizeHint().height()))
 
 
 def apply_theme(app, mode: str = "auto") -> ThemeTokens:
