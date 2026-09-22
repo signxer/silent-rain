@@ -20,11 +20,10 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QFrame,
-    QDialog, QLabel, QGraphicsOpacityEffect,
+    QDialog, QLabel, QGraphicsOpacityEffect, QComboBox, QProgressBar,
 )
 
 from qfluentwidgets import (
-    MSFluentWindow,
     FluentIcon as FIF,
     CardWidget, HeaderCardWidget, SimpleCardWidget,
     PrimaryPushButton, PushButton, ToolButton,
@@ -36,7 +35,11 @@ from qfluentwidgets import (
     TitleLabel, IconWidget,
     InfoBar, InfoBarPosition,
     Dialog,
-    setTheme, Theme,
+)
+
+from ui_theme import (
+    NavigationRail, PageHeader, StepBar, SurfaceCard,
+    apply_theme, normalize_theme_mode,
 )
 
 from main import (
@@ -285,8 +288,13 @@ class WelcomeScreen(QWidget):
         self.lbl_title.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_title)
 
+        version = CaptionLabel(f"v{CURRENT_VERSION} · 青黛润物工作台")
+        version.setObjectName("statusPill")
+        version.setAlignment(Qt.AlignCenter)
+        layout.addWidget(version, 0, Qt.AlignHCenter)
+
         self.lbl_sub = BodyLabel("网络课程自动学习工具 · 随风潜入夜，润物细无声")
-        self.lbl_sub.setStyleSheet("color: #888;")
+        self.lbl_sub.setObjectName("pageSubtitle")
         self.lbl_sub.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_sub)
 
@@ -386,13 +394,8 @@ class ConfigScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        # Title
-        title = TitleLabel("运行配置")
-        layout.addWidget(title)
-
-        subtitle = BodyLabel("设置工作线程数、浏览器模式和考试自动答题")
-        subtitle.setStyleSheet("color: #888;")
-        layout.addWidget(subtitle)
+        layout.addWidget(PageHeader("运行配置", "设置工作线程数、浏览器模式和考试自动答题"))
+        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=0))
 
         layout.addSpacing(10)
 
@@ -414,7 +417,7 @@ class ConfigScreen(QWidget):
         w_layout.addWidget(BodyLabel("个线程"))
         w_layout.addSpacing(16)
         w_hint = CaptionLabel("建议 3-10")
-        w_hint.setStyleSheet("color: #888;")
+        w_hint.setObjectName("muted")
         w_layout.addWidget(w_hint)
         w_layout.addStretch()
         workers_card.viewLayout.addLayout(w_layout)
@@ -465,7 +468,7 @@ class ConfigScreen(QWidget):
 
         # 内置 Chromium 提示：首次使用自动下载（缩进与行对齐，避免拥挤）
         browser_hint = CaptionLabel("  内置 Chromium 首次使用会自动下载（约200MB）；本地 Chrome 无需下载")
-        browser_hint.setStyleSheet("color: #888;")
+        browser_hint.setObjectName("muted")
         browser_hint.setWordWrap(True)
         card_layout.addWidget(browser_hint)
         card_layout.addSpacing(2)
@@ -556,12 +559,55 @@ class ConfigScreen(QWidget):
         exam_hint = CaptionLabel(
             "  开启后，训练营课程页里的「随堂测试」会用 DeepSeek 自动答题并提交；"
             "考试记录只取一次，未通过会记录日志后继续下一门")
-        exam_hint.setStyleSheet("color: #888;")
+        exam_hint.setObjectName("muted")
         exam_hint.setWordWrap(True)
         exam_layout.addWidget(exam_hint)
+        self.lbl_exam_validation = CaptionLabel("")
+        self.lbl_exam_validation.setObjectName("muted")
+        exam_layout.addWidget(self.lbl_exam_validation)
+        self.switch_exam.checkedChanged.connect(self._validate_exam_settings)
+        self.input_api_key.textChanged.connect(lambda: self._validate_exam_settings())
 
         exam_card.viewLayout.addLayout(exam_layout)
         layout.addWidget(exam_card)
+
+        appearance_card = HeaderCardWidget(self)
+        appearance_card.setTitle("外观与动效")
+        appearance_card.setBorderRadius(10)
+        appearance_card.viewLayout.setContentsMargins(24, 8, 24, 16)
+        appearance_layout = QVBoxLayout()
+        appearance_layout.setContentsMargins(0, 0, 0, 0)
+        appearance_layout.setSpacing(12)
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(12)
+        theme_row.addWidget(BodyLabel("主题"))
+        self.combo_theme = QComboBox()
+        self.combo_theme.addItem("跟随系统", "auto")
+        self.combo_theme.addItem("浅色", "light")
+        self.combo_theme.addItem("深色", "dark")
+        saved_theme = normalize_theme_mode(self._saved.get("theme_mode", "auto"))
+        self.combo_theme.setCurrentIndex(self.combo_theme.findData(saved_theme))
+        self.combo_theme.setFixedWidth(150)
+        self.combo_theme.currentIndexChanged.connect(
+            lambda: apply_theme(QApplication.instance(), self.combo_theme.currentData() or "auto"))
+        theme_row.addWidget(self.combo_theme)
+        theme_row.addStretch()
+        appearance_layout.addLayout(theme_row)
+        motion_row = QHBoxLayout()
+        motion_row.setSpacing(12)
+        motion_row.addWidget(BodyLabel("动效"))
+        self.switch_reduced_motion = SwitchButton()
+        self.switch_reduced_motion.setChecked(bool(self._saved.get("reduced_motion", False)))
+        self.switch_reduced_motion.setOnText("减少")
+        self.switch_reduced_motion.setOffText("标准")
+        motion_row.addWidget(self.switch_reduced_motion)
+        motion_hint = CaptionLabel("减少页面切换和进度动画")
+        motion_hint.setObjectName("muted")
+        motion_row.addWidget(motion_hint)
+        motion_row.addStretch()
+        appearance_layout.addLayout(motion_row)
+        appearance_card.viewLayout.addLayout(appearance_layout)
+        layout.addWidget(appearance_card)
 
         layout.addStretch()
 
@@ -575,6 +621,12 @@ class ConfigScreen(QWidget):
         btn_layout.addWidget(self.btn_start)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+
+    def _validate_exam_settings(self):
+        if self.switch_exam.isChecked() and not self.input_api_key.text().strip():
+            self.lbl_exam_validation.setText("开启自动答题后需要填写 DeepSeek API Key；留空则学习时跳过考试。")
+        else:
+            self.lbl_exam_validation.setText("")
 
     def _browse_chrome(self):
         from PySide6.QtWidgets import QFileDialog
@@ -665,6 +717,8 @@ class ConfigScreen(QWidget):
             cfg["deepseek_model"] = model
             cfg["deepseek_thinking"] = thinking
             cfg["deepseek_base_url"] = DEEPSEEK_DEFAULT_BASE_URL
+            cfg["theme_mode"] = self.combo_theme.currentData() or "auto"
+            cfg["reduced_motion"] = self.switch_reduced_motion.isChecked()
             if api_key:
                 cfg["deepseek_api_key"] = obfuscate_secret(api_key)
             elif not exam_enabled:
@@ -682,6 +736,16 @@ class ConfigScreen(QWidget):
         win.cfg_deepseek_api_key = api_key
         win.cfg_deepseek_model = model
         win.cfg_deepseek_thinking = thinking
+        win.cfg_theme_mode = self.combo_theme.currentData() or "auto"
+        win.cfg_reduced_motion = self.switch_reduced_motion.isChecked()
+        apply_theme(QApplication.instance(), win.cfg_theme_mode)
+        if getattr(win, "_in_main_shell", False):
+            win._screen_index = 5
+            win.set_navigation_visible(True)
+            win.navigationInterface.set_active("dashboard")
+            win.switchTo(win.screen_dashboard)
+            win.screen_dashboard.start_learning()
+            return
         win.next_screen()
 
 
@@ -727,12 +791,8 @@ class LoginScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        title = TitleLabel("用户登录")
-        layout.addWidget(title)
-
-        subtitle = BodyLabel("输入统一认证账号密码")
-        subtitle.setStyleSheet("color: #888;")
-        layout.addWidget(subtitle)
+        layout.addWidget(PageHeader("用户登录", "输入统一认证账号密码"))
+        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=1))
 
         layout.addSpacing(10)
 
@@ -803,6 +863,10 @@ class LoginScreen(QWidget):
         if not username:
             InfoBar.warning("提示", "请输入账号", parent=self, position=InfoBarPosition.TOP)
             return
+        if auto and not password:
+            InfoBar.warning("提示", "自动登录需要输入密码", parent=self, position=InfoBarPosition.TOP)
+            self.input_pass.setFocus()
+            return
 
         try:
             from main import AutoLearner
@@ -814,6 +878,7 @@ class LoginScreen(QWidget):
         win.cfg_username = username
         win.cfg_password = password
         win.cfg_auto_login = auto
+        self.lbl_status.setText("账号已保存，正在进入学习设置…")
         win.next_screen()
 
 
@@ -880,12 +945,8 @@ class GoalScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        title = TitleLabel("学习目标")
-        layout.addWidget(title)
-
-        subtitle = BodyLabel("分别设置集中培训和网络自学的学习目标")
-        subtitle.setStyleSheet("color: #888;")
-        layout.addWidget(subtitle)
+        layout.addWidget(PageHeader("学习目标", "分别设置集中培训和网络自学的学习目标"))
+        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=3))
 
         layout.addSpacing(10)
 
@@ -1017,6 +1078,19 @@ class GoalScreen(QWidget):
         self.central_goal_widget.setVisible(self._saved_central_on)
         self.online_goal_widget.setVisible(self._saved_online_on)
 
+        self.lbl_goal_summary = CaptionLabel("")
+        self.lbl_goal_summary.setObjectName("muted")
+        layout.addWidget(self.lbl_goal_summary)
+        for control in (self.switch_central, self.switch_online,
+                        self.spin_central, self.spin_online,
+                        self.radio_central_target, self.radio_central_remain,
+                        self.radio_online_target, self.radio_online_remain):
+            if hasattr(control, "checkedChanged"):
+                control.checkedChanged.connect(lambda *_: self._update_goal_summary())
+            elif hasattr(control, "valueChanged"):
+                control.valueChanged.connect(lambda *_: self._update_goal_summary())
+        self._update_goal_summary()
+
         layout.addStretch()
 
         # 按钮
@@ -1036,6 +1110,16 @@ class GoalScreen(QWidget):
         btn_layout.addWidget(btn_next)
 
         layout.addLayout(btn_layout)
+
+    def _update_goal_summary(self):
+        parts = []
+        if self.switch_central.isChecked() and self.spin_central.value() > 0:
+            mode = "总学时" if self.radio_central_target.isChecked() else "差额补修"
+            parts.append(f"集中培训 · {mode} {self.spin_central.value()} 学时")
+        if self.switch_online.isChecked() and self.spin_online.value() > 0:
+            mode = "总学时" if self.radio_online_target.isChecked() else "差额补修"
+            parts.append(f"网络自学 · {mode} {self.spin_online.value()} 学时")
+        self.lbl_goal_summary.setText("当前选择：" + ("；".join(parts) if parts else "未设置学习目标"))
 
     def _on_next(self):
         central_on = self.switch_central.isChecked()
@@ -1090,16 +1174,12 @@ class ModeScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        title = TitleLabel("选择模式")
-        layout.addWidget(title)
-
-        subtitle = BodyLabel("选择学习方式，后续可在设置中切换")
-        subtitle.setStyleSheet("color: #888;")
-        layout.addWidget(subtitle)
+        layout.addWidget(PageHeader("选择模式", "选择学习方式，后续可在设置中切换"))
+        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=2))
 
         # 当前模式提示（互斥）
         self.lbl_current = CaptionLabel("")
-        self.lbl_current.setStyleSheet("color: #107c10;")
+        self.lbl_current.setObjectName("statusPill")
         layout.addWidget(self.lbl_current)
 
         layout.addSpacing(24)
@@ -1117,7 +1197,7 @@ class ModeScreen(QWidget):
         a_desc.setFixedHeight(30)
         a_layout.addWidget(a_desc)
         a_hint = CaptionLabel("适合：需要完成学时目标的日常挂机学习")
-        a_hint.setStyleSheet("color: #888;")
+        a_hint.setObjectName("muted")
         a_hint.setFixedHeight(24)
         a_layout.addWidget(a_hint)
         a_layout.addSpacing(12)
@@ -1142,7 +1222,7 @@ class ModeScreen(QWidget):
         m_desc.setFixedHeight(30)
         m_layout.addWidget(m_desc)
         m_hint = CaptionLabel("适合：学习特定课程、补学指定内容")
-        m_hint.setStyleSheet("color: #888;")
+        m_hint.setObjectName("muted")
         m_hint.setFixedHeight(24)
         m_layout.addWidget(m_hint)
         m_layout.addSpacing(12)
@@ -1233,12 +1313,8 @@ class ManualScreen(QWidget):
         layout.setSpacing(16)
         layout.setAlignment(Qt.AlignTop)
 
-        title = TitleLabel("手动指定课程")
-        layout.addWidget(title)
-
-        subtitle = BodyLabel("输入专题班、训练营或课程URL，每行一个")
-        subtitle.setStyleSheet("color: #888;")
-        layout.addWidget(subtitle)
+        layout.addWidget(PageHeader("手动指定课程", "输入专题班、训练营或课程 URL，每行一个"))
+        layout.addWidget(StepBar(["配置", "登录", "学习方式", "课程"], active=3))
 
         # URL input card
         input_card = HeaderCardWidget(self)
@@ -1259,8 +1335,12 @@ class ManualScreen(QWidget):
         i_layout.addWidget(self.text_urls)
 
         hint = CaptionLabel("支持专题班、训练营详情页和课程页URL；详情页会自动提取课程")
-        hint.setStyleSheet("color: #888;")
+        hint.setObjectName("muted")
         i_layout.addWidget(hint)
+
+        self.lbl_url_summary = CaptionLabel("等待输入链接")
+        self.lbl_url_summary.setObjectName("muted")
+        i_layout.addWidget(self.lbl_url_summary)
 
         input_card.viewLayout.addLayout(i_layout)
         layout.addWidget(input_card)
@@ -1281,9 +1361,43 @@ class ManualScreen(QWidget):
         btn_start.setIcon(FIF.PLAY)
         btn_start.setFixedSize(140, 40)
         btn_start.clicked.connect(self._on_start)
+        self.btn_start = btn_start
         btn_layout.addWidget(btn_start)
 
         layout.addLayout(btn_layout)
+        self.text_urls.textChanged.connect(self._update_url_summary)
+        self._update_url_summary()
+
+    def _parse_urls(self):
+        lines = [line.strip() for line in self.text_urls.toPlainText().splitlines() if line.strip()]
+        valid = [line for line in lines if "ccb.com" in line and line.startswith(("http://", "https://"))]
+        types = {"专题班": 0, "训练营": 0, "课程页": 0, "未知": 0}
+        for url in valid:
+            if "/trainingcamp/" in url:
+                types["训练营"] += 1
+            elif "/workshop/" in url:
+                types["专题班"] += 1
+            elif "/course/" in url:
+                types["课程页"] += 1
+            else:
+                types["未知"] += 1
+        return lines, valid, types
+
+    def _update_url_summary(self):
+        lines, valid, types = self._parse_urls()
+        invalid = len(lines) - len(valid)
+        if not lines:
+            self.lbl_url_summary.setText("等待输入链接")
+            self.btn_start.setEnabled(False)
+            return
+        parts = [f"已识别 {len(valid)} 个"]
+        for name, count in types.items():
+            if count:
+                parts.append(f"{name} {count}")
+        if invalid:
+            parts.append(f"无效 {invalid}")
+        self.lbl_url_summary.setText(" · ".join(parts))
+        self.btn_start.setEnabled(bool(valid))
 
     def _on_start(self):
         text = self.text_urls.toPlainText().strip()
@@ -1291,7 +1405,7 @@ class ManualScreen(QWidget):
             InfoBar.warning("提示", "请输入至少一个URL", parent=self, position=InfoBarPosition.TOP)
             return
 
-        urls = [line.strip() for line in text.split("\n") if line.strip() and "ccb.com" in line]
+        urls = self._parse_urls()[1]
         if not urls:
             InfoBar.warning("提示", "未识别到有效的课程URL", parent=self, position=InfoBarPosition.TOP)
             return
@@ -1331,10 +1445,16 @@ class DashboardScreen(QWidget):
         self._eta_calc_time = None          # 预估计算时的时间戳
         self._session_start_total = None    # 本次会话起始总学时（用于"本次已学"）
         self._hours_history = []            # 学时趋势点 [(timestamp, total), ...]
+        self._runtime_start = None
+        self._log_collapsed = False
+        self._unread_logs = 0
         # 实时倒计时定时器
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
         self._eta_timer.timeout.connect(self._tick_eta)
+        self._runtime_timer = QTimer(self)
+        self._runtime_timer.setInterval(1000)
+        self._runtime_timer.timeout.connect(self._update_runtime)
         self.update_check_signal.connect(self._on_update_check_result)
         self.update_check_fail_signal.connect(self._on_update_check_fail)
         self._build_ui()
@@ -1347,16 +1467,29 @@ class DashboardScreen(QWidget):
         # Header
         header = QHBoxLayout()
         header.setSpacing(8)
-        title = QLabel(f'润物 Moisten <span style="font-size:12px;color:#888;">v{CURRENT_VERSION}</span>')
+        title = QLabel(f'润物 Moisten <span style="font-size:12px;">v{CURRENT_VERSION}</span>')
         title.setTextFormat(Qt.RichText)
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        title.setObjectName("heroTitle")
         header.addWidget(title)
         header.addStretch()
 
         # Mode indicator
         self.lbl_mode = CaptionLabel("")
-        self.lbl_mode.setStyleSheet("padding: 2px 8px; border-radius: 4px; background: rgba(128,128,128,0.1);")
+        self.lbl_mode.setObjectName("statusPill")
         header.addWidget(self.lbl_mode)
+
+        self.lbl_session_state = CaptionLabel("准备中")
+        self.lbl_session_state.setObjectName("statusPill")
+        header.addWidget(self.lbl_session_state)
+        self.lbl_runtime = CaptionLabel("00:00")
+        self.lbl_runtime.setObjectName("muted")
+        header.addWidget(self.lbl_runtime)
+
+        self.btn_stop = PushButton("停止")
+        self.btn_stop.setIcon(FIF.CLOSE)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop_clicked)
+        header.addWidget(self.btn_stop)
 
         btn_update = ToolButton(FIF.CLOUD)
         btn_update.setToolTip("检查更新")
@@ -1367,7 +1500,24 @@ class DashboardScreen(QWidget):
         btn_settings.setToolTip("设置")
         btn_settings.clicked.connect(lambda: self.window().show_settings())
         header.addWidget(btn_settings)
+        self.btn_log_open = ToolButton(FIF.CHECKBOX)
+        self.btn_log_open.setToolTip("展开日志")
+        self.btn_log_open.clicked.connect(self._toggle_log)
+        header.addWidget(self.btn_log_open)
         layout.addLayout(header)
+
+        self.current_card = SurfaceCard(self, "heroCard")
+        current_layout = QVBoxLayout(self.current_card)
+        current_layout.setContentsMargins(18, 14, 18, 14)
+        current_layout.setSpacing(4)
+        current_layout.addWidget(QLabel("当前任务"))
+        self.lbl_current_task = QLabel("尚未开始学习")
+        self.lbl_current_task.setObjectName("heroTitle")
+        current_layout.addWidget(self.lbl_current_task)
+        self.lbl_current_hint = CaptionLabel("启动后，这里会显示当前 worker 正在处理的课程")
+        self.lbl_current_hint.setObjectName("muted")
+        current_layout.addWidget(self.lbl_current_hint)
+        layout.addWidget(self.current_card)
 
         # Main area: left (info+table) | right (log)
         main_area = QHBoxLayout()
@@ -1402,7 +1552,7 @@ class DashboardScreen(QWidget):
         hl.addWidget(self.lbl_updated)
         # 本次会话已学 + 学时趋势
         self.lbl_session = CaptionLabel("本次已学: -- 学时")
-        self.lbl_session.setStyleSheet("color: #3b82c4;")
+        self.lbl_session.setObjectName("sessionMetric")
         hl.addWidget(self.lbl_session)
         self.sparkline = _Sparkline()
         self.sparkline.setFixedHeight(34)
@@ -1427,7 +1577,7 @@ class DashboardScreen(QWidget):
         self.lbl_goal_info = BodyLabel("--")
         gl_left.addWidget(self.lbl_goal_info)
         self.lbl_eta = CaptionLabel("")
-        self.lbl_eta.setStyleSheet("color: #888;")
+        self.lbl_eta.setObjectName("muted")
         gl_left.addWidget(self.lbl_eta)
         gl_left.addStretch()
         gl.addLayout(gl_left)
@@ -1475,10 +1625,10 @@ class DashboardScreen(QWidget):
         main_area.addLayout(left, 1)
 
         # ── Right panel: log ──
-        log_card = SimpleCardWidget(self)
-        log_card.setBorderRadius(10)
-        log_card.setFixedWidth(320)
-        ll = QVBoxLayout(log_card)
+        self.log_card = SimpleCardWidget(self)
+        self.log_card.setBorderRadius(10)
+        self.log_card.setFixedWidth(320)
+        ll = QVBoxLayout(self.log_card)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
 
@@ -1490,6 +1640,13 @@ class DashboardScreen(QWidget):
         log_header.addWidget(log_icon)
         log_header.addWidget(SubtitleLabel("日志"))
         log_header.addStretch()
+        self.btn_log_toggle = ToolButton(FIF.CHEVRON_RIGHT)
+        self.btn_log_toggle.setToolTip("折叠日志")
+        self.btn_log_toggle.clicked.connect(self._toggle_log)
+        log_header.addWidget(self.btn_log_toggle)
+        self.lbl_log_badge = CaptionLabel("")
+        self.lbl_log_badge.setObjectName("statusPill")
+        log_header.addWidget(self.lbl_log_badge)
         ll.addLayout(log_header)
 
         self.log_view = PlainTextEdit()
@@ -1497,9 +1654,40 @@ class DashboardScreen(QWidget):
         self.log_view.setMaximumBlockCount(500)
         ll.addWidget(self.log_view)
 
-        main_area.addWidget(log_card)
+        main_area.addWidget(self.log_card)
 
         layout.addLayout(main_area, 1)
+        # 当前任务优先；日志在有异常或用户主动展开时占用空间。
+        self._toggle_log()
+
+    def _toggle_log(self):
+        self._log_collapsed = not self._log_collapsed
+        self.log_card.setVisible(not self._log_collapsed)
+        self.log_view.setVisible(not self._log_collapsed)
+        self.btn_log_toggle.setIcon(FIF.LEFT_ARROW if self._log_collapsed else FIF.CHEVRON_RIGHT)
+        self.btn_log_toggle.setToolTip("展开日志" if self._log_collapsed else "折叠日志")
+        self.btn_log_open.setToolTip("展开日志" if self._log_collapsed else "折叠日志")
+        if not self._log_collapsed:
+            self._unread_logs = 0
+            self.lbl_log_badge.setText("")
+
+    def _on_stop_clicked(self):
+        worker = getattr(self, "_worker", None)
+        if not worker or not worker.isRunning():
+            return
+        dlg = Dialog("停止学习", "当前学习任务会在安全检查点停止，已完成进度会保留。", self)
+        dlg.cancelButton.setText("继续学习")
+        dlg.yesButton.setText("停止")
+        if dlg.exec():
+            self.lbl_session_state.setText("停止中")
+            self.btn_stop.setEnabled(False)
+            self._stop_current_learning()
+
+    def _update_runtime(self):
+        if self._runtime_start is None:
+            return
+        elapsed = max(0, int(__import__("time").time() - self._runtime_start))
+        self.lbl_runtime.setText(f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}")
 
     def _stop_current_learning(self):
         """停止正在运行的学习任务（配置变更/重新开始时调用）"""
@@ -1521,10 +1709,19 @@ class DashboardScreen(QWidget):
 
     def start_learning(self):
         # 已有学习线程在运行：先停止旧任务并关闭其浏览器，再用新配置重新开始
+        self._runtime_start = __import__("time").time()
+        self._runtime_timer.start()
+        self.lbl_session_state.setText("初始化")
+        self.lbl_current_task.setText("正在准备学习任务…")
+        self.lbl_current_hint.setText("正在启动浏览器并读取课程列表")
+        self.btn_stop.setEnabled(True)
         # 重置进度环状态（颜色恢复主题色、数值清零）
         self.progress_ring.setValue(0)
         try:
-            self.progress_ring.setCustomBarColor("#0078d4", "#60cdff")
+            tokens = QApplication.instance().property("moisten_tokens")
+            accent = getattr(tokens, "accent", "#087F88")
+            accent_soft = getattr(tokens, "accent_strong", "#63D1D4")
+            self.progress_ring.setCustomBarColor(accent, accent_soft)
         except Exception:
             pass
         old_worker = getattr(self, "_worker", None)
@@ -1553,10 +1750,8 @@ class DashboardScreen(QWidget):
         mode = getattr(win, "cfg_mode", "auto")
         if mode == "manual":
             self.lbl_mode.setText("手动模式")
-            self.lbl_mode.setStyleSheet("padding: 2px 8px; border-radius: 4px; background: rgba(0,120,215,0.15); color: #0078d7;")
         else:
             self.lbl_mode.setText("自动模式")
-            self.lbl_mode.setStyleSheet("padding: 2px 8px; border-radius: 4px; background: rgba(16,124,16,0.15); color: #107c10;")
 
         self._learner = None  # 保存learner引用用于退出时清理
         self._worker = AsyncThread(self._run_learning, self)
@@ -1575,9 +1770,16 @@ class DashboardScreen(QWidget):
 
     def _init_table(self, workers):
         self.table.setRowCount(workers)
+        self._progress_bars = []
         for i in range(workers):
             self.table.setItem(i, 0, QTableWidgetItem("-"))
-            self.table.setItem(i, 1, QTableWidgetItem("-"))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setFormat("%p%")
+            self.table.setCellWidget(i, 1, bar)
+            self._progress_bars.append(bar)
             self.table.setItem(i, 2, QTableWidgetItem("-"))
             self.table.setItem(i, 3, QTableWidgetItem("等待中"))
 
@@ -2142,6 +2344,11 @@ class DashboardScreen(QWidget):
             self.log_view.appendHtml(f'<span style="color:{color};">[{ts}] {safe}</span>')
         else:
             self.log_view.appendHtml(f"[{ts}] {safe}")
+        if self._log_collapsed:
+            self._unread_logs += 1
+            self.lbl_log_badge.setText(str(self._unread_logs))
+        if str(style).lower() in {"red", "yellow"} and self._log_collapsed:
+            self._toggle_log()
 
     def _on_progress(self, data):
         wid = data.get("wid", 0)
@@ -2155,22 +2362,44 @@ class DashboardScreen(QWidget):
             return it
 
         self.table.setItem(wid, 0, _item(data.get("course", "-")))
-        self.table.setItem(wid, 1, _item(data.get("progress", "-")))
+        progress_text = str(data.get("progress", "-"))
+        if wid < len(getattr(self, "_progress_bars", [])):
+            try:
+                pct = max(0, min(100, int(float(progress_text.rstrip("%")))))
+                self._progress_bars[wid].setValue(pct)
+            except (TypeError, ValueError):
+                pass
         self.table.setItem(wid, 2, _item(data.get("eta", "-")))
         status = str(data.get("status", "-"))
+        if status in {"学习中", "加载中", "查找按钮", "考试答题中"}:
+            self.lbl_session_state.setText("学习中")
+        elif "异常" in status or "失败" in status:
+            self.lbl_session_state.setText("需要处理")
+        course = str(data.get("course", "-")).strip()
+        if course and course != "-":
+            self.lbl_current_task.setText(course)
+            self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {data.get('progress', '-')}")
+        tokens = QApplication.instance().property("moisten_tokens")
+        success_color = getattr(tokens, "success", "#2e9e5b")
+        danger_color = getattr(tokens, "danger", "#d64545")
+        accent_color = getattr(tokens, "accent", "#3b82c4")
+        warning_color = getattr(tokens, "warning", "#c99700")
         sc = None
         if any(k in status for k in ("完成", "目标达成")):
-            sc = "#2e9e5b"      # 成功 → 绿
+            sc = success_color      # 成功 → 绿
         elif any(k in status for k in ("异常", "失败", "放弃", "超时")):
-            sc = "#d64545"      # 失败 → 红
+            sc = danger_color      # 失败 → 红
         elif any(k in status for k in ("学习", "加载", "查找")):
-            sc = "#3b82c4"      # 进行中 → 蓝
+            sc = accent_color      # 进行中 → 蓝
         elif any(k in status for k in ("重试", "未找到", "无按钮", "跳过", "退出")):
-            sc = "#c99700"      # 提示 → 黄
+            sc = warning_color      # 提示 → 黄
         self.table.setItem(wid, 3, _item(status, sc))
 
     def _animate_ring(self, target):
         """进度环数值平滑动画（OutCubic，400ms）"""
+        if getattr(self.window(), "cfg_reduced_motion", False):
+            self.progress_ring.setValue(int(target))
+            return
         try:
             anim = QPropertyAnimation(self.progress_ring, b"value", self)
             anim.setDuration(400)
@@ -2183,11 +2412,14 @@ class DashboardScreen(QWidget):
 
     def _on_hours(self, data):
         import time as _time
-        # 学时数值着色（集中蓝 / 网络绿），一眼可读
+        tokens = QApplication.instance().property("moisten_tokens")
+        central_color = getattr(tokens, "accent", "#3b82c4")
+        online_color = getattr(tokens, "success", "#2e9e5b")
+        # 学时数值着色（集中主色 / 网络成功色），一眼可读
         self.lbl_central.setText(
-            f'<span style="color:#3b82c4;">集中培训</span>: {data.get("central", 0):.1f} 学时')
+            f'<span style="color:{central_color};">集中培训</span>: {data.get("central", 0):.1f} 学时')
         self.lbl_online.setText(
-            f'<span style="color:#2e9e5b;">网络自学</span>: {data.get("online", 0):.1f} 学时')
+            f'<span style="color:{online_color};">网络自学</span>: {data.get("online", 0):.1f} 学时')
         self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
 
         # 本次已学 + 学时趋势
@@ -2248,7 +2480,9 @@ class DashboardScreen(QWidget):
             label = "网络自学"
         else:
             self._animate_ring(100)
-            self.progress_ring.setCustomBarColor("#2e9e5b", "#2e9e5b")  # 完成变绿
+            tokens = QApplication.instance().property("moisten_tokens")
+            done_color = getattr(tokens, "success", "#2e9e5b")
+            self.progress_ring.setCustomBarColor(done_color, done_color)  # 完成变绿
             self.lbl_goal_info.setText(f"✓ 全部完成 集中{c_cur:.1f} 网络{o_cur:.1f}")
             self._eta_seconds = None
             self._eta_timer.stop()
@@ -2361,7 +2595,7 @@ class DashboardScreen(QWidget):
         layout.addWidget(info)
 
         hint = CaptionLabel(f"不操作将在 {TIMEOUT} 秒后按「不重考」继续，不阻塞学习")
-        hint.setStyleSheet("color: #888;")
+        hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -2445,6 +2679,11 @@ class DashboardScreen(QWidget):
 
     def _on_done(self, success, failed):
         self._eta_timer.stop()
+        self._runtime_timer.stop()
+        self.btn_stop.setEnabled(False)
+        self.lbl_session_state.setText("已完成" if not failed else "已完成 · 有失败")
+        self.lbl_current_task.setText("本次学习已结束")
+        self.lbl_current_hint.setText(f"成功 {success} 门 · 失败 {failed} 门")
         # 表格标题栏显示汇总
         if success or failed:
             self.lbl_progress_summary.setText(f"成功 {success} · 失败 {failed}")
@@ -2518,7 +2757,7 @@ class DashboardScreen(QWidget):
         outer.addLayout(header)
 
         hint = CaptionLabel("不选则学习全部内容")
-        hint.setStyleSheet("color: #888;")
+        hint.setObjectName("muted")
         outer.addWidget(hint)
 
         # Scroll area with checkboxes
@@ -2764,29 +3003,37 @@ class DashboardScreen(QWidget):
 
 # ─── Main Window ───────────────────────────────────────────────────
 
-if sys.platform == "darwin":
-    from PySide6.QtWidgets import QMainWindow, QStackedWidget
+from PySide6.QtWidgets import QMainWindow
 
-    class _BaseWindow(QMainWindow):
-        """macOS原生窗口：交通灯在左侧，不使用无边框方案"""
-        def __init__(self):
-            super().__init__()
-            self._stack = QStackedWidget()
-            self.setCentralWidget(self._stack)
-        def addSubInterface(self, widget, icon, text, **kw):
-            self._stack.addWidget(widget)
-        def switchTo(self, widget):
-            self._stack.setCurrentWidget(widget)
-        class _NavStub:
-            def hide(self): pass
-            def show(self): pass
-        @property
-        def navigationInterface(self):
-            if not hasattr(self, '_nav'):
-                self._nav = self._NavStub()
-            return self._nav
-else:
-    _BaseWindow = MSFluentWindow
+
+class _BaseWindow(QMainWindow):
+    """跨平台统一应用壳层：原生窗口 + 自定义侧栏 + 页面堆栈。"""
+
+    def __init__(self):
+        super().__init__()
+        self._stack = QStackedWidget()
+        self._nav = NavigationRail(self)
+        self._nav.hide()
+        shell = QWidget(self)
+        shell_layout = QHBoxLayout(shell)
+        shell_layout.setContentsMargins(12, 12, 12, 12)
+        shell_layout.setSpacing(12)
+        shell_layout.addWidget(self._nav)
+        shell_layout.addWidget(self._stack, 1)
+        self.setCentralWidget(shell)
+
+    def addSubInterface(self, widget, icon, text, **kw):
+        self._stack.addWidget(widget)
+
+    def switchTo(self, widget):
+        self._stack.setCurrentWidget(widget)
+
+    @property
+    def navigationInterface(self):
+        return self._nav
+
+    def set_navigation_visible(self, visible: bool):
+        self._nav.setVisible(bool(visible))
 
 
 class MainWindow(_BaseWindow):
@@ -2795,6 +3042,8 @@ class MainWindow(_BaseWindow):
     def switchTo(self, widget):
         """切换到指定页面，附带轻微淡入（仪表盘除外，避免实时刷新闪烁）"""
         super().switchTo(widget)
+        if getattr(self, "cfg_reduced_motion", False):
+            return
         try:
             if isinstance(widget, DashboardScreen):
                 return
@@ -2854,6 +3103,7 @@ class MainWindow(_BaseWindow):
         self.resize(1080, 720)
         self.setMinimumSize(900, 640)
         self._drag_pos = None
+        self._in_main_shell = False
 
         # 设置窗口图标
         icon_path = _get_resource_path("icon.png")
@@ -2879,6 +3129,8 @@ class MainWindow(_BaseWindow):
         self.cfg_tags = []
         self.cfg_mode = "auto"
         self.cfg_manual_urls = []
+        self.cfg_theme_mode = "auto"
+        self.cfg_reduced_motion = False
         # 考试自动答题（DeepSeek）
         self.cfg_exam_enabled = False
         self.cfg_deepseek_api_key = ""
@@ -2897,8 +3149,12 @@ class MainWindow(_BaseWindow):
 
         # 检查是否有保存的配置，有则自动开始
         has_config = self._load_saved_config()
+        apply_theme(QApplication.instance(), getattr(self, "cfg_theme_mode", "auto"))
         if has_config:
             self._screen_index = 5
+            self._in_main_shell = True
+            self.set_navigation_visible(True)
+            self.navigationInterface.set_active("dashboard")
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
         elif os.path.exists(CONFIG_PATH):
@@ -2941,7 +3197,33 @@ class MainWindow(_BaseWindow):
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
 
         self._screen_index = 0
-        self.navigationInterface.hide()
+        self._main_pages = {
+            "dashboard": self.screen_dashboard,
+            "mode": self.screen_mode,
+            "manual": self.screen_manual,
+            "settings": self.screen_config,
+        }
+        self.navigationInterface.add_item("dashboard", FIF.HOME, "仪表盘")
+        self.navigationInterface.add_item("mode", FIF.TILES, "学习方式")
+        self.navigationInterface.add_item("manual", FIF.LINK, "手动学习")
+        self.navigationInterface.add_item("settings", FIF.SETTING, "设置")
+        self.navigationInterface.pageSelected.connect(self._on_navigation)
+        self.set_navigation_visible(False)
+
+    def _on_navigation(self, key):
+        widget = self._main_pages.get(key)
+        if not widget:
+            return
+        if key == "settings":
+            self._screen_index = 1
+        elif key == "mode":
+            self._screen_index = 3
+        elif key == "manual":
+            self._screen_index = 4
+        elif key == "dashboard":
+            self._screen_index = 5
+        self.switchTo(widget)
+        self.navigationInterface.set_active(key)
 
     def _check_update(self):
         """检查是否有新版本（后台线程，避免阻塞GUI）"""
@@ -3213,6 +3495,8 @@ del "%~f0"
                 else:
                     self.cfg_online_goal = cfg["study_goal"]
             self.cfg_tags = cfg.get("selected_tags", [])
+            self.cfg_theme_mode = normalize_theme_mode(cfg.get("theme_mode", "auto"))
+            self.cfg_reduced_motion = bool(cfg.get("reduced_motion", False))
             # 考试自动答题（DeepSeek）
             self.cfg_exam_enabled = bool(cfg.get("exam_enabled", False))
             self.cfg_deepseek_api_key = deobfuscate_secret(cfg.get("deepseek_api_key", ""))
@@ -3281,6 +3565,9 @@ del "%~f0"
                 self.switchTo(self.screen_manual)
         elif self._screen_index == 5:
             # 目标/手动 → 仪表盘，或启动时恢复配置自动进入
+            self._in_main_shell = True
+            self.set_navigation_visible(True)
+            self.navigationInterface.set_active("dashboard")
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
 
@@ -3292,11 +3579,15 @@ del "%~f0"
     def show_mode_screen(self):
         """从手动URL输入返回模式选择"""
         self._screen_index = 3
+        self.set_navigation_visible(self._in_main_shell)
         self.switchTo(self.screen_mode)
 
     def show_settings(self):
         """从仪表盘返回设置界面"""
         self._screen_index = 1
+        self._in_main_shell = True
+        self.set_navigation_visible(True)
+        self.navigationInterface.set_active("settings")
         self.switchTo(self.screen_config)
 
 
@@ -3409,11 +3700,11 @@ def _main():
     font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(font)
 
-    # 全局样式覆盖字体族
+    # 全局字体和青黛主题；具体主题会在读取配置后再次应用。
     app.setStyleSheet(f"* {{ font-family: '{font_family}'; }}")
 
     app.setStyle("Windows")
-    setTheme(Theme.AUTO)
+    apply_theme(app, "auto")
 
     # 设置应用图标（全局生效）
     icon_path = _get_resource_path("icon.png")
