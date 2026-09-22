@@ -6,6 +6,8 @@
 - fix(ui): 训练营任务补充预计时间计算，并调整进度与预计列宽
 - fix(exit): 关闭窗口时取消卡住的 worker asyncio 主任务，确保 Playwright 和学习线程能够退出
 
+# 更新日志
+
 ## 2.2.0
 - feat(ui): 使用 QFluentWidgets 官方 NavigationInterface，侧栏拆分账号、学习、运行、考试和外观设置
 - feat(ui): 学习目标/手动学习根据当前模式动态显示，统一菜单宽度、图标基线和品牌图标展示
