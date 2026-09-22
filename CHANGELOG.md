@@ -1,15 +1,15 @@
 # 更新日志
 
 ## 2.2.4
+- release: v2.2.4 motion and icon fixes
+- chore: VERSION 2.2.2
+- docs: CHANGELOG 2.2.2
+# 更新日志
+
+## 2.2.4
 - fix(build): 从新版品牌 PNG 重新生成多尺寸 Windows ICO，并在 CI 构建前自动同步
 - feat(motion): 增加可中断的进度条平滑过渡与学习背景流体波浪动效
 - feat(motion): 波浪动效同步覆盖当前任务卡，并遵循“减少动效”设置
-
-## 2.2.3
-- release: v2.2.3 dashboard and dialog fixes
-- chore: VERSION 2.2.1
-- docs: CHANGELOG 2.2.1
-# 更新日志
 
 ## 2.2.3
 - fix(dashboard): 修复学习目标进度环动画未更新导致始终显示 0%
@@ -18,17 +18,21 @@
 - docs: 重写 README，补充 Logo、安装、配置、隐私和开发说明
 
 ## 2.2.2
-- fix(ui): 统一退出确认、停止学习、标签选择、版本更新等弹窗的卡片、按钮和深浅主题样式
-
-## 2.2.1
-- release: v2.2.1 shutdown and settings fixes
+- release: v2.2.2 unified dialog styling
+- chore: VERSION 2.2.0
+- docs: CHANGELOG 2.2.0
 # 更新日志
+
+## 2.2.2
+- fix(ui): 统一退出确认、停止学习、标签选择、版本更新等弹窗的卡片、按钮和深浅主题样式
 
 ## 2.2.1
 - fix(ui): 重新排列侧栏设置顺序，统一学习方式页边距并隐藏侧栏设置中的向导步骤条
 - fix(ui): 外观设置改为主题和动效变更即时保存，修复跟随系统时深浅主题混杂
 - fix(ui): 训练营任务补充预计时间计算，并调整进度与预计列宽
 - fix(exit): 关闭窗口时取消卡住的 worker asyncio 主任务，确保 Playwright 和学习线程能够退出
+
+# 更新日志
 
 ## 2.2.0
 - feat(ui): 使用 QFluentWidgets 官方 NavigationInterface，侧栏拆分账号、学习、运行、考试和外观设置
