@@ -1,13 +1,6 @@
 # 更新日志
 
 ## 2.1.0
-- release: v2.1.0 blue-gray UI refresh
-- docs: consolidate v2.0.0 changelog
-- chore: VERSION 2.0.0
-- docs: CHANGELOG 2.0.0
-# 更新日志
-
-## 2.1.0
 - feat(ui): 新增青黛润物设计系统，支持跟随系统、浅色和深色主题
 - feat(ui): 首次使用增加步骤导航，学习中启用统一侧栏工作台
 - feat(仪表盘): 当前任务卡、worker 进度条、运行时长、停止操作和可折叠日志
