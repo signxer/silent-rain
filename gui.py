@@ -9,6 +9,7 @@ import urllib.error
 import platform
 import sys
 import threading
+import math
 from datetime import datetime
 
 from PySide6.QtCore import (
@@ -303,6 +304,14 @@ class _MetricIcon(QWidget):
 class _HeroCard(QFrame):
     """覆盖整张 Hero 卡的冰蓝流体背景。"""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._wave_phase = 0.0
+
+    def set_wave_phase(self, phase):
+        self._wave_phase = float(phase)
+        self.update()
+
     def paintEvent(self, event):
         del event
         p = QPainter(self)
@@ -329,9 +338,14 @@ class _HeroCard(QFrame):
         p.fillPath(card, QBrush(base))
 
         # 波纹覆盖整张卡，但把左侧文字区留在更干净的白色层次中。
+        phase = self._wave_phase
+
+        def wy(base, amplitude=0.012, shift=0.0):
+            return h * (base + amplitude * math.sin(phase * 0.78 + shift))
+
         def wave(start_y, points, color):
             path = QPainterPath()
-            path.moveTo(-24, h * start_y)
+            path.moveTo(-24, wy(start_y, 0.010))
             for x, y, cx1, cy1, cx2, cy2 in points:
                 path.cubicTo(cx1, cy1, cx2, cy2, x, y)
             path.lineTo(w + 24, h + 24)
@@ -340,30 +354,30 @@ class _HeroCard(QFrame):
             p.fillPath(path, QColor(*color))
 
         wave(0.73, [
-            (w * 0.22, h * 0.55, w * 0.06, h * 0.70, w * 0.11, h * 0.82),
-            (w * 0.52, h * 0.74, w * 0.36, h * 0.38, w * 0.42, h * 0.90),
-            (w * 0.78, h * 0.27, w * 0.62, h * 0.62, w * 0.70, h * 0.28),
-            (w + 24, h * 0.10, w * 0.92, h * 0.04, w * 1.02, h * 0.15),
+            (w * 0.22, wy(0.55, 0.016), w * 0.06, wy(0.70, 0.014), w * 0.11, wy(0.82, 0.014, 0.4)),
+            (w * 0.52, wy(0.74, 0.016, 0.8), w * 0.36, wy(0.38, 0.018, 0.3), w * 0.42, wy(0.90, 0.014, 0.5)),
+            (w * 0.78, wy(0.27, 0.014, 1.2), w * 0.62, wy(0.62, 0.016, 0.6), w * 0.70, wy(0.28, 0.014, 0.9)),
+            (w + 24, wy(0.10, 0.010, 1.5), w * 0.92, wy(0.04, 0.010, 1.0), w * 1.02, wy(0.15, 0.012, 1.3)),
         ], (55, 143, 207, 54) if dark else (164, 215, 248, 58))
         wave(0.82, [
-            (w * 0.30, h * 0.70, w * 0.10, h * 0.80, w * 0.19, h * 0.95),
-            (w * 0.60, h * 0.84, w * 0.42, h * 0.56, w * 0.50, h * 0.98),
-            (w * 0.84, h * 0.43, w * 0.70, h * 0.75, w * 0.77, h * 0.42),
-            (w + 24, h * 0.22, w * 0.95, h * 0.13, w * 1.04, h * 0.26),
+            (w * 0.30, wy(0.70, 0.018, 1.0), w * 0.10, wy(0.80, 0.014, 0.6), w * 0.19, wy(0.95, 0.016, 0.8)),
+            (w * 0.60, wy(0.84, 0.016, 1.6), w * 0.42, wy(0.56, 0.018, 1.0), w * 0.50, wy(0.98, 0.014, 1.3)),
+            (w * 0.84, wy(0.43, 0.014, 2.1), w * 0.70, wy(0.75, 0.016, 1.7), w * 0.77, wy(0.42, 0.014, 1.9)),
+            (w + 24, wy(0.22, 0.012, 2.4), w * 0.95, wy(0.13, 0.010, 2.0), w * 1.04, wy(0.26, 0.012, 2.2)),
         ], (31, 124, 170, 42) if dark else (83, 199, 229, 28))
         wave(0.64, [
-            (w * 0.44, h * 0.62, w * 0.22, h * 0.32, w * 0.32, h * 0.80),
-            (w * 0.70, h * 0.34, w * 0.55, h * 0.55, w * 0.61, h * 0.32),
-            (w + 24, h * 0.18, w * 0.84, h * 0.05, w * 0.95, h * 0.20),
+            (w * 0.44, wy(0.62, 0.014, 2.4), w * 0.22, wy(0.32, 0.014, 2.0), w * 0.32, wy(0.80, 0.016, 2.2)),
+            (w * 0.70, wy(0.34, 0.014, 2.9), w * 0.55, wy(0.55, 0.016, 2.5), w * 0.61, wy(0.32, 0.014, 2.7)),
+            (w + 24, wy(0.18, 0.010, 3.2), w * 0.84, wy(0.05, 0.010, 2.8), w * 0.95, wy(0.20, 0.012, 3.0)),
         ], (145, 207, 242, 58) if dark else (255, 255, 255, 132))
 
         # 参考稿中的细白边让波纹显得轻，而不是一块突兀的色块。
         p.setPen(QPen(QColor(142, 207, 245, 135) if dark else QColor(255, 255, 255, 178), 1.4))
         line = QPainterPath()
-        line.moveTo(-16, h * 0.73)
-        line.cubicTo(w * 0.06, h * 0.68, w * 0.15, h * 0.82, w * 0.23, h * 0.55)
-        line.cubicTo(w * 0.38, h * 0.34, w * 0.46, h * 0.83, w * 0.62, h * 0.34)
-        line.cubicTo(w * 0.76, h * 0.08, w * 0.89, h * 0.23, w + 16, h * 0.09)
+        line.moveTo(-16, wy(0.73, 0.010))
+        line.cubicTo(w * 0.06, wy(0.68, 0.012), w * 0.15, wy(0.82, 0.014), w * 0.23, wy(0.55, 0.012))
+        line.cubicTo(w * 0.38, wy(0.34, 0.014), w * 0.46, wy(0.83, 0.014), w * 0.62, wy(0.34, 0.012))
+        line.cubicTo(w * 0.76, wy(0.08, 0.010), w * 0.89, wy(0.23, 0.012), w + 16, wy(0.09, 0.010))
         p.drawPath(line)
         p.setClipping(False)
         p.setPen(QPen(QColor(166, 220, 248, 150) if dark else QColor(255, 255, 255, 220), 1))
@@ -905,6 +919,9 @@ class ConfigScreen(QWidget):
         win = self.window()
         win.cfg_theme_mode = mode
         win.cfg_reduced_motion = reduced_motion
+        dashboard = getattr(win, "screen_dashboard", None)
+        if dashboard is not None and hasattr(dashboard, "set_motion_enabled"):
+            dashboard.set_motion_enabled(not reduced_motion)
         apply_theme(QApplication.instance(), mode)
 
     def _browse_chrome(self):
@@ -1770,6 +1787,8 @@ class DashboardScreen(QWidget):
         self._runtime_start = None
         self._log_collapsed = False
         self._unread_logs = 0
+        self._wave_phase = 0.0
+        self._progress_animations = {}
         # 实时倒计时定时器
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
@@ -1777,9 +1796,40 @@ class DashboardScreen(QWidget):
         self._runtime_timer = QTimer(self)
         self._runtime_timer.setInterval(1000)
         self._runtime_timer.timeout.connect(self._update_runtime)
+        self._wave_timer = QTimer(self)
+        self._wave_timer.setInterval(50)
+        self._wave_timer.timeout.connect(self._advance_wave)
         self.update_check_signal.connect(self._on_update_check_result)
         self.update_check_fail_signal.connect(self._on_update_check_fail)
         self._build_ui()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.set_motion_enabled(not getattr(self.window(), "cfg_reduced_motion", False))
+
+    def hideEvent(self, event):
+        self._wave_timer.stop()
+        super().hideEvent(event)
+
+    def set_motion_enabled(self, enabled):
+        """切换背景流体动效；减少动效时保留静态背景和进度反馈。"""
+        enabled = bool(enabled)
+        if enabled and self.isVisible():
+            if not self._wave_timer.isActive():
+                self._wave_timer.start()
+        else:
+            self._wave_timer.stop()
+        self.update()
+
+    def _advance_wave(self):
+        if getattr(self.window(), "cfg_reduced_motion", False):
+            self._wave_timer.stop()
+            return
+        self._wave_phase = (self._wave_phase + 0.028) % (math.pi * 2)
+        self.update()
+        hero = getattr(self, "current_card", None)
+        if hero is not None and hasattr(hero, "set_wave_phase"):
+            hero.set_wave_phase(self._wave_phase * 0.72)
 
     def paintEvent(self, event):
         """绘制参考稿中的冰蓝底色、柔光和水墨波纹。"""
@@ -1810,6 +1860,11 @@ class DashboardScreen(QWidget):
         teal.setColorAt(1.0, QColor(40, 170, 178, 0) if dark else QColor(144, 231, 222, 0))
         p.fillRect(self.rect(), QBrush(teal))
 
+        phase = self._wave_phase
+
+        def wy(base, amplitude=0.014, shift=0.0):
+            return h * (base + amplitude * math.sin(phase * 0.62 + shift))
+
         def wave(points, color):
             path = QPainterPath()
             path.moveTo(0, points[0][1])
@@ -1821,16 +1876,16 @@ class DashboardScreen(QWidget):
             p.fillPath(path, QColor(*color))
 
         wave([
-            (0, h * 0.74),
-            (w * 0.24, h * 0.67, w * 0.07, h * 0.67, w * 0.14, h * 0.82),
-            (w * 0.48, h * 0.78, w * 0.34, h * 0.61, w * 0.41, h * 0.84),
-            (w, h * 0.64, w * 0.74, h * 0.72, w * 0.86, h * 0.56),
+            (0, wy(0.74, 0.012)),
+            (w * 0.24, wy(0.67, 0.016), w * 0.07, wy(0.67, 0.014), w * 0.14, wy(0.82, 0.014, 0.4)),
+            (w * 0.48, wy(0.78, 0.016, 0.8), w * 0.34, wy(0.61, 0.014, 0.3), w * 0.41, wy(0.84, 0.016, 0.5)),
+            (w, wy(0.64, 0.014, 1.2), w * 0.74, wy(0.72, 0.014, 0.6), w * 0.86, wy(0.56, 0.016, 0.9)),
         ], (44, 106, 157, 48) if dark else (169, 219, 247, 54))
         wave([
-            (0, h * 0.83),
-            (w * 0.25, h * 0.76, w * 0.10, h * 0.78, w * 0.16, h * 0.92),
-            (w * 0.58, h * 0.84, w * 0.36, h * 0.65, w * 0.47, h * 0.92),
-            (w, h * 0.73, w * 0.76, h * 0.72, w * 0.89, h * 0.64),
+            (0, wy(0.83, 0.014, 1.0)),
+            (w * 0.25, wy(0.76, 0.016, 1.4), w * 0.10, wy(0.78, 0.014, 1.0), w * 0.16, wy(0.92, 0.016, 1.2)),
+            (w * 0.58, wy(0.84, 0.016, 1.8), w * 0.36, wy(0.65, 0.014, 1.4), w * 0.47, wy(0.92, 0.016, 1.6)),
+            (w, wy(0.73, 0.014, 2.2), w * 0.76, wy(0.72, 0.014, 1.8), w * 0.89, wy(0.64, 0.016, 2.0)),
         ], (36, 91, 140, 32) if dark else (117, 190, 238, 35))
         # 左下角的纸张颗粒与小点，模拟参考稿的手绘留白。
         p.setPen(Qt.NoPen)
@@ -3025,6 +3080,30 @@ class DashboardScreen(QWidget):
         if str(style).lower() in {"red", "yellow"} and self._log_collapsed:
             self._toggle_log()
 
+    def _animate_progress_bar(self, bar, target, duration=280):
+        """让实时进度变化有明确反馈，同时在减少动效时立即更新。"""
+        target = max(0, min(100, int(target)))
+        if getattr(self.window(), "cfg_reduced_motion", False):
+            bar.setValue(target)
+            return
+        key = id(bar)
+        previous = self._progress_animations.get(key)
+        if previous is not None:
+            try:
+                previous.stop()
+                previous.deleteLater()
+            except RuntimeError:
+                pass
+        if bar.value() == target:
+            return
+        anim = QPropertyAnimation(bar, b"value", bar)
+        anim.setDuration(duration)
+        anim.setStartValue(bar.value())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._progress_animations[key] = anim
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+
     def _on_progress(self, data):
         wid = data.get("wid", 0)
         if wid >= self.table.rowCount():
@@ -3041,12 +3120,12 @@ class DashboardScreen(QWidget):
         if wid < len(getattr(self, "_progress_bars", [])):
             try:
                 pct = max(0, min(100, int(float(progress_text.rstrip("%")))))
-                self._progress_bars[wid].setValue(pct)
+                self._animate_progress_bar(self._progress_bars[wid], pct)
                 if wid < len(getattr(self, "_progress_labels", [])):
                     self._progress_labels[wid].setText(f"{pct}%")
                 if wid == 0:
-                    self.current_progress.setValue(pct)
-                    self.goal_progress.setValue(pct)
+                    self._animate_progress_bar(self.current_progress, pct)
+                    self._animate_progress_bar(self.goal_progress, pct)
             except (TypeError, ValueError):
                 pass
         status = str(data.get("status", "-"))
