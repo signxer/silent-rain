@@ -15,18 +15,22 @@ from PySide6.QtCore import (
     Qt, QThread, Signal, QSize, QTimer, QEventLoop,
     QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve,
 )
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (
+    QColor, QIcon, QPainter, QPainterPath, QPen, QBrush,
+    QLinearGradient, QRadialGradient, QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QFrame,
-    QDialog, QLabel, QGraphicsOpacityEffect, QComboBox, QProgressBar,
+    QDialog, QLabel, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
+    QComboBox, QProgressBar,
 )
 
 from qfluentwidgets import (
     FluentIcon as FIF,
     CardWidget, HeaderCardWidget, SimpleCardWidget,
-    PrimaryPushButton, PushButton, ToolButton,
+    PrimaryPushButton, PushButton, ToolButton, TransparentToolButton,
     LineEdit, PasswordLineEdit, SpinBox, SwitchButton,
     RadioButton, CheckBox,
     TableWidget, ProgressBar, ProgressRing,
@@ -40,7 +44,7 @@ from qfluentwidgets import (
 
 from ui_theme import (
     BrandNavigationWidget, PageHeader, StepBar, SurfaceCard,
-    apply_theme, normalize_theme_mode,
+    apply_theme, normalize_theme_mode, style_moisten_dialog,
 )
 
 from main import (
@@ -48,6 +52,13 @@ from main import (
     DEEPSEEK_DEFAULT_BASE_URL, DEEPSEEK_DEFAULT_MODEL, DeepSeekClient,
     obfuscate_secret, deobfuscate_secret,
 )
+
+
+def _is_dark_theme():
+    app = QApplication.instance()
+    if app is None:
+        return False
+    return app.palette().color(QPalette.Window).lightness() < 128
 
 
 # ─── Async Thread ──────────────────────────────────────────────────
@@ -147,12 +158,14 @@ class _Sparkline(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
+        dark = _is_dark_theme()
         if w < 10 or h < 10:
             return
         lo, hi = min(self._points), max(self._points)
         span = (hi - lo) or 1.0
         n = len(self._points)
-        p.setPen(QPen(QColor("#3b82c4"), 1.5))
+        line_color = QColor("#72B9FF") if _is_dark_theme() else QColor("#3b82c4")
+        p.setPen(QPen(line_color, 1.5))
         path = QPainterPath()
         for i, v in enumerate(self._points):
             x = i / max(1, n - 1) * (w - 6) + 3
@@ -166,8 +179,194 @@ class _Sparkline(QWidget):
         lx = (n - 1) / max(1, n - 1) * (w - 6) + 3
         ly = h - 3 - (self._points[-1] - lo) / span * (h - 6)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#3b82c4"))
+        p.setBrush(line_color)
         p.drawEllipse(int(lx) - 2, int(ly) - 2, 5, 5)
+        p.end()
+
+
+class _GoalRing(QWidget):
+    """仪表盘目标环：用轻量 QPainter 绘制，保证浅色/离屏渲染一致。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = 0
+        self._track_color = QColor("#E2E7EF")
+        self._bar_color = QColor("#1976F3")
+        self.setMinimumSize(80, 80)
+
+    def value(self):
+        return self._value
+
+    def setValue(self, value):
+        self._value = max(0, min(100, int(value)))
+        self.update()
+
+    def setCustomBarColor(self, primary, secondary=None):
+        self._bar_color = QColor(primary)
+        self.update()
+
+    def setTextVisible(self, visible):
+        # 与 QFluentWidgets.ProgressRing 保持兼容；本实现始终显示百分比。
+        del visible
+
+    def paintEvent(self, event):
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = _is_dark_theme()
+        margin = 11
+        diameter = min(self.width(), self.height()) - margin * 2
+        rect = (self.width() - diameter) / 2, (self.height() - diameter) / 2, diameter, diameter
+        track_color = QColor("#3D4D65") if dark else self._track_color
+        bar_color = QColor("#61C6FF") if dark and self._bar_color.name().lower() == "#1976f3" else self._bar_color
+        text_color = QColor("#F4F7FF") if dark else QColor("#17213D")
+        p.setPen(QPen(track_color, 8, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(*[int(v) for v in rect], 0, 360 * 16)
+        p.setPen(QPen(bar_color, 8, Qt.SolidLine, Qt.RoundCap))
+        if self._value:
+            p.drawArc(*[int(v) for v in rect], 90 * 16, -int(self._value * 360 * 16 / 100))
+        p.setPen(text_color)
+        font = p.font()
+        font.setPointSize(16)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(self.rect(), Qt.AlignCenter, f"{self._value}%")
+        p.end()
+
+
+class _MetricIcon(QWidget):
+    """参考稿里的彩色线性图标，避免 QFluent 默认图标抢走视觉重点。"""
+
+    def __init__(self, kind="bars", color="#2B83F6", parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.color = QColor(color)
+        self.setFixedSize(28, 28)
+
+    def paintEvent(self, event):
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(self.color, 2.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        w, h = self.width(), self.height()
+        if self.kind == "clock":
+            p.drawEllipse(4, 4, 20, 20)
+            p.drawLine(14, 14, 14, 8)
+            p.drawLine(14, 14, 19, 17)
+        elif self.kind == "cap":
+            p.setBrush(QBrush(self.color))
+            cap = QPainterPath()
+            cap.moveTo(3, 11)
+            cap.lineTo(14, 5)
+            cap.lineTo(25, 11)
+            cap.lineTo(14, 17)
+            cap.closeSubpath()
+            p.drawPath(cap)
+            p.drawLine(7, 14, 7, 20)
+            p.drawArc(7, 14, 14, 10, 180 * 16, 180 * 16)
+        elif self.kind == "laptop":
+            p.setBrush(QBrush(self.color))
+            p.drawRoundedRect(5, 5, 18, 14, 2, 2)
+            p.drawLine(3, 22, 25, 22)
+            p.drawLine(9, 22, 10, 19)
+            p.drawLine(19, 22, 18, 19)
+        elif self.kind == "ribbon":
+            p.setBrush(QBrush(self.color))
+            p.drawRoundedRect(7, 4, 14, 19, 3, 3)
+            p.setPen(QPen(QColor("#FFFFFF"), 1.5, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(14, 8, 14, 15)
+            p.drawLine(10.5, 11.5, 17.5, 11.5)
+        elif self.kind == "target":
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(3, 3, 22, 22)
+            p.drawEllipse(8, 8, 12, 12)
+            p.setBrush(QBrush(self.color))
+            p.drawEllipse(12, 12, 4, 4)
+        elif self.kind == "book":
+            p.setBrush(QBrush(self.color))
+            p.drawRoundedRect(4, 5, 9, 18, 2, 2)
+            p.drawRoundedRect(15, 5, 9, 18, 2, 2)
+            p.setPen(QPen(QColor("#FFFFFF"), 1.2))
+            p.drawLine(14, 6, 14, 23)
+        else:  # bars
+            p.setBrush(QBrush(self.color))
+            p.drawRoundedRect(4, 16, 4, 8, 2, 2)
+            p.drawRoundedRect(11, 10, 4, 14, 2, 2)
+            p.drawRoundedRect(18, 4, 4, 20, 2, 2)
+        p.end()
+
+
+class _HeroCard(QFrame):
+    """覆盖整张 Hero 卡的冰蓝流体背景。"""
+
+    def paintEvent(self, event):
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if w < 2 or h < 2:
+            p.end()
+            return
+
+        card = QPainterPath()
+        card.addRoundedRect(0.5, 0.5, w - 1, h - 1, 20, 20)
+        p.setClipPath(card)
+
+        dark = _is_dark_theme()
+        base = QLinearGradient(0, 0, w, h)
+        if dark:
+            base.setColorAt(0.0, QColor(25, 39, 60, 250))
+            base.setColorAt(0.52, QColor(27, 48, 72, 245))
+            base.setColorAt(1.0, QColor(28, 61, 87, 245))
+        else:
+            base.setColorAt(0.0, QColor(255, 255, 255, 245))
+            base.setColorAt(0.52, QColor(246, 252, 255, 238))
+            base.setColorAt(1.0, QColor(226, 244, 255, 238))
+        p.fillPath(card, QBrush(base))
+
+        # 波纹覆盖整张卡，但把左侧文字区留在更干净的白色层次中。
+        def wave(start_y, points, color):
+            path = QPainterPath()
+            path.moveTo(-24, h * start_y)
+            for x, y, cx1, cy1, cx2, cy2 in points:
+                path.cubicTo(cx1, cy1, cx2, cy2, x, y)
+            path.lineTo(w + 24, h + 24)
+            path.lineTo(-24, h + 24)
+            path.closeSubpath()
+            p.fillPath(path, QColor(*color))
+
+        wave(0.73, [
+            (w * 0.22, h * 0.55, w * 0.06, h * 0.70, w * 0.11, h * 0.82),
+            (w * 0.52, h * 0.74, w * 0.36, h * 0.38, w * 0.42, h * 0.90),
+            (w * 0.78, h * 0.27, w * 0.62, h * 0.62, w * 0.70, h * 0.28),
+            (w + 24, h * 0.10, w * 0.92, h * 0.04, w * 1.02, h * 0.15),
+        ], (55, 143, 207, 54) if dark else (164, 215, 248, 58))
+        wave(0.82, [
+            (w * 0.30, h * 0.70, w * 0.10, h * 0.80, w * 0.19, h * 0.95),
+            (w * 0.60, h * 0.84, w * 0.42, h * 0.56, w * 0.50, h * 0.98),
+            (w * 0.84, h * 0.43, w * 0.70, h * 0.75, w * 0.77, h * 0.42),
+            (w + 24, h * 0.22, w * 0.95, h * 0.13, w * 1.04, h * 0.26),
+        ], (31, 124, 170, 42) if dark else (83, 199, 229, 28))
+        wave(0.64, [
+            (w * 0.44, h * 0.62, w * 0.22, h * 0.32, w * 0.32, h * 0.80),
+            (w * 0.70, h * 0.34, w * 0.55, h * 0.55, w * 0.61, h * 0.32),
+            (w + 24, h * 0.18, w * 0.84, h * 0.05, w * 0.95, h * 0.20),
+        ], (145, 207, 242, 58) if dark else (255, 255, 255, 132))
+
+        # 参考稿中的细白边让波纹显得轻，而不是一块突兀的色块。
+        p.setPen(QPen(QColor(142, 207, 245, 135) if dark else QColor(255, 255, 255, 178), 1.4))
+        line = QPainterPath()
+        line.moveTo(-16, h * 0.73)
+        line.cubicTo(w * 0.06, h * 0.68, w * 0.15, h * 0.82, w * 0.23, h * 0.55)
+        line.cubicTo(w * 0.38, h * 0.34, w * 0.46, h * 0.83, w * 0.62, h * 0.34)
+        line.cubicTo(w * 0.76, h * 0.08, w * 0.89, h * 0.23, w + 16, h * 0.09)
+        p.drawPath(line)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(166, 220, 248, 150) if dark else QColor(255, 255, 255, 220), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(0.5, 0.5, w - 1, h - 1, 20, 20)
         p.end()
 
 
@@ -1365,6 +1564,7 @@ class ModeScreen(QWidget):
         dlg = Dialog("切换模式",
                      f"切换到{'自动模式' if mode == 'auto' else '手动模式'}将清空{other}的{loss}，确定继续？",
                      win)
+        style_moisten_dialog(dlg)
         dlg.cancelButton.setText("取消")
         dlg.yesButton.setText("确定")
         if not dlg.exec():
@@ -1579,183 +1779,401 @@ class DashboardScreen(QWidget):
         self.update_check_fail_signal.connect(self._on_update_check_fail)
         self._build_ui()
 
+    def paintEvent(self, event):
+        """绘制参考稿中的冰蓝底色、柔光和水墨波纹。"""
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        dark = _is_dark_theme()
+        base = QLinearGradient(0, 0, w, h)
+        if dark:
+            base.setColorAt(0.0, QColor("#111827"))
+            base.setColorAt(0.48, QColor("#152439"))
+            base.setColorAt(1.0, QColor("#162D43"))
+        else:
+            base.setColorAt(0.0, QColor("#F8FCFF"))
+            base.setColorAt(0.48, QColor("#EEF8FD"))
+            base.setColorAt(1.0, QColor("#E8F4FA"))
+        p.fillRect(self.rect(), QBrush(base))
+
+        # 顶部的蓝色冷光与右侧青色光晕
+        glow = QRadialGradient(w * 0.43, h * 0.13, max(w, h) * 0.42)
+        glow.setColorAt(0.0, QColor(53, 126, 205, 76) if dark else QColor(184, 225, 255, 118))
+        glow.setColorAt(0.7, QColor(65, 145, 214, 20) if dark else QColor(220, 244, 255, 28))
+        glow.setColorAt(1.0, QColor(65, 145, 214, 0) if dark else QColor(220, 244, 255, 0))
+        p.fillRect(self.rect(), QBrush(glow))
+        teal = QRadialGradient(w * 0.83, h * 0.36, max(w, h) * 0.27)
+        teal.setColorAt(0.0, QColor(40, 170, 178, 34) if dark else QColor(144, 231, 222, 52))
+        teal.setColorAt(1.0, QColor(40, 170, 178, 0) if dark else QColor(144, 231, 222, 0))
+        p.fillRect(self.rect(), QBrush(teal))
+
+        def wave(points, color):
+            path = QPainterPath()
+            path.moveTo(0, points[0][1])
+            for x, y, cx1, cy1, cx2, cy2 in points[1:]:
+                path.cubicTo(cx1, cy1, cx2, cy2, x, y)
+            path.lineTo(w, h)
+            path.lineTo(0, h)
+            path.closeSubpath()
+            p.fillPath(path, QColor(*color))
+
+        wave([
+            (0, h * 0.74),
+            (w * 0.24, h * 0.67, w * 0.07, h * 0.67, w * 0.14, h * 0.82),
+            (w * 0.48, h * 0.78, w * 0.34, h * 0.61, w * 0.41, h * 0.84),
+            (w, h * 0.64, w * 0.74, h * 0.72, w * 0.86, h * 0.56),
+        ], (44, 106, 157, 48) if dark else (169, 219, 247, 54))
+        wave([
+            (0, h * 0.83),
+            (w * 0.25, h * 0.76, w * 0.10, h * 0.78, w * 0.16, h * 0.92),
+            (w * 0.58, h * 0.84, w * 0.36, h * 0.65, w * 0.47, h * 0.92),
+            (w, h * 0.73, w * 0.76, h * 0.72, w * 0.89, h * 0.64),
+        ], (36, 91, 140, 32) if dark else (117, 190, 238, 35))
+        # 左下角的纸张颗粒与小点，模拟参考稿的手绘留白。
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(94, 157, 211, 35) if dark else QColor(92, 165, 222, 42))
+        for x, y, r in ((26, h - 78, 2), (42, h - 56, 1), (56, h - 101, 2),
+                        (72, h - 68, 1), (96, h - 42, 2), (118, h - 82, 1)):
+            p.drawEllipse(x, y, r * 2, r * 2)
+        p.end()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_slogan()
+
+    def _place_slogan(self):
+        """让 slogan 固定贴在工具栏上方，避免被垂直布局越推越远。"""
+        slogan = getattr(self, "_slogan", None)
+        toolbar = getattr(self, "_toolbar", None)
+        button = getattr(self, "btn_stop", None)
+        if slogan is None or toolbar is None or button is None:
+            return
+        toolbar_rect = toolbar.geometry()
+        button_top = toolbar_rect.top() + button.geometry().top()
+        # 以工作区右侧内容边界为锚点，和最右侧文档图标保持同一条右边界。
+        x = self.width() - 28 - slogan.width()
+        y = button_top - slogan.height() - 6
+        slogan.move(max(0, x), max(0, y))
+        slogan.raise_()
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        # 背景仍由 DashboardScreen 铺满工作区，内容卡片保留参考稿中的呼吸边距。
+        layout.setContentsMargins(28, 28, 28, 8)
+        layout.setSpacing(16)
 
-        # Header
+        def icon_box(kind, color="#2B83F6"):
+            box = QFrame(self)
+            box.setObjectName("cardIcon")
+            box.setFixedSize(36, 36)
+            box_layout = QHBoxLayout(box)
+            box_layout.setContentsMargins(4, 4, 4, 4)
+            box_layout.setAlignment(Qt.AlignCenter)
+            icon_widget = _MetricIcon(kind, color, box)
+            box_layout.addWidget(icon_widget, 0, Qt.AlignCenter)
+            return box
+
+        def add_shadow(widget, blur=28, offset_y=8, alpha=36):
+            effect = QGraphicsDropShadowEffect(widget)
+            effect.setBlurRadius(blur)
+            effect.setOffset(0, offset_y)
+            effect.setColor(QColor(0, 0, 0, 75 if _is_dark_theme() else alpha))
+            widget.setGraphicsEffect(effect)
+
+        def text_label(text, object_name):
+            label = QLabel(text, self)
+            label.setObjectName(object_name)
+            return label
+
+        def toolbar_divider():
+            divider = QFrame(self)
+            divider.setFixedSize(1, 26)
+            divider.setStyleSheet(
+                f"background: {'#34465D' if _is_dark_theme() else '#D9E5EF'}; border: none;"
+            )
+            return divider
+
+        # 顶部品牌标题与会话工具栏。slogan 作为独立浮层贴在工具栏上方，
+        # 这样可以精确控制它与按钮的留白。
+        header_wrap = QVBoxLayout()
+        header_wrap.setContentsMargins(0, 0, 0, 0)
+        header_wrap.setSpacing(0)
+
         header = QHBoxLayout()
-        header.setSpacing(8)
-        title = QLabel(f'润物 Moisten <span style="font-size:12px;">v{CURRENT_VERSION}</span>')
+        header.setSpacing(12)
+        intro = QVBoxLayout()
+        intro.setSpacing(2)
+        greeting = QLabel("专注学习 · 持续成长")
+        greeting.setObjectName("dashboardGreeting")
+        intro.addWidget(greeting)
+        title = QLabel(f"润物 Moisten <span style='font-size:14px; color:#91A9C2;'>v{CURRENT_VERSION}</span>")
         title.setTextFormat(Qt.RichText)
-        title.setObjectName("heroTitle")
-        header.addWidget(title)
+        title.setObjectName("dashboardTitle")
+        intro.addWidget(title)
+        subtitle = QLabel("")
+        subtitle.setObjectName("dashboardSubtitle")
+        subtitle.setFixedHeight(2)
+        header.addLayout(intro)
         header.addStretch()
 
-        # Mode indicator
+        # 工具栏整体略向下，并与左侧标题区域的底边对齐。
+        toolbar = QWidget(self)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(0, 8, 0, 0)
+        toolbar_layout.setSpacing(12)
+
         self.lbl_mode = CaptionLabel("")
         self.lbl_mode.setObjectName("statusPill")
-        header.addWidget(self.lbl_mode)
-
+        self.lbl_mode.setFixedHeight(38)
+        toolbar_layout.addWidget(self.lbl_mode)
         self.lbl_session_state = CaptionLabel("准备中")
         self.lbl_session_state.setObjectName("statusPill")
-        header.addWidget(self.lbl_session_state)
-        self.lbl_runtime = CaptionLabel("00:00")
-        self.lbl_runtime.setObjectName("muted")
-        header.addWidget(self.lbl_runtime)
+        self.lbl_session_state.setProperty("success", True)
+        self.lbl_session_state.setFixedHeight(38)
+        toolbar_layout.addWidget(self.lbl_session_state)
+        self.lbl_runtime = CaptionLabel("00:00:00")
+        self.lbl_runtime.setObjectName("runtime")
+        self.lbl_runtime.setAlignment(Qt.AlignCenter)
+        self.lbl_runtime.setFixedWidth(76)
+        toolbar_layout.addWidget(self.lbl_runtime)
+        toolbar_layout.addWidget(toolbar_divider())
 
-        self.btn_stop = PushButton("停止")
-        self.btn_stop.setIcon(FIF.CLOSE)
+        self.btn_stop = TransparentToolButton(self)
+        self.btn_stop.setObjectName("topIconButton")
+        self.btn_stop.setIcon(FIF.PAUSE)
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setIconSize(QSize(22, 22))
+        self.btn_stop.setFixedSize(42, 40)
+        self.btn_stop.setToolTip("停止学习")
         self.btn_stop.clicked.connect(self._on_stop_clicked)
-        header.addWidget(self.btn_stop)
+        toolbar_layout.addWidget(self.btn_stop)
+        toolbar_layout.addWidget(toolbar_divider())
 
-        btn_update = ToolButton(FIF.CLOUD)
+        btn_update = TransparentToolButton(self)
+        btn_update.setObjectName("topIconButton")
+        btn_update.setIcon(FIF.CLOUD)
+        btn_update.setIconSize(QSize(22, 22))
+        btn_update.setFixedSize(42, 40)
         btn_update.setToolTip("检查更新")
         btn_update.clicked.connect(self._check_update_manual)
-        header.addWidget(btn_update)
-
-        self.btn_log_open = ToolButton(FIF.DOCUMENT)
+        toolbar_layout.addWidget(btn_update)
+        toolbar_layout.addWidget(toolbar_divider())
+        self.btn_log_open = TransparentToolButton(self)
+        self.btn_log_open.setObjectName("topIconButton")
+        self.btn_log_open.setIcon(FIF.DOCUMENT)
+        self.btn_log_open.setIconSize(QSize(22, 22))
+        self.btn_log_open.setFixedSize(42, 40)
         self.btn_log_open.setToolTip("展开日志")
         self.btn_log_open.clicked.connect(self._toggle_log)
-        header.addWidget(self.btn_log_open)
-        layout.addLayout(header)
+        toolbar_layout.addWidget(self.btn_log_open)
+        header.addWidget(toolbar, 0, Qt.AlignBottom)
+        header_wrap.addLayout(header)
+        layout.addLayout(header_wrap)
+        self._toolbar = toolbar
+        self._slogan = QLabel("让知识，如水般滋养成长", self)
+        self._slogan.setObjectName("slogan")
+        self._slogan.adjustSize()
+        QTimer.singleShot(0, self._place_slogan)
 
-        self.current_card = SurfaceCard(self, "heroCard")
-        current_layout = QVBoxLayout(self.current_card)
-        current_layout.setContentsMargins(18, 14, 18, 14)
-        current_layout.setSpacing(4)
-        current_layout.addWidget(QLabel("当前任务"))
+        # 当前任务 Hero 卡：进度条与可识别的课程意象
+        self.current_card = _HeroCard(self)
+        self.current_card.setObjectName("heroCard")
+        hero_layout = QHBoxLayout(self.current_card)
+        hero_layout.setContentsMargins(24, 20, 20, 20)
+        hero_layout.setSpacing(18)
+        hero_layout.addWidget(icon_box("book", "#256BD3"))
+        hero_text = QVBoxLayout()
+        hero_text.setSpacing(7)
+        kicker = QLabel("当前任务")
+        kicker.setObjectName("heroKicker")
+        hero_text.addWidget(kicker)
         self.lbl_current_task = QLabel("尚未开始学习")
         self.lbl_current_task.setObjectName("heroTitle")
-        current_layout.addWidget(self.lbl_current_task)
-        self.lbl_current_hint = CaptionLabel("启动后，这里会显示当前 worker 正在处理的课程")
-        self.lbl_current_hint.setObjectName("muted")
-        current_layout.addWidget(self.lbl_current_hint)
+        self.lbl_current_task.setWordWrap(True)
+        hero_text.addWidget(self.lbl_current_task)
+        self.lbl_current_hint = QLabel("启动后，这里会显示当前 worker 正在处理的课程")
+        self.lbl_current_hint.setObjectName("heroHint")
+        hero_text.addWidget(self.lbl_current_hint)
+        self.current_progress = QProgressBar(self)
+        self.current_progress.setRange(0, 100)
+        self.current_progress.setValue(0)
+        self.current_progress.setFormat("%p%")
+        self.current_progress.setFixedHeight(18)
+        # 参考稿的 Hero 卡只保留任务信息，进度条放在“学习目标”卡内。
+        self.current_progress.setVisible(False)
+        hero_layout.addLayout(hero_text, 1)
+
+        hero_art = QFrame(self.current_card)
+        hero_art.setObjectName("heroArt")
+        hero_art.setFixedWidth(360)
+        art_layout = QVBoxLayout(hero_art)
+        art_layout.setContentsMargins(22, 18, 22, 18)
+        art_layout.setSpacing(3)
+        art_label = QLabel("在真实的场景中")
+        art_label.setObjectName("heroTitle")
+        art_layout.addWidget(art_label)
+        art_hint = QLabel("遇见更大的可能")
+        art_hint.setObjectName("heroHint")
+        art_layout.addWidget(art_hint)
+        art_layout.addStretch()
+        hero_layout.addWidget(hero_art)
         layout.addWidget(self.current_card)
+        add_shadow(self.current_card, blur=30, offset_y=10, alpha=42)
 
-        # Main area: left (info+table) | right (log)
+        # Main area: 信息卡片 + 进度表，日志仍保留为可折叠侧栏
         main_area = QHBoxLayout()
-        main_area.setSpacing(10)
-
-        # ── Left panel ──
+        main_area.setSpacing(16)
         left = QVBoxLayout()
-        left.setSpacing(10)
-
-        # Row 1: hours + goal side by side
+        left.setSpacing(16)
         info_row = QHBoxLayout()
-        info_row.setSpacing(10)
+        info_row.setSpacing(16)
 
-        hours_card = SimpleCardWidget(self)
-        hours_card.setBorderRadius(10)
+        hours_card = SurfaceCard(self)
         hl = QVBoxLayout(hours_card)
-        hl.setContentsMargins(16, 14, 16, 14)
-        hl.setSpacing(8)
+        hl.setContentsMargins(20, 18, 20, 16)
+        hl.setSpacing(12)
         hl_title = QHBoxLayout()
-        hl_title.setSpacing(6)
-        hl_icon = IconWidget(FIF.PEOPLE, self)
-        hl_icon.setFixedSize(16, 16)
-        hl_title.addWidget(hl_icon)
-        hl_title.addWidget(SubtitleLabel("培训学时"))
+        hl_title.addWidget(icon_box("clock", "#2B83F6"))
+        hl_title.addWidget(text_label("训练学时", "cardTitle"))
         hl_title.addStretch()
+        self.lbl_updated = CaptionLabel("更新: --")
+        self.lbl_updated.setObjectName("cardMeta")
+        hl_title.addWidget(self.lbl_updated)
         hl.addLayout(hl_title)
-        self.lbl_central = BodyLabel("集中培训: -- 学时")
-        self.lbl_online = BodyLabel("网络自学: -- 学时")
-        self.lbl_updated = CaptionLabel("更新时间: --")
-        hl.addWidget(self.lbl_central)
-        hl.addWidget(self.lbl_online)
-        hl.addWidget(self.lbl_updated)
-        # 本次会话已学 + 学时趋势
-        self.lbl_session = CaptionLabel("本次已学: -- 学时")
-        self.lbl_session.setObjectName("sessionMetric")
-        hl.addWidget(self.lbl_session)
-        self.sparkline = _Sparkline()
-        self.sparkline.setFixedHeight(34)
-        hl.addWidget(self.sparkline)
-        info_row.addWidget(hours_card, 1)
 
-        goal_card = SimpleCardWidget(self)
-        goal_card.setBorderRadius(10)
+        metrics = QHBoxLayout()
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setSpacing(0)
+
+        def metric_column(kind, color, label, value_widget):
+            col = QVBoxLayout()
+            col.setAlignment(Qt.AlignCenter)
+            col.setSpacing(5)
+            col.addWidget(_MetricIcon(kind, color, self), 0, Qt.AlignHCenter)
+            caption = QLabel(label)
+            caption.setObjectName("metricLabel")
+            caption.setAlignment(Qt.AlignCenter)
+            col.addWidget(caption)
+            value_widget.setAlignment(Qt.AlignCenter)
+            value_widget.setObjectName("metricText")
+            value_widget.setWordWrap(True)
+            col.addWidget(value_widget)
+            return col
+
+        self.lbl_central = QLabel("-- 学时")
+        self.lbl_online = QLabel("-- 学时")
+        self.lbl_session = QLabel("-- 学时")
+        metrics.addLayout(metric_column("cap", "#2B83F6", "集中培训", self.lbl_central), 1)
+        separator1 = QFrame(self)
+        separator1.setFrameShape(QFrame.VLine)
+        separator1.setFrameShadow(QFrame.Plain)
+        separator1.setStyleSheet(
+            f"color: {'#34465D' if _is_dark_theme() else '#DDEAF5'};"
+        )
+        metrics.addWidget(separator1)
+        metrics.addLayout(metric_column("laptop", "#1FB8C4", "网络自学", self.lbl_online), 1)
+        separator2 = QFrame(self)
+        separator2.setFrameShape(QFrame.VLine)
+        separator2.setFrameShadow(QFrame.Plain)
+        separator2.setStyleSheet(
+            f"color: {'#34465D' if _is_dark_theme() else '#DDEAF5'};"
+        )
+        metrics.addWidget(separator2)
+        metrics.addLayout(metric_column("ribbon", "#F2B35C", "本次已学", self.lbl_session), 1)
+        hl.addLayout(metrics, 1)
+        self.sparkline = _Sparkline()
+        self.sparkline.setFixedHeight(1)
+        info_row.addWidget(hours_card, 1)
+        add_shadow(hours_card)
+
+        goal_card = SurfaceCard(self)
         gl = QHBoxLayout(goal_card)
-        gl.setContentsMargins(16, 14, 16, 14)
-        gl.setSpacing(16)
+        gl.setContentsMargins(20, 18, 20, 18)
+        gl.setSpacing(18)
         gl_left = QVBoxLayout()
-        gl_left.setSpacing(6)
+        gl_left.setSpacing(8)
         gl_title = QHBoxLayout()
-        gl_title.setSpacing(6)
-        gl_icon = IconWidget(FIF.FLAG, self)
-        gl_icon.setFixedSize(16, 16)
-        gl_title.addWidget(gl_icon)
-        gl_title.addWidget(SubtitleLabel("学习目标"))
+        gl_title.addWidget(icon_box("target", "#1FB8B7"))
+        gl_title.addWidget(text_label("学习目标", "cardTitle"))
         gl_title.addStretch()
         gl_left.addLayout(gl_title)
         self.lbl_goal_info = BodyLabel("--")
+        self.lbl_goal_info.setWordWrap(True)
         gl_left.addWidget(self.lbl_goal_info)
+        self.goal_progress = QProgressBar(self)
+        self.goal_progress.setRange(0, 100)
+        self.goal_progress.setValue(0)
+        self.goal_progress.setTextVisible(False)
+        self.goal_progress.setFixedHeight(13)
+        gl_left.addWidget(self.goal_progress)
+        goal_note = QLabel("按计划完成学习任务，持续提升专业能力")
+        goal_note.setObjectName("cardMeta")
+        gl_left.addWidget(goal_note)
         self.lbl_eta = CaptionLabel("")
-        self.lbl_eta.setObjectName("muted")
+        self.lbl_eta.setObjectName("cardMeta")
         gl_left.addWidget(self.lbl_eta)
         gl_left.addStretch()
-        gl.addLayout(gl_left)
-        self.progress_ring = ProgressRing()
-        self.progress_ring.setFixedSize(72, 72)
+        gl.addLayout(gl_left, 1)
+        self.progress_ring = _GoalRing()
+        self.progress_ring.setFixedSize(116, 116)
         self.progress_ring.setValue(0)
         self.progress_ring.setTextVisible(True)
         gl.addWidget(self.progress_ring)
         info_row.addWidget(goal_card, 1)
-
+        add_shadow(goal_card)
         left.addLayout(info_row)
 
-        # Row 2: worker table
-        table_card = SimpleCardWidget(self)
-        table_card.setBorderRadius(10)
+        table_card = SurfaceCard(self)
         tl = QVBoxLayout(table_card)
         tl.setContentsMargins(0, 0, 0, 0)
         tl.setSpacing(0)
-
         table_header = QHBoxLayout()
-        table_header.setContentsMargins(16, 12, 16, 8)
-        table_header.setSpacing(6)
-        tbl_icon = IconWidget(FIF.GAME, self)
-        tbl_icon.setFixedSize(16, 16)
-        table_header.addWidget(tbl_icon)
-        table_header.addWidget(SubtitleLabel("学习进度"))
+        table_header.setContentsMargins(20, 16, 20, 12)
+        table_header.setSpacing(10)
+        table_header.addWidget(icon_box("bars", "#2B83F6"))
+        table_header.addWidget(text_label("学习进度", "cardTitle"))
         table_header.addStretch()
         self.lbl_progress_summary = CaptionLabel("")
+        self.lbl_progress_summary.setObjectName("cardMeta")
         table_header.addWidget(self.lbl_progress_summary)
+        table_header.addWidget(text_label("⋮", "heroKicker"))
         tl.addLayout(table_header)
 
         self.table = TableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["课程", "进度", "预计", "状态"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        # 进度条需要足够空间显示百分比；预计时间是短文本，避免占用课程标题区域。
-        self.table.setColumnWidth(1, 128)
-        self.table.setColumnWidth(2, 112)
-        self.table.setColumnWidth(3, 108)
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["#", "课程", "进度", "预计", "状态"])
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(2, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(3, QHeaderView.Fixed)
+        header_view.setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 70)
+        self.table.setColumnWidth(2, 360)
+        self.table.setColumnWidth(3, 165)
+        self.table.setColumnWidth(4, 180)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
         self.table.setSelectionMode(TableWidget.NoSelection)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setBorderRadius(8)
         tl.addWidget(self.table)
-
         left.addWidget(table_card, 1)
+        add_shadow(table_card, blur=30, offset_y=9, alpha=34)
         main_area.addLayout(left, 1)
 
-        # ── Right panel: log ──
-        self.log_card = SimpleCardWidget(self)
-        self.log_card.setBorderRadius(10)
-        self.log_card.setFixedWidth(320)
+        # 日志侧栏：默认折叠，异常或用户主动打开时展示
+        self.log_card = SurfaceCard(self)
+        self.log_card.setFixedWidth(360)
         ll = QVBoxLayout(self.log_card)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
-
         log_header = QHBoxLayout()
-        log_header.setContentsMargins(16, 12, 16, 8)
-        log_header.setSpacing(6)
-        log_icon = IconWidget(FIF.DOCUMENT, self)
-        log_icon.setFixedSize(16, 16)
-        log_header.addWidget(log_icon)
-        log_header.addWidget(SubtitleLabel("日志"))
+        log_header.setContentsMargins(18, 14, 18, 10)
+        log_header.addWidget(icon_box("book", "#2B83F6"))
+        log_header.addWidget(text_label("运行日志", "cardTitle"))
         log_header.addStretch()
         self.btn_log_toggle = ToolButton(FIF.CHEVRON_RIGHT)
         self.btn_log_toggle.setToolTip("折叠日志")
@@ -1763,17 +2181,26 @@ class DashboardScreen(QWidget):
         log_header.addWidget(self.btn_log_toggle)
         self.lbl_log_badge = CaptionLabel("")
         self.lbl_log_badge.setObjectName("statusPill")
+        self.lbl_log_badge.hide()
         log_header.addWidget(self.lbl_log_badge)
         ll.addLayout(log_header)
-
         self.log_view = PlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
         ll.addWidget(self.log_view)
-
         main_area.addWidget(self.log_card)
-
+        add_shadow(self.log_card)
         layout.addLayout(main_area, 1)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(4, 0, 4, 0)
+        footer_left = QLabel(f"润物 Moisten   v{CURRENT_VERSION}    |    学而不止 · 润物无声")
+        footer_left.setObjectName("cardMeta")
+        footer_right = QLabel("今天也在进步  ♡")
+        footer_right.setObjectName("cardMeta")
+        footer.addWidget(footer_left)
+        footer.addStretch()
+        footer.addWidget(footer_right)
+        layout.addLayout(footer)
         # 当前任务优先；日志在有异常或用户主动展开时占用空间。
         self._toggle_log()
 
@@ -1787,12 +2214,14 @@ class DashboardScreen(QWidget):
         if not self._log_collapsed:
             self._unread_logs = 0
             self.lbl_log_badge.setText("")
+            self.lbl_log_badge.hide()
 
     def _on_stop_clicked(self):
         worker = getattr(self, "_worker", None)
         if not worker or not worker.isRunning():
             return
         dlg = Dialog("停止学习", "当前学习任务会在安全检查点停止，已完成进度会保留。", self)
+        style_moisten_dialog(dlg)
         dlg.cancelButton.setText("继续学习")
         dlg.yesButton.setText("停止")
         if dlg.exec():
@@ -1832,6 +2261,8 @@ class DashboardScreen(QWidget):
         self.lbl_current_task.setText("正在准备学习任务…")
         self.lbl_current_hint.setText("正在启动浏览器并读取课程列表")
         self.btn_stop.setEnabled(True)
+        self.current_progress.setValue(0)
+        self.goal_progress.setValue(0)
         # 重置进度环状态（颜色恢复主题色、数值清零）
         self.progress_ring.setValue(0)
         try:
@@ -1885,20 +2316,72 @@ class DashboardScreen(QWidget):
         self._worker.exam_retry_signal.connect(self._on_exam_retry)
         self._worker.start()
 
+    @staticmethod
+    def _status_kind(status):
+        status = str(status or "").strip()
+        if status in {"", "-", "等待中"}:
+            return "waiting"
+        if any(k in status for k in ("完成", "目标达成")):
+            return "success"
+        if any(k in status for k in ("异常", "失败", "放弃", "超时")):
+            return "danger"
+        if any(k in status for k in ("学习", "加载", "查找", "考试")):
+            return "active"
+        return "warning"
+
+    @classmethod
+    def _status_capsule(cls, text, kind=None):
+        container = QWidget()
+        container.setAttribute(Qt.WA_TranslucentBackground)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        label = QLabel(str(text))
+        label.setObjectName("tableStatus")
+        label.setProperty("kind", kind or cls._status_kind(text))
+        label.setAlignment(Qt.AlignCenter)
+        row.addStretch(1)
+        row.addWidget(label, 0, Qt.AlignCenter)
+        row.addStretch(1)
+        return container
+
+    def _set_status_cell(self, row, text, kind=None):
+        """替换状态单元格时同时移除旧 widget/item，避免出现两层状态文本。"""
+        old_widget = self.table.cellWidget(row, 4)
+        if old_widget is not None:
+            old_widget.hide()
+            old_widget.setParent(None)
+            old_widget.deleteLater()
+        self.table.removeCellWidget(row, 4)
+        self.table.takeItem(row, 4)
+        self.table.setCellWidget(row, 4, self._status_capsule(text, kind))
+
     def _init_table(self, workers):
         self.table.setRowCount(workers)
         self._progress_bars = []
+        self._progress_labels = []
         for i in range(workers):
-            self.table.setItem(i, 0, QTableWidgetItem("-"))
+            self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
-            bar.setTextVisible(True)
-            bar.setFormat("%p%")
-            self.table.setCellWidget(i, 1, bar)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(13)
+            progress_cell = QWidget()
+            progress_layout = QHBoxLayout(progress_cell)
+            progress_layout.setContentsMargins(10, 8, 10, 8)
+            progress_layout.setSpacing(10)
+            progress_layout.addWidget(bar, 1)
+            percent_label = QLabel("0%")
+            percent_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            percent_label.setMinimumWidth(32)
+            progress_layout.addWidget(percent_label)
+            self.table.setCellWidget(i, 2, progress_cell)
             self._progress_bars.append(bar)
-            self.table.setItem(i, 2, QTableWidgetItem("-"))
-            self.table.setItem(i, 3, QTableWidgetItem("等待中"))
+            self._progress_labels.append(percent_label)
+            self.table.setItem(i, 1, QTableWidgetItem("-"))
+            self.table.setItem(i, 3, QTableWidgetItem("-"))
+            self._set_status_cell(i, "等待中", "waiting")
 
     @staticmethod
     def _format_worker_eta(seconds):
@@ -2534,6 +3017,7 @@ class DashboardScreen(QWidget):
         if self._log_collapsed:
             self._unread_logs += 1
             self.lbl_log_badge.setText(str(self._unread_logs))
+            self.lbl_log_badge.show()
         if str(style).lower() in {"red", "yellow"} and self._log_collapsed:
             self._toggle_log()
 
@@ -2548,12 +3032,17 @@ class DashboardScreen(QWidget):
                 it.setForeground(QColor(color))
             return it
 
-        self.table.setItem(wid, 0, _item(data.get("course", "-")))
+        self.table.setItem(wid, 1, _item(data.get("course", "-")))
         progress_text = str(data.get("progress", "-"))
         if wid < len(getattr(self, "_progress_bars", [])):
             try:
                 pct = max(0, min(100, int(float(progress_text.rstrip("%")))))
                 self._progress_bars[wid].setValue(pct)
+                if wid < len(getattr(self, "_progress_labels", [])):
+                    self._progress_labels[wid].setText(f"{pct}%")
+                if wid == 0:
+                    self.current_progress.setValue(pct)
+                    self.goal_progress.setValue(pct)
             except (TypeError, ValueError):
                 pass
         status = str(data.get("status", "-"))
@@ -2565,7 +3054,7 @@ class DashboardScreen(QWidget):
             status,
             data.get("eta", "-"),
         )
-        self.table.setItem(wid, 2, _item(eta_text))
+        self.table.setItem(wid, 3, _item(eta_text))
         if status in {"学习中", "加载中", "查找按钮", "考试答题中"}:
             self.lbl_session_state.setText("学习中")
         elif "异常" in status or "失败" in status:
@@ -2573,21 +3062,7 @@ class DashboardScreen(QWidget):
         if course and course != "-":
             self.lbl_current_task.setText(course)
             self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {progress_text}")
-        tokens = QApplication.instance().property("moisten_tokens")
-        success_color = getattr(tokens, "success", "#2e9e5b")
-        danger_color = getattr(tokens, "danger", "#d64545")
-        accent_color = getattr(tokens, "accent", "#3b82c4")
-        warning_color = getattr(tokens, "warning", "#c99700")
-        sc = None
-        if any(k in status for k in ("完成", "目标达成")):
-            sc = success_color      # 成功 → 绿
-        elif any(k in status for k in ("异常", "失败", "放弃", "超时")):
-            sc = danger_color      # 失败 → 红
-        elif any(k in status for k in ("学习", "加载", "查找")):
-            sc = accent_color      # 进行中 → 蓝
-        elif any(k in status for k in ("重试", "未找到", "无按钮", "跳过", "退出")):
-            sc = warning_color      # 提示 → 黄
-        self.table.setItem(wid, 3, _item(status, sc))
+        self._set_status_cell(wid, status, self._status_kind(status))
 
     def _animate_ring(self, target):
         """进度环数值平滑动画（OutCubic，400ms）"""
@@ -2611,10 +3086,10 @@ class DashboardScreen(QWidget):
         online_color = getattr(tokens, "success", "#2e9e5b")
         # 学时数值着色（集中主色 / 网络成功色），一眼可读
         self.lbl_central.setText(
-            f'<span style="color:{central_color};">集中培训</span>: {data.get("central", 0):.1f} 学时')
+            f'<span style="color:{central_color};"><b>{data.get("central", 0):.1f}</b> 学时</span>')
         self.lbl_online.setText(
-            f'<span style="color:{online_color};">网络自学</span>: {data.get("online", 0):.1f} 学时')
-        self.lbl_updated.setText(f"更新时间: {data.get('updated', '--')}")
+            f'<span style="color:{online_color};"><b>{data.get("online", 0):.1f}</b> 学时</span>')
+        self.lbl_updated.setText(f"更新: {data.get('updated', '--')}")
 
         # 本次已学 + 学时趋势
         total = data.get("central", 0) + data.get("online", 0)
@@ -2622,7 +3097,7 @@ class DashboardScreen(QWidget):
             self._session_start_total = total
         try:
             learned = max(0.0, total - self._session_start_total)
-            self.lbl_session.setText(f"本次已学: {learned:.1f} 学时")
+            self.lbl_session.setText(f"<b>{learned:.1f}</b> 学时")
             now = _time.time()
             self._hours_history.append((now, total))
             if len(self._hours_history) > 120:
@@ -2776,6 +3251,7 @@ class DashboardScreen(QWidget):
         """考试没考成/没通过：弹窗问是否重考。倒计时结束未操作 = 不重考。"""
         TIMEOUT = EXAM_RETRY_TIMEOUT
         dlg = QDialog(self)
+        style_moisten_dialog(dlg)
         dlg.setWindowTitle("考试未通过")
         dlg.setMinimumWidth(420)
         dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
@@ -2840,6 +3316,7 @@ class DashboardScreen(QWidget):
                 from PySide6.QtWidgets import QDialog, QVBoxLayout
                 from qfluentwidgets import ProgressBar, SubtitleLabel, BodyLabel
                 dlg = QDialog(self.window())
+                style_moisten_dialog(dlg)
                 dlg.setWindowTitle("正在下载内置 Chromium")
                 dlg.setModal(True)
                 dlg.setMinimumWidth(440)
@@ -2933,6 +3410,7 @@ class DashboardScreen(QWidget):
             pass
 
         dlg = QDialog(self)
+        style_moisten_dialog(dlg)
         dlg.setWindowTitle("选择标签")
         dlg.setMinimumWidth(500)
         dlg.setMinimumHeight(500)
@@ -3058,6 +3536,7 @@ class DashboardScreen(QWidget):
         TIMEOUT = 10  # 秒
 
         dlg = QDialog(self)
+        style_moisten_dialog(dlg)
         dlg.setWindowTitle("标签筛选")
         dlg.setMinimumWidth(400)
 
@@ -3141,6 +3620,7 @@ class DashboardScreen(QWidget):
         TIMEOUT = 10
 
         dlg = QDialog(self)
+        style_moisten_dialog(dlg)
         dlg.setWindowTitle("继续学习")
         dlg.setMinimumWidth(380)
 
@@ -3201,20 +3681,81 @@ class DashboardScreen(QWidget):
 from PySide6.QtWidgets import QMainWindow
 
 
+class _NavigationRail(NavigationInterface):
+    """参考稿侧边栏：保留清爽导航，同时在底部补一层低对比度水波纹。"""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if w < 2 or h < 120:
+            p.end()
+            return
+        dark = _is_dark_theme()
+
+        p.save()
+        p.setClipRect(0, max(0, h - 245), w, 245)
+        p.translate(10, 0)
+
+        def rounded_wave(start_y, controls, color):
+            path = QPainterPath()
+            path.moveTo(-24, h * start_y)
+            for cx, cy, x, y in controls:
+                path.quadTo(cx, cy, x, y)
+            path.lineTo(w + 24, h + 24)
+            path.lineTo(-24, h + 24)
+            path.closeSubpath()
+            p.fillPath(path, QColor(*color))
+
+        rounded_wave(0.90, [
+            (w * 0.10, h * 0.78, w * 0.28, h * 0.88),
+            (w * 0.46, h * 0.99, w * 0.64, h * 0.87),
+            (w * 0.88, h * 0.72, w + 24, h * 0.82),
+        ], (45, 107, 159, 48) if dark else (164, 215, 247, 50))
+        rounded_wave(0.96, [
+            (w * 0.16, h * 0.86, w * 0.36, h * 0.94),
+            (w * 0.58, h * 1.00, w * 0.76, h * 0.91),
+            (w * 0.98, h * 0.82, w + 24, h * 0.88),
+        ], (33, 84, 133, 34) if dark else (91, 181, 235, 26))
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(113, 181, 224, 34) if dark else QColor(73, 151, 211, 42))
+        for x, y, r in ((22, h - 94, 2), (38, h - 70, 1), (54, h - 112, 2),
+                        (72, h - 82, 1), (91, h - 55, 2), (112, h - 96, 1)):
+            p.drawEllipse(x, y, r * 2, r * 2)
+
+        p.setPen(QColor(137, 171, 204, 155) if dark else QColor(112, 153, 190, 155))
+        font = p.font()
+        font.setPointSize(12)
+        font.setItalic(True)
+        p.setFont(font)
+        p.drawText(20, h - 42, "如水润物")
+        p.drawText(46, h - 18, "向知而行")
+        p.restore()
+        p.end()
+
+
 class _BaseWindow(QMainWindow):
     """原生窗口壳层 + QFluentWidgets 官方 NavigationInterface。"""
 
     def __init__(self):
         super().__init__()
         self._stack = QStackedWidget()
-        self.navigationInterface = NavigationInterface(
+        self.navigationInterface = _NavigationRail(
             self, showMenuButton=False, showReturnButton=False, collapsible=False)
-        self.navigationInterface.setExpandWidth(176)
+        self.navigationInterface.setObjectName("navRail")
+        self.navigationInterface.setExpandWidth(228)
         self.navigationInterface.expand()
+        # 菜单项之间留出更明确的呼吸感，避免放大文字后侧栏显得拥挤。
+        self.navigationInterface.panel.topLayout.setSpacing(10)
+        QApplication.instance().setProperty("moisten_navigation", self.navigationInterface)
         shell = QWidget(self)
         shell_layout = QHBoxLayout(shell)
-        shell_layout.setContentsMargins(12, 12, 12, 12)
-        shell_layout.setSpacing(12)
+        # 壳层必须铺满窗口：参考稿的工作区背景直接贴到右侧/底部边缘，
+        # 不能让 QMainWindow 的 page 色在外圈露出来。
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
         shell_layout.addWidget(self.navigationInterface)
         shell_layout.addWidget(self._stack, 1)
         self.setCentralWidget(shell)
@@ -3263,6 +3804,7 @@ class MainWindow(_BaseWindow):
     def closeEvent(self, event):
         """关闭窗口时二次确认并清理资源"""
         dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
+        style_moisten_dialog(dlg)
         dlg.cancelButton.setText("取消")
         dlg.yesButton.setText("退出")
         if dlg.exec():
@@ -3319,8 +3861,8 @@ class MainWindow(_BaseWindow):
         super().__init__()
         self.setWindowTitle("润物 Moisten")
         # 默认/最小尺寸要足够容纳各设置页内容（过小会导致文字被裁切）
-        self.resize(1080, 720)
-        self.setMinimumSize(900, 640)
+        self.resize(1440, 900)
+        self.setMinimumSize(1120, 720)
         self._drag_pos = None
         self._in_main_shell = False
         self._settings_mode = False
@@ -3520,6 +4062,7 @@ class MainWindow(_BaseWindow):
                     msg,
                     self
                 )
+                style_moisten_dialog(dlg)
                 dlg.cancelButton.setText("稍后")
                 dlg.yesButton.setText("立即更新")
                 if dlg.exec():
@@ -3546,6 +4089,7 @@ class MainWindow(_BaseWindow):
 
         # 下载进度对话框（Fluent 风格）
         dlg = QDialog(self)
+        style_moisten_dialog(dlg)
         dlg.setWindowTitle("正在更新")
         dlg.setMinimumWidth(400)
         dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
