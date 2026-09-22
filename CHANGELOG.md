@@ -1,6 +1,13 @@
 # 更新日志
 
 ## 2.2.0
+- release: v2.2.0 settings navigation update fix
+- docs: consolidate v2.1.0 changelog
+- chore: VERSION 2.1.0
+- docs: CHANGELOG 2.1.0
+# 更新日志
+
+## 2.2.0
 - feat(ui): 使用 QFluentWidgets 官方 NavigationInterface，侧栏拆分账号、学习、运行、考试和外观设置
 - feat(ui): 学习目标/手动学习根据当前模式动态显示，统一菜单宽度、图标基线和品牌图标展示
 - fix(ui): 修复深色主题侧栏图标颜色和主题下拉列表背景异常
