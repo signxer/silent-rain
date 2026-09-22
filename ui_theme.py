@@ -139,9 +139,30 @@ def apply_theme(app, mode: str = "auto") -> ThemeTokens:
         setTheme(Theme.LIGHT)
         tokens = LIGHT
     else:
-        setTheme(Theme.AUTO)
-        # Qt 的 palette 已经完成系统主题判断；浅色 token 是更安全的初始化值。
-        tokens = DARK if app.palette().color(QPalette.Window).lightness() < 128 else LIGHT
+        # 不从 app.palette() 判断系统主题：该 palette 是我们上一次应用的
+        # 自定义 palette，切回“跟随系统”时会把旧的深色/浅色误认为系统主题，
+        # 造成 QFluentWidgets 与自定义控件混用两套颜色。
+        scheme = None
+        try:
+            scheme = app.styleHints().colorScheme()
+        except Exception:
+            pass
+        if scheme == Qt.ColorScheme.Dark:
+            tokens = DARK
+        elif scheme == Qt.ColorScheme.Light:
+            tokens = LIGHT
+        else:
+            # 低版本 Qt 或离屏环境可能没有可用的 colorScheme，读取 style
+            # 的标准 palette；它不受 app.setPalette() 的自定义值污染。
+            try:
+                standard = app.style().standardPalette()
+                is_dark = standard.color(QPalette.Window).lightness() < 128
+            except Exception:
+                is_dark = False
+            tokens = DARK if is_dark else LIGHT
+        # 显式选择当前系统主题，避免 Theme.AUTO 在已设置自定义 palette 后
+        # 仍保留旧主题组件，产生深浅色混杂。
+        setTheme(Theme.DARK if tokens is DARK else Theme.LIGHT)
     app.setPalette(_palette(tokens))
     family = app.font().family().replace("'", "")
     app.setStyleSheet(f"* {{ font-family: '{family}'; }}\n" + _stylesheet(tokens))

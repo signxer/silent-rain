@@ -69,10 +69,31 @@ class AsyncThread(QThread):
         super().__init__(parent)
         self._coro_func = coro_func
         self._stop_event = threading.Event()
+        self._loop = None
+        self._main_task = None
 
     def request_stop(self):
         """请求协作式停止：学习协程在检查点主动退出"""
         self._stop_event.set()
+
+    def cancel_pending(self):
+        """在窗口退出等硬截止场景取消主协程。
+
+        Playwright 的单次导航/等待可能还没走到业务层的停止检查点，
+        仅设置 threading.Event 会让 GUI 长时间等不到线程退出。取消发生在
+        worker 自己的 asyncio loop 中，仍会经过 _run_learning 的 finally 清理。
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self._cancel_main_task)
+            except RuntimeError:
+                pass
+
+    def _cancel_main_task(self):
+        task = self._main_task
+        if task is not None and not task.done():
+            task.cancel()
 
     def run(self):
         if sys.platform == "win32":
@@ -80,8 +101,15 @@ class AsyncThread(QThread):
         else:
             loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._main_task = loop.create_task(self._coro_func(self))
+        if self._stop_event.is_set():
+            self._main_task.cancel()
         try:
-            loop.run_until_complete(self._coro_func(self))
+            loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            # 关闭窗口/强制停止时的正常退出路径，不向日志报告为错误。
+            pass
         except Exception as e:
             self.log_signal.emit(f"错误: {e}", "red")
         finally:
@@ -97,6 +125,8 @@ class AsyncThread(QThread):
             except Exception:
                 pass
             finally:
+                self._main_task = None
+                self._loop = None
                 loop.close()
 
 
@@ -600,8 +630,7 @@ class ConfigScreen(QWidget):
         saved_theme = normalize_theme_mode(self._saved.get("theme_mode", "auto"))
         self.combo_theme.setCurrentIndex(self.combo_theme.findData(saved_theme))
         self.combo_theme.setFixedWidth(150)
-        self.combo_theme.currentIndexChanged.connect(
-            lambda: apply_theme(QApplication.instance(), self.combo_theme.currentData() or "auto"))
+        self.combo_theme.currentIndexChanged.connect(self._on_appearance_changed)
         theme_row.addWidget(self.combo_theme)
         theme_row.addStretch()
         appearance_layout.addLayout(theme_row)
@@ -612,6 +641,7 @@ class ConfigScreen(QWidget):
         self.switch_reduced_motion.setChecked(bool(self._saved.get("reduced_motion", False)))
         self.switch_reduced_motion.setOnText("减少")
         self.switch_reduced_motion.setOffText("标准")
+        self.switch_reduced_motion.checkedChanged.connect(self._on_appearance_changed)
         motion_row.addWidget(self.switch_reduced_motion)
         motion_hint = CaptionLabel("减少页面切换和进度动画")
         motion_hint.setObjectName("muted")
@@ -633,22 +663,48 @@ class ConfigScreen(QWidget):
 
         layout.addStretch()
 
-        # Start button
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        self.btn_start = PrimaryPushButton("  保存并返回" if self.sidebar_mode else "  开始")
-        self.btn_start.setIcon(FIF.PLAY)
-        self.btn_start.setFixedSize(160, 40)
-        self.btn_start.clicked.connect(self._on_start)
-        btn_layout.addWidget(self.btn_start)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        # 首次向导仍保留“开始/继续”；侧栏外观设置采用控件变更即保存，
+        # 不再放置一个会让用户误以为需要提交的底部按钮。
+        self.btn_start = None
+        if not (self.sidebar_mode and self.section == "appearance"):
+            self.btn_start = PrimaryPushButton("  保存并返回" if self.sidebar_mode else "  开始")
+            self.btn_start.setIcon(FIF.PLAY)
+            self.btn_start.setFixedSize(160, 40)
+            self.btn_start.clicked.connect(self._on_start)
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            btn_layout.addWidget(self.btn_start)
+            btn_layout.addStretch()
+            layout.addLayout(btn_layout)
 
     def _validate_exam_settings(self):
         if self.switch_exam.isChecked() and not self.input_api_key.text().strip():
             self.lbl_exam_validation.setText("开启自动答题后需要填写 DeepSeek API Key；留空则学习时跳过考试。")
         else:
             self.lbl_exam_validation.setText("")
+
+    def _on_appearance_changed(self, *_args):
+        """外观侧栏即时保存并立即预览，不触发学习任务重启。"""
+        if not hasattr(self, "combo_theme") or not hasattr(self, "switch_reduced_motion"):
+            return
+        mode = normalize_theme_mode(self.combo_theme.currentData() or "auto")
+        reduced_motion = self.switch_reduced_motion.isChecked()
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg["theme_mode"] = mode
+            cfg["reduced_motion"] = reduced_motion
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # 主题预览仍然生效；下次进入页面会从现有配置重新读取。
+            pass
+        win = self.window()
+        win.cfg_theme_mode = mode
+        win.cfg_reduced_motion = reduced_motion
+        apply_theme(QApplication.instance(), mode)
 
     def _browse_chrome(self):
         from PySide6.QtWidgets import QFileDialog
@@ -919,6 +975,8 @@ class GoalScreen(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "step_bar"):
+            self.step_bar.setVisible(not getattr(self.window(), "_settings_mode", False))
         # 模式互斥切换会清空另一模式的目标配置，进入时重新读取并刷新控件，
         # 避免显示切换前的旧值（A14）
         self._load_goal()
@@ -974,7 +1032,8 @@ class GoalScreen(QWidget):
         layout.setAlignment(Qt.AlignTop)
 
         layout.addWidget(PageHeader("学习目标", "分别设置集中培训和网络自学的学习目标"))
-        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=3))
+        self.step_bar = StepBar(["配置", "登录", "学习方式", "目标"], active=3)
+        layout.addWidget(self.step_bar)
 
         layout.addSpacing(10)
 
@@ -1200,14 +1259,22 @@ class ModeScreen(QWidget):
         super().__init__(parent)
         self._build_ui()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "step_bar"):
+            self.step_bar.setVisible(not getattr(self.window(), "_settings_mode", False))
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(160, 50, 160, 50)
+        # 与账号、运行、考试等设置页使用同一套内容边距，避免学习方式页
+        # 单独收窄成居中的窄栏。
+        layout.setContentsMargins(40, 30, 40, 30)
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
         layout.addWidget(PageHeader("选择模式", "选择学习方式，后续可在设置中切换"))
-        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=2))
+        self.step_bar = StepBar(["配置", "登录", "学习方式", "目标"], active=2)
+        layout.addWidget(self.step_bar)
 
         # 当前模式提示（互斥）
         self.lbl_current = CaptionLabel("")
@@ -1342,6 +1409,8 @@ class ManualScreen(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "step_bar"):
+            self.step_bar.setVisible(not getattr(self.window(), "_settings_mode", False))
         # 每次进入手动页时回填已保存的 URL（重启/重新进入后依然可见可用）
         try:
             win = self.window()
@@ -1358,7 +1427,8 @@ class ManualScreen(QWidget):
         layout.setAlignment(Qt.AlignTop)
 
         layout.addWidget(PageHeader("手动指定课程", "输入专题班、训练营或课程 URL，每行一个"))
-        layout.addWidget(StepBar(["配置", "登录", "学习方式", "课程"], active=3))
+        self.step_bar = StepBar(["配置", "登录", "学习方式", "课程"], active=3)
+        layout.addWidget(self.step_bar)
 
         # URL input card
         input_card = HeaderCardWidget(self)
@@ -1488,6 +1558,9 @@ class DashboardScreen(QWidget):
         self._exam_retry_choice = False
         self._learn_start_time = None      # 学习开始时间
         self._progress_history = []         # [(timestamp, pct), ...]
+        # 每个 worker 独立记录当前课程的进度，用于训练营课程回调未提供
+        # eta 时在 GUI 侧计算预计剩余时间。
+        self._worker_eta_state = {}
         self._eta_seconds = None            # 最新预估剩余秒数
         self._eta_calc_time = None          # 预估计算时的时间戳
         self._session_start_total = None    # 本次会话起始总学时（用于"本次已学"）
@@ -1656,9 +1729,10 @@ class DashboardScreen(QWidget):
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["课程", "进度", "预计", "状态"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.setColumnWidth(1, 80)
-        self.table.setColumnWidth(2, 200)
-        self.table.setColumnWidth(3, 100)
+        # 进度条需要足够空间显示百分比；预计时间是短文本，避免占用课程标题区域。
+        self.table.setColumnWidth(1, 128)
+        self.table.setColumnWidth(2, 112)
+        self.table.setColumnWidth(3, 108)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
         self.table.setSelectionMode(TableWidget.NoSelection)
         self.table.setBorderRadius(8)
@@ -1825,6 +1899,76 @@ class DashboardScreen(QWidget):
             self._progress_bars.append(bar)
             self.table.setItem(i, 2, QTableWidgetItem("-"))
             self.table.setItem(i, 3, QTableWidgetItem("等待中"))
+
+    @staticmethod
+    def _format_worker_eta(seconds):
+        """把 worker 的预计剩余秒数压缩成适合窄列的中文文本。"""
+        try:
+            seconds = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return "计算中..."
+        if seconds < 60:
+            return f"剩{seconds:.0f}秒"
+        minutes = int(seconds // 60)
+        if minutes < 60:
+            return f"剩{minutes}分"
+        hours = int(minutes // 60)
+        remain_minutes = minutes % 60
+        return f"剩{hours}时{remain_minutes}分" if remain_minutes else f"剩{hours}时"
+
+    def _worker_eta(self, wid, course, progress_text, status, reported_eta):
+        """优先使用后端 ETA；训练营未上报时按当前 worker 进度估算。"""
+        import time as _time
+
+        placeholder = {"", "-", "...", "计算中", "计算中..."}
+        reported = str(reported_eta or "").strip()
+        try:
+            pct = float(str(progress_text).rstrip("%"))
+            pct = max(0.0, min(100.0, pct))
+            pct_valid = True
+        except (TypeError, ValueError):
+            pct = 0.0
+            pct_valid = False
+
+        state = self._worker_eta_state.get(wid)
+        if state is None or state.get("course") != course:
+            state = {"course": course, "started": _time.monotonic(), "history": []}
+            self._worker_eta_state[wid] = state
+
+        if pct_valid:
+            history = state["history"]
+            now = _time.monotonic()
+            if not history or pct != history[-1][1]:
+                history.append((now, pct))
+                if len(history) > 20:
+                    del history[:-20]
+
+        # 后端有可靠结果时直接显示；训练营通常会传 "-"，再走本地估算。
+        if reported not in placeholder:
+            return reported
+        if pct_valid and pct >= 100:
+            return "-"
+        if status == "考试答题中":
+            return "考试中"
+        active = status in {"学习中", "加载中", "查找按钮"}
+        if not active:
+            return "-"
+
+        history = state["history"]
+        if len(history) >= 2:
+            t0, p0 = history[0]
+            t1, p1 = history[-1]
+            dt = t1 - t0
+            dp = p1 - p0
+            # 过短的采样间隔会把 ETA 放大成 0 秒（页面初始化时常见），
+            # 至少积累一秒再展示数值。
+            if dt >= 1.0 and dp > 0:
+                return self._format_worker_eta((100.0 - p1) * dt / dp)
+        if pct_valid and pct > 0:
+            elapsed = _time.monotonic() - state["started"]
+            if elapsed > 1:
+                return self._format_worker_eta((100.0 - pct) * elapsed / pct)
+        return "计算中..."
 
     def _manual_goal_text(self):
         """手动模式的目标区文案（供 _set_goal_info / _on_hours 共用）"""
@@ -2412,16 +2556,23 @@ class DashboardScreen(QWidget):
                 self._progress_bars[wid].setValue(pct)
             except (TypeError, ValueError):
                 pass
-        self.table.setItem(wid, 2, _item(data.get("eta", "-")))
         status = str(data.get("status", "-"))
+        course = str(data.get("course", "-")).strip()
+        eta_text = self._worker_eta(
+            wid,
+            course,
+            progress_text,
+            status,
+            data.get("eta", "-"),
+        )
+        self.table.setItem(wid, 2, _item(eta_text))
         if status in {"学习中", "加载中", "查找按钮", "考试答题中"}:
             self.lbl_session_state.setText("学习中")
         elif "异常" in status or "失败" in status:
             self.lbl_session_state.setText("需要处理")
-        course = str(data.get("course", "-")).strip()
         if course and course != "-":
             self.lbl_current_task.setText(course)
-            self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {data.get('progress', '-')}")
+            self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {progress_text}")
         tokens = QApplication.instance().property("moisten_tokens")
         success_color = getattr(tokens, "success", "#2e9e5b")
         danger_color = getattr(tokens, "danger", "#d64545")
@@ -2615,6 +2766,7 @@ class DashboardScreen(QWidget):
         """GUI线程内重置ETA状态（由worker通过信号触发，避免跨线程写Qt对象）"""
         self._learn_start_time = None
         self._progress_history = []
+        self._worker_eta_state = {}
         self._eta_seconds = None
         self._eta_calc_time = None
         self._eta_timer.stop()
@@ -3121,7 +3273,25 @@ class MainWindow(_BaseWindow):
             # 2) 等待 worker 线程结束（限时，避免 GUI 卡死）
             worker = getattr(dash, "_worker", None) if dash else None
             if worker and worker.isRunning():
+                # 先给业务协程一个短暂的协作式退出窗口；如果正卡在
+                # Playwright 导航/等待中，取消 worker 自己的 asyncio 主任务，
+                # 让 _run_learning 的 finally 负责关闭浏览器。
+                if not worker.wait(2500):
+                    worker.cancel_pending()
                 if not worker.wait(10000):
+                    # 最后的兜底只处理 Playwright 进程并终止线程，避免窗口
+                    # 永远停留在“仍在学习”状态。正常路径不会走到这里。
+                    try:
+                        from main import _kill_playwright_chrome
+                        _kill_playwright_chrome()
+                    except Exception:
+                        pass
+                    try:
+                        worker.terminate()
+                        worker.wait(3000)
+                    except Exception:
+                        pass
+                if worker.isRunning():
                     InfoBar.warning(
                         "仍在学习",
                         "任务尚未安全停止，请稍后再退出，避免损坏学习进度。",
@@ -3262,14 +3432,16 @@ class MainWindow(_BaseWindow):
             "brand", brand_widget, position=NavigationItemPosition.TOP)
 
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
+        # 侧栏按设置使用顺序排列：账号 → 浏览器 → 学习方式 →
+        # 学习目标/手动学习 → 考试 → 外观。
+        self.addSubInterface(self.screen_account, FIF.PEOPLE, "账号登录")
+        self.addSubInterface(self.screen_runtime, FIF.SETTING, "运行与浏览器")
         self.addSubInterface(self.screen_mode, FIF.TILES, "学习方式")
         self.navigationInterface.addItem(
             "learning", FIF.FLAG, "学习目标",
             onClick=lambda: self._on_navigation("learning"),
             position=NavigationItemPosition.TOP,
         )
-        self.addSubInterface(self.screen_account, FIF.PEOPLE, "账号登录")
-        self.addSubInterface(self.screen_runtime, FIF.SETTING, "运行与浏览器")
         self.addSubInterface(self.screen_exam, FIF.CHECKBOX, "考试设置")
         self.addSubInterface(self.screen_appearance, FIF.PALETTE, "外观设置")
 
@@ -3310,6 +3482,8 @@ class MainWindow(_BaseWindow):
         elif key == "dashboard":
             self._screen_index = 5
         self._settings_mode = key != "dashboard"
+        if hasattr(widget, "step_bar"):
+            widget.step_bar.setVisible(not self._settings_mode)
         self.switchTo(widget)
         self.navigationInterface.setCurrentItem(key)
 

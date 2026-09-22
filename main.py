@@ -4865,9 +4865,25 @@ class AutoLearner:
 
         def update_status(w_id, **kwargs):
             """更新线程状态（线程安全）+ 心跳 + 进度追踪"""
-            worker_status.setdefault(w_id, {}).update(kwargs)
+            current = worker_status.setdefault(w_id, {})
+            if "course" in kwargs and current.get("course") != kwargs.get("course"):
+                # 一个 worker 切换课程时，不能把上一门课的速率带到新课程。
+                worker_progress_history[w_id] = []
+            current.update(kwargs)
             worker_heartbeat[w_id] = time.time()
-            # Textual回调
+            # 记录进度变化
+            pct_str = kwargs.get("progress", "")
+            if pct_str and pct_str != "-":
+                try:
+                    pct_val = float(pct_str.replace("%", ""))
+                    history = worker_progress_history.setdefault(w_id, [])
+                    history.append((time.time(), pct_val))
+                    # 只保留最近10条记录
+                    if len(history) > 10:
+                        worker_progress_history[w_id] = history[-10:]
+                except:
+                    pass
+            # Textual/GUI 回调放在记录进度之后，确保本次更新就能参与 ETA 计算。
             if progress_callback:
                 try:
                     info = worker_status.get(w_id, {})
@@ -4882,18 +4898,6 @@ class AutoLearner:
                         "eta": eta,
                         "status": info.get("status", "-"),
                     })
-                except:
-                    pass
-            # 记录进度变化
-            pct_str = kwargs.get("progress", "")
-            if pct_str and pct_str != "-":
-                try:
-                    pct_val = float(pct_str.replace("%", ""))
-                    history = worker_progress_history.setdefault(w_id, [])
-                    history.append((time.time(), pct_val))
-                    # 只保留最近10条记录
-                    if len(history) > 10:
-                        worker_progress_history[w_id] = history[-10:]
                 except:
                     pass
 
@@ -5576,6 +5580,21 @@ class AutoLearner:
         nw = min(workers, len(urls))
         _log(f"共 {len(urls)} 个课程URL待学习，使用 {nw} 个线程", "blue")
 
+        def format_eta(seconds):
+            """格式化课程剩余时间，供训练营进度回调显示。"""
+            try:
+                seconds = max(0.0, float(seconds))
+            except (TypeError, ValueError):
+                return "计算中..."
+            if seconds < 60:
+                return f"剩{seconds:.0f}秒"
+            minutes = int(seconds // 60)
+            if minutes < 60:
+                return f"剩{minutes}分"
+            hours = int(minutes // 60)
+            remain_minutes = minutes % 60
+            return f"剩{hours}时{remain_minutes}分" if remain_minutes else f"剩{hours}时"
+
         async def cworker(wid, wp, task_urls):
             for task in task_urls:
                 # 用户变更配置：停止
@@ -5612,9 +5631,32 @@ class AutoLearner:
                             except:
                                 pass
                     def on_progress(pct):
+                        now = time.monotonic()
                         last_reported_progress[0] = max(0.0, min(99.0, float(pct)))
+                        if not hasattr(on_progress, "history"):
+                            on_progress.history = []
+                            on_progress.started = now
+                        history = on_progress.history
+                        if not history or last_reported_progress[0] != history[-1][1]:
+                            history.append((now, last_reported_progress[0]))
+                            if len(history) > 20:
+                                del history[:-20]
+                        eta = "计算中..."
+                        if len(history) >= 2:
+                            t0, p0 = history[0]
+                            t1, p1 = history[-1]
+                            dt = t1 - t0
+                            dp = p1 - p0
+                            if dt >= 1.0 and dp > 0:
+                                eta = format_eta((100.0 - p1) * dt / dp)
+                        elif last_reported_progress[0] > 0 and now - on_progress.started > 1:
+                            eta = format_eta(
+                                (100.0 - last_reported_progress[0])
+                                * (now - on_progress.started)
+                                / last_reported_progress[0]
+                            )
                         _progress({"wid": wid, "course": title,
-                                   "progress": f"{last_reported_progress[0]:.0f}%", "eta": "-", "status": "学习中"})
+                                   "progress": f"{last_reported_progress[0]:.0f}%", "eta": eta, "status": "学习中"})
                     # 训练营课程页可能同时有多个视频和考试，顺序很关键：
                     # 必须先看视频再做考试——平台有可能在考试通过后就把整页标记完成，
                     # 先考试会让接下来的视频学习被「已完成」短路掉（一节视频都没看）。
