@@ -1,12 +1,14 @@
 # 更新日志
 
 ## 2.2.1
+- release: v2.2.1 shutdown and settings fixes
+# 更新日志
+
+## 2.2.1
 - fix(ui): 重新排列侧栏设置顺序，统一学习方式页边距并隐藏侧栏设置中的向导步骤条
 - fix(ui): 外观设置改为主题和动效变更即时保存，修复跟随系统时深浅主题混杂
 - fix(ui): 训练营任务补充预计时间计算，并调整进度与预计列宽
 - fix(exit): 关闭窗口时取消卡住的 worker asyncio 主任务，确保 Playwright 和学习线程能够退出
-
-# 更新日志
 
 ## 2.2.0
 - feat(ui): 使用 QFluentWidgets 官方 NavigationInterface，侧栏拆分账号、学习、运行、考试和外观设置
