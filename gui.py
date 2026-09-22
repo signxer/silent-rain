@@ -81,7 +81,19 @@ class AsyncThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"错误: {e}", "red")
         finally:
-            loop.close()
+            # 协程异常退出时仍可能留下 refresh/预取等后台任务；先取消并等待，
+            # 再关闭事件循环，避免下次启动出现 "Task was destroyed" 和页面泄漏。
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            finally:
+                loop.close()
 
 
 class _Sparkline(QWidget):
@@ -2811,7 +2823,16 @@ class MainWindow(_BaseWindow):
             # 2) 等待 worker 线程结束（限时，避免 GUI 卡死）
             worker = getattr(dash, "_worker", None) if dash else None
             if worker and worker.isRunning():
-                worker.wait(10000)
+                if not worker.wait(10000):
+                    InfoBar.warning(
+                        "仍在学习",
+                        "任务尚未安全停止，请稍后再退出，避免损坏学习进度。",
+                        parent=self,
+                        position=InfoBarPosition.TOP,
+                        duration=5000,
+                    )
+                    event.ignore()
+                    return
             # 3) 清理浏览器（worker 结束后再关，避免两个事件循环并发操作同一 context）
             try:
                 learner = dash._learner if dash else None
@@ -3173,7 +3194,10 @@ del "%~f0"
             self.cfg_manual_urls = cfg.get("manual_urls", [])
             if "workers" not in cfg:
                 return False
-            self.cfg_workers = cfg.get("workers", 5)
+            try:
+                self.cfg_workers = max(1, min(20, int(cfg.get("workers", 5))))
+            except (TypeError, ValueError):
+                self.cfg_workers = 5
             self.cfg_headless = cfg.get("headless", True)
             default_browser = "chrome"  # 默认使用系统 Chrome
             self.cfg_browser = cfg.get("browser", default_browser)

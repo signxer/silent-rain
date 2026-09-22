@@ -7,6 +7,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -37,6 +38,25 @@ from rich.table import Table
 
 load_dotenv()
 console = Console()
+
+
+def _atomic_json_dump(path: str, data: dict) -> None:
+    """原子写入 JSON，避免进程中断留下半截状态文件。"""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".moisten-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _default_browsers_path() -> str:
@@ -800,6 +820,8 @@ class AutoLearner:
                 await self.context.close()
             except:
                 pass
+            self.context = None
+            self.pages = []
         
         # 关闭浏览器
         if self.browser:
@@ -807,6 +829,7 @@ class AutoLearner:
                 await self.browser.close()
             except:
                 pass
+            self.browser = None
         
         # 停止Playwright
         if self.playwright:
@@ -814,6 +837,7 @@ class AutoLearner:
                 await self.playwright.stop()
             except:
                 pass
+            self.playwright = None
         
         # 强制结束Playwright残留进程
         _kill_playwright_chrome()
@@ -964,13 +988,12 @@ class AutoLearner:
         """保存学习进度（带锁，避免多 worker 并发写互相覆盖）"""
         with self._progress_lock:
             try:
-                with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        "completed_ws_ids": list(completed_ws_ids),
-                        "last_page": last_page,
-                        "last_idx": last_idx,
-                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }, f, ensure_ascii=False, indent=2)
+                _atomic_json_dump(PROGRESS_PATH, {
+                    "completed_ws_ids": list(completed_ws_ids),
+                    "last_page": last_page,
+                    "last_idx": last_idx,
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
             except Exception as e:
                 debug(f"保存进度失败: {e}")
 
@@ -987,17 +1010,20 @@ class AutoLearner:
             except Exception as e:
                 debug(f"标记完成失败: {e}")
 
-    def mark_course_completed(self, title: str):
-        """网络自学断点续学：记录已学课程标题，立即落盘（带锁）"""
+    def mark_course_completed(self, title: str, course_key: str = ""):
+        """网络自学断点续学：记录课程标题和稳定键，立即落盘（带锁）。"""
         with self._progress_lock:
             try:
                 progress = self.load_progress()
                 done = set(progress.get("completed_course_titles", []))
                 done.add(title)
                 progress["completed_course_titles"] = sorted(done)
+                if course_key:
+                    keys = set(progress.get("completed_course_keys", []))
+                    keys.add(course_key)
+                    progress["completed_course_keys"] = sorted(keys)
                 progress["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(progress, f, ensure_ascii=False, indent=2)
+                _atomic_json_dump(PROGRESS_PATH, progress)
             except Exception as e:
                 debug(f"标记课程完成失败: {e}")
 
@@ -1924,8 +1950,8 @@ class AutoLearner:
 
 
     async def _check_video_progress(self, page: Page) -> float:
-        # 检查当前课程的播放进度：
-        # 1) 平台显示的百分比（服务器认证）；2) 兜底：本地 video.currentTime/duration
+        # 检查当前课程的平台播放进度。
+        # 本地 currentTime 只用于停滞检测，不能代替平台上报结果。
         try:
             pct = await page.evaluate('''() => {
                 const el = document.querySelector('.el-progress__text');
@@ -1933,11 +1959,6 @@ class AutoLearner:
                     const t = el.innerText.trim().replace('%', '');
                     const n = parseFloat(t);
                     if (!isNaN(n)) return n;
-                }
-                // 兜底：本地播放进度（平台不显示进度条时仍可检测卡住/完成）
-                const v = document.querySelector('video');
-                if (v && v.duration > 0 && isFinite(v.currentTime)) {
-                    return Math.min(100, v.currentTime / v.duration * 100);
                 }
                 return -1;
             }''')
@@ -1947,7 +1968,8 @@ class AutoLearner:
             pass
         return -1
 
-    async def find_and_play_video(self, page: Page, worker_id: int, progress_callback=None, course_type=""):
+    async def find_and_play_video(self, page: Page, worker_id: int, progress_callback=None,
+                                  course_type="", cancel_event=None):
         # 查找并播放视频，监控进度到100%
         # O4：3 分钟进度无变化判定卡住，提前放弃（替代最长 20 分钟空转）
         try:
@@ -1957,7 +1979,8 @@ class AutoLearner:
             video_found = False
             video_selectors = ["video", "audio", "[class*='video']", "[class*='audio']", ".prism-player"]
             for refresh_attempt in range(10):
-                if self._stop_event.is_set():  # 用户变更配置，立即停止
+                if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
+                    # 用户停止或心跳超时触发重试，立即结束当前播放。
                     return False
                 for sel in video_selectors:
                     try:
@@ -2009,7 +2032,7 @@ class AutoLearner:
             last_local_time = -1.0
             stall_count = 0
             for check in range(120 * (MAX_REFRESHES + 1)):
-                if self._stop_event.is_set():  # 用户变更配置，立即停止
+                if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     return False
                 await asyncio.sleep(10)
                 # 每次检查进度时，确保视频还在播放
@@ -2028,6 +2051,18 @@ class AutoLearner:
                 if local_time >= 0 and local_time != last_local_time:
                     last_local_time = local_time
                     advanced = True
+                # 没有平台进度条时，只有页面明确报告完成才能算成功；
+                # 本地播放到末尾本身不能证明服务器已收到学习进度。
+                if progress < 0 and local_time >= 0:
+                    try:
+                        done = await page.evaluate("""() => {
+                            const text = (document.body && (document.body.innerText || '')) || '';
+                            return /学习完成|已完成|已学习|已看完|恭喜您/.test(text);
+                        }""")
+                        if done:
+                            return True
+                    except Exception:
+                        pass
                 if advanced:
                     stall_count = 0
                     continue
@@ -2263,7 +2298,8 @@ class AutoLearner:
     }"""
 
     async def find_and_play_trainingcamp_video(self, page: Page, worker_id: int,
-                                               progress_callback=None, log_callback=None):
+                                               progress_callback=None, log_callback=None,
+                                               cancel_event=None):
         """学习训练营课程页里的视频/音频组件，由平台确认课程完成。
 
         组件类型不止 cuVideo/cuAudio（cuCase 课程包同样渲染阿里播放器且没有进度条），
@@ -2404,7 +2440,7 @@ class AutoLearner:
                         for c in (state.get("components") or [])):
                     debug(f"{prefix} 页面组件已渲染但没有可自动完成的组件，提前结束等待")
                     break
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     return False
                 await page.wait_for_timeout(1000)
                 state = await snapshot()
@@ -2489,7 +2525,7 @@ class AutoLearner:
                         component = match
                         media_ready = False
                         break
-                    if self._stop_event.is_set():
+                    if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                         return False
                     await page.wait_for_timeout(1000)
 
@@ -2522,7 +2558,7 @@ class AutoLearner:
                 local_reached_since = None
                 component_complete = False
                 for _ in range(120 * 4):
-                    if self._stop_event.is_set():
+                    if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                         return False
                     await page.wait_for_timeout(TRAINCAMP_POLL_SECONDS * 1000)
                     current_state = await snapshot()
@@ -2626,7 +2662,7 @@ class AutoLearner:
             # 所以「逐个点开始阅读」就等于学完；点开的新标签页看完就关掉。
             state = await snapshot()
             for component in components_of_kind(state, "book", "outlink"):
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     return False
                 component_class = component.get("componentClass")
                 is_book = component.get("kind") == "book"
@@ -2696,7 +2732,7 @@ class AutoLearner:
             if read_components:
                 _log(f"{prefix} 有 {len(read_components)} 个图文/图片组件未完成，逐个滚动到视口", "blue")
             for component in read_components:
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     return False
                 component_class = component.get("componentClass")
                 try:
@@ -4179,68 +4215,96 @@ class AutoLearner:
         # 网络自学使用共享队列；worker 消费完当前课程后会继续取课。
         # 队列将空时，单独的列表页串行翻页并补充新课程。
         done_titles = self.load_completed_course_titles()
+        done_keys = set(self.load_progress().get("completed_course_keys", []))
         if done_titles:
             _log(f"已有 {len(done_titles)} 门课程学过，将跳过", "blue")
         seen_titles = set()
         seen_pages = set()
         page_num = 1
         no_more_pages = False
+        retry_current_page = False
+        saw_courses = False
         course_queue = asyncio.Queue()
         fetch_lock = asyncio.Lock()
         goal_reached = asyncio.Event()
         prefetch_tasks = set()
 
         async def collect_current_page():
-            nonlocal no_more_pages
-            try:
-                await page.wait_for_selector("a.p-cursor[title]", timeout=15000)
-            except Exception:
-                _log(f"课程列表第 {page_num} 页未加载出课程", "yellow")
-                no_more_pages = True
+            nonlocal no_more_pages, retry_current_page, saw_courses
+            loaded = False
+            for attempt in range(3):
+                try:
+                    await page.wait_for_selector("a.p-cursor[title]", timeout=15000)
+                    loaded = True
+                    break
+                except Exception:
+                    if attempt < 2:
+                        await page.wait_for_timeout(2000)
+            if not loaded:
+                # 网络抖动不能等价于“没有下一页”；保留当前页，后续补课时重试。
+                retry_current_page = True
+                _log(f"课程列表第 {page_num} 页暂时未加载，稍后重试", "yellow")
                 return 0
             cards = page.locator("a.p-cursor[title]")
             cnt = await cards.count()
             if cnt == 0:
                 _log(f"课程列表第 {page_num} 页没有课程", "yellow")
                 no_more_pages = True
+                retry_current_page = False
                 return 0
+            saw_courses = True
 
-            titles = []
+            cards_data = []
             for i in range(cnt):
                 try:
                     title = (await cards.nth(i).get_attribute("title") or "").strip()
+                    href = (await cards.nth(i).get_attribute("href") or "").strip()
                 except Exception:
                     title = ""
+                    href = ""
                 if title:
-                    titles.append(title)
+                    cards_data.append({"title": title, "href": href, "index": i})
 
             # 防止翻页点击未生效时重复扫描当前页。
-            fingerprint = tuple(titles)
+            fingerprint = tuple((item["title"], item["href"]) for item in cards_data)
             if fingerprint in seen_pages:
                 _log("课程列表翻页后内容未变化，停止继续采集", "yellow")
                 no_more_pages = True
+                retry_current_page = False
                 return 0
             seen_pages.add(fingerprint)
 
             added = 0
-            for title in titles:
-                if title in seen_titles:
+            for item in cards_data:
+                title = item["title"]
+                href = item["href"]
+                course_key = href or f"page:{page_num}:index:{item['index']}"
+                if course_key in seen_titles:
                     continue
-                seen_titles.add(title)
-                if title[:60] in done_titles:
+                seen_titles.add(course_key)
+                # 新记录优先按 href 去重；旧版本只有标题记录时才回退到标题。
+                if (href and href in done_keys) or (not href and title[:60] in done_titles):
                     continue
-                course_queue.put_nowait({"page": page_num, "title": title[:60]})
+                course_queue.put_nowait({"page": page_num, "title": title[:60],
+                                         "href": href, "key": course_key})
                 added += 1
             _log(f"课程列表第 {page_num} 页: {cnt} 门（新增 {added}）", "blue")
             return added
 
         async def fetch_more_courses(force=False):
-            nonlocal page_num, no_more_pages
+            nonlocal page_num, no_more_pages, retry_current_page
             async with fetch_lock:
                 if self._stop_event.is_set() or goal_reached.is_set() or no_more_pages:
                     return 0
                 if course_queue.qsize() > 0 and not force:
                     return course_queue.qsize()
+
+                if retry_current_page:
+                    retry_current_page = False
+                    added = await collect_current_page()
+                    if added > 0:
+                        _log(f"重试当前页后新增 {added} 门课程", "green")
+                    return added
 
                 while not no_more_pages and not self._stop_event.is_set():
                     try:
@@ -4260,6 +4324,8 @@ class AutoLearner:
                     if added > 0:
                         _log(f"课程池新增 {added} 门课程", "green")
                         return added
+                    if retry_current_page:
+                        return 0
 
                 return 0
 
@@ -4283,13 +4349,13 @@ class AutoLearner:
                 break
 
         if course_queue.qsize() == 0:
-            _log("课程列表未获取到课程", "yellow")
+            _log("课程列表没有待学习课程" if saw_courses else "课程列表未获取到课程", "yellow")
             self.last_stats = (0, 0)
             try:
                 await page.close()
             except Exception:
                 pass
-            return False
+            return bool(saw_courses and not self._stop_event.is_set())
 
         nw = min(self.workers, course_queue.qsize())
         _log(f"课程池初始采集 {course_queue.qsize()} 门课程，启动 {nw} 个线程", "bold blue")
@@ -4317,6 +4383,7 @@ class AutoLearner:
                 if self._stop_event.is_set():
                     break
                 cpage, ctitle = task["page"], task["title"]
+                chref, ckey = task.get("href", ""), task.get("key", "")
                 _log(f"[线程{wid+1}] {ctitle}", "blue")
                 _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "加载中"})
                 done_ok = False
@@ -4337,14 +4404,25 @@ class AutoLearner:
                         links = wp.locator("a.p-cursor[title]")
                         ln = await links.count()
                         link = None
+                        title_candidate = None
                         for i in range(ln):
                             try:
-                                t = (await links.nth(i).get_attribute("title") or "").strip()
+                                candidate = links.nth(i)
+                                t = (await candidate.get_attribute("title") or "").strip()
+                                h = (await candidate.get_attribute("href") or "").strip()
                             except:
                                 t = ""
-                            if t and ctitle in t:
-                                link = links.nth(i)
+                                h = ""
+                            if ((chref and h == chref) or
+                                    (chref and h and chref.rstrip('/') == h.rstrip('/')) or
+                                    (not chref and t and ctitle in t)):
+                                link = candidate
                                 break
+                            if chref and t and ctitle in t and title_candidate is None:
+                                title_candidate = candidate
+                        if link is None and title_candidate is not None:
+                            # 列表页可能改写 href；标题仅作为地址匹配失败时的兼容兜底。
+                            link = title_candidate
                         if link is None:
                             # 未找到：可能是翻页未生效，抛错走重试而不是直接放弃
                             raise RuntimeError("未找到课程链接")
@@ -4405,7 +4483,7 @@ class AutoLearner:
                     ok_count[0] += 1
                     # O3 断点续学：记录已学课程，中断后重跑自动跳过
                     try:
-                        self.mark_course_completed(ctitle)
+                        self.mark_course_completed(ctitle, ckey)
                     except Exception:
                         pass
                     _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-", "status": "✓ 完成"})
@@ -4450,7 +4528,8 @@ class AutoLearner:
                 pass
         self.last_stats = (ok_count[0], fail_count[0])
         _log(f"网络自学阶段完成: 成功 {ok_count[0]} 门, 失败 {fail_count[0]} 门", "bold green")
-        return True
+        # 只有全部课程成功且没有被用户停止，阶段才算完成。
+        return bool(ok_count[0] > 0 and fail_count[0] == 0 and not self._stop_event.is_set())
 
     @staticmethod
     def _is_learnable(action: str, hours: str = "") -> bool:
@@ -4502,6 +4581,9 @@ class AutoLearner:
                 pass
 
         _log(f"使用 {len(collect_pages)} 个页面并行采集", "blue")
+        if not collect_pages:
+            _log("无法创建课程采集页面，本轮不标记为已完成", "red")
+            return [], {}
 
         # 每个采集页都先导航到专题班列表
         async def init_collect_page(cp):
@@ -4527,7 +4609,9 @@ class AutoLearner:
 
         await asyncio.gather(*(init_collect_page(cp) for cp in collect_pages))
 
-        sem = asyncio.Semaphore(COLLECT_CONCURRENCY)
+        # 页面创建可能部分失败；并发上限必须跟实际页面数一致，
+        # 否则多个 collector 会同时操作同一个 SPA 页面。
+        sem = asyncio.Semaphore(len(collect_pages))
 
         async def collect_one(idx: int, ws: dict, cp: Page):
             """单个专题班：每个专题班用新页面，避免SPA状态累积"""
@@ -4892,7 +4976,7 @@ class AutoLearner:
             hours_table.add_row("更新时间", h['updated'])
 
             # 线程进度表
-            table = Table(title=f"学习进度（完成 {completed_count[0]}/{total}，失败 {failed[0]}）")
+            table = Table(title=f"学习进度（完成 {completed_count[0]}/{total_ref[0]}，失败 {failed[0]}）")
             table.add_column("线程", style="cyan", width=4)
             table.add_column("课程", style="white", width=36)
             table.add_column("进度", style="green", width=6)
@@ -4913,7 +4997,7 @@ class AutoLearner:
             return Group(hours_table, table)
 
         # 进度统计
-        total = len(all_tasks)
+        total_ref = [len(all_tasks)]
         completed_count = [0]
         failed = [0]
         lock_stat = asyncio.Lock()
@@ -4926,9 +5010,38 @@ class AutoLearner:
             ws_progress[ws_id]["total"] += 1
         completed_ws_ids = set()
 
+        # 动态补课也必须即时纳入总数和专题班统计。
+        registered_task_keys = set()
+
+        def task_key(ws_id, cidx, course):
+            return (ws_id, cidx, course.get('url', '') or course.get('title', '').strip()[:80])
+
+        for ws_id, cidx, course, _ws_title in all_tasks:
+            registered_task_keys.add(task_key(ws_id, cidx, course))
+
+        def register_queued_task(item):
+            """队列入队钩子：初始任务已登记，动态任务在入队时登记。"""
+            if not isinstance(item, (tuple, list)) or len(item) < 4:
+                return
+            ws_id, cidx, course, ws_title = item[:4]
+            if not isinstance(course, dict):
+                return
+            key = task_key(ws_id, cidx, course)
+            if key in registered_task_keys:
+                return
+            registered_task_keys.add(key)
+            total_ref[0] += 1
+            wp = ws_progress.setdefault(ws_id, {"total": 0, "done": 0, "title": ws_title})
+            wp["total"] += 1
+
+        class _TrackedQueue(asyncio.Queue):
+            def put_nowait(self, item):
+                register_queued_task(item)
+                return super().put_nowait(item)
+
         # 构建任务队列（每个任务带重试计数）
         MAX_RETRY = 3
-        course_queue = asyncio.Queue()
+        course_queue = _TrackedQueue()
         seen_courses = set()  # 去重：已见过的课程URL
         dedup_count = 0
         for t in all_tasks:
@@ -5078,14 +5191,17 @@ class AutoLearner:
                     update_status(w_id, status="学习中", progress="0%")
                     def on_progress(pct):
                         update_status(w_id, progress=f"{pct:.0f}%", status="学习中")
-                    play_ok = await self.find_and_play_video(course_page, w_id, on_progress,
-                                                             course_type=course.get('type', ''))
+                    play_ok = await self.find_and_play_video(
+                        course_page, w_id, on_progress,
+                        course_type=course.get('type', ''), cancel_event=cancel_event)
                     if not play_ok:
                         debug(f"[工作线程 {w_id+1}] 视频未完成: {title}")
                         try:
                             await course_page.close()
                         except:
                             pass
+                        if cancel_event.is_set():
+                            continue
                         if retry_task(ws_id, cidx, course, ws_title, retry, w_id):
                             continue
                         update_status(w_id, status="播放失败")
@@ -5851,7 +5967,8 @@ def cli(ctx):
 
 @cli.command()
 @click.option("--headless", is_flag=True, help="隐藏浏览器界面")
-@click.option("--workers", default=1, help="同时学习的页面数量")
+@click.option("--workers", default=1, type=click.IntRange(1, 20),
+              help="同时学习的页面数量（1-20）")
 @click.option("--target-hours", default=0.0, help="目标学习学时，0表示不限制")
 @click.option("--tags", multiple=True, help="要学习的标签，例如：党的创新理论教育 党性教育")
 @click.option("--exam/--no-exam", "exam", default=None,
