@@ -35,10 +35,11 @@ from qfluentwidgets import (
     TitleLabel, IconWidget,
     InfoBar, InfoBarPosition,
     Dialog,
+    NavigationInterface, NavigationItemPosition, NavigationWidget,
 )
 
 from ui_theme import (
-    NavigationRail, PageHeader, StepBar, SurfaceCard,
+    BrandNavigationWidget, PageHeader, StepBar, SurfaceCard,
     apply_theme, normalize_theme_mode,
 )
 
@@ -355,8 +356,10 @@ class ConfigScreen(QWidget):
     # 后台线程测试 DeepSeek 连接的结果（跨线程 → 主线程，QueuedConnection）
     api_test_signal = Signal(bool, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, section: str = "all", sidebar_mode: bool = False):
         super().__init__(parent)
+        self.section = section
+        self.sidebar_mode = sidebar_mode
         self._load_config()
         self._build_ui()
         self.api_test_signal.connect(self._finish_test_api)
@@ -394,8 +397,17 @@ class ConfigScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        layout.addWidget(PageHeader("运行配置", "设置工作线程数、浏览器模式和考试自动答题"))
-        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=0))
+        title_map = {
+            "all": ("运行配置", "设置工作线程数、浏览器模式和考试自动答题"),
+            "runtime": ("运行与浏览器", "调整 worker、浏览器和启动方式"),
+            "exam": ("考试设置", "配置训练营考试的自动答题能力"),
+            "appearance": ("外观设置", "选择主题和动效偏好"),
+        }
+        title, subtitle = title_map.get(self.section, title_map["all"])
+        layout.addWidget(PageHeader(title, subtitle))
+        self.step_bar = StepBar(["配置", "登录", "学习方式", "目标"], active=0)
+        self.step_bar.setVisible(not self.sidebar_mode)
+        layout.addWidget(self.step_bar)
 
         layout.addSpacing(10)
 
@@ -609,12 +621,22 @@ class ConfigScreen(QWidget):
         appearance_card.viewLayout.addLayout(appearance_layout)
         layout.addWidget(appearance_card)
 
+        self._section_widgets = {
+            "runtime": (workers_card, browser_card),
+            "exam": (exam_card,),
+            "appearance": (appearance_card,),
+        }
+        if self.sidebar_mode and self.section in self._section_widgets:
+            visible = set(self._section_widgets[self.section])
+            for card in (workers_card, browser_card, exam_card, appearance_card):
+                card.setVisible(card in visible)
+
         layout.addStretch()
 
         # Start button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.btn_start = PrimaryPushButton("  开始")
+        self.btn_start = PrimaryPushButton("  保存并返回" if self.sidebar_mode else "  开始")
         self.btn_start.setIcon(FIF.PLAY)
         self.btn_start.setFixedSize(160, 40)
         self.btn_start.clicked.connect(self._on_start)
@@ -739,12 +761,8 @@ class ConfigScreen(QWidget):
         win.cfg_theme_mode = self.combo_theme.currentData() or "auto"
         win.cfg_reduced_motion = self.switch_reduced_motion.isChecked()
         apply_theme(QApplication.instance(), win.cfg_theme_mode)
-        if getattr(win, "_in_main_shell", False):
-            win._screen_index = 5
-            win.set_navigation_visible(True)
-            win.navigationInterface.set_active("dashboard")
-            win.switchTo(win.screen_dashboard)
-            win.screen_dashboard.start_learning()
+        if self.sidebar_mode or getattr(win, "_settings_mode", False):
+            win.return_to_dashboard(restart=True)
             return
         win.next_screen()
 
@@ -753,8 +771,9 @@ class ConfigScreen(QWidget):
 
 
 class LoginScreen(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, sidebar_mode: bool = False):
         super().__init__(parent)
+        self.sidebar_mode = sidebar_mode
         self._load_creds()
         self._build_ui()
 
@@ -791,8 +810,12 @@ class LoginScreen(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignTop)
 
-        layout.addWidget(PageHeader("用户登录", "输入统一认证账号密码"))
-        layout.addWidget(StepBar(["配置", "登录", "学习方式", "目标"], active=1))
+        title = "账号登录" if self.sidebar_mode else "用户登录"
+        subtitle = "管理账号、登录方式和当前会话" if self.sidebar_mode else "输入统一认证账号密码"
+        layout.addWidget(PageHeader(title, subtitle))
+        self.step_bar = StepBar(["配置", "登录", "学习方式", "目标"], active=1)
+        self.step_bar.setVisible(not self.sidebar_mode)
+        layout.addWidget(self.step_bar)
 
         layout.addSpacing(10)
 
@@ -845,7 +868,7 @@ class LoginScreen(QWidget):
         # Button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.btn_login = PrimaryPushButton("  登录")
+        self.btn_login = PrimaryPushButton("  保存并重新登录" if self.sidebar_mode else "  登录")
         self.btn_login.setIcon(FIF.PEOPLE)
         self.btn_login.setFixedSize(160, 40)
         self.btn_login.clicked.connect(self._on_login)
@@ -878,8 +901,11 @@ class LoginScreen(QWidget):
         win.cfg_username = username
         win.cfg_password = password
         win.cfg_auto_login = auto
-        self.lbl_status.setText("账号已保存，正在进入学习设置…")
-        win.next_screen()
+        self.lbl_status.setText("账号已保存，正在重新启动学习…" if self.sidebar_mode else "账号已保存，正在进入学习设置…")
+        if self.sidebar_mode:
+            win.return_to_dashboard(restart=True)
+        else:
+            win.next_screen()
 
 
 # ─── Goal Screen ───────────────────────────────────────────────────
@@ -909,6 +935,8 @@ class GoalScreen(QWidget):
             self.online_goal_widget.setVisible(self._saved_online_on)
         except Exception:
             pass
+        if hasattr(self, "btn_next"):
+            self.btn_next.setText("  保存并返回" if getattr(self.window(), "_settings_mode", False) else "  继续")
 
     def _load_goal(self):
         self._saved_central = 0
@@ -1107,6 +1135,7 @@ class GoalScreen(QWidget):
         btn_next.setIcon(FIF.RIGHT_ARROW)
         btn_next.setFixedSize(120, 40)
         btn_next.clicked.connect(self._on_next)
+        self.btn_next = btn_next
         btn_layout.addWidget(btn_next)
 
         layout.addLayout(btn_layout)
@@ -1154,7 +1183,10 @@ class GoalScreen(QWidget):
         win.cfg_online_goal = online_goal if online_on else 0
         win.cfg_central_mode = central_mode if central_on else "target"
         win.cfg_online_mode = online_mode if online_on else "target"
-        win.next_screen()
+        if getattr(win, "_settings_mode", False):
+            win.return_to_dashboard(restart=True)
+        else:
+            win.next_screen()
 
 
 # ─── Dashboard Screen ──────────────────────────────────────────────
@@ -1189,6 +1221,7 @@ class ModeScreen(QWidget):
         auto_card = HeaderCardWidget(self)
         auto_card.setTitle("自动模式")
         auto_card.setBorderRadius(10)
+        auto_card.setMinimumHeight(150)
         auto_card.viewLayout.setContentsMargins(24, 6, 24, 14)
         a_layout = QVBoxLayout()
         a_layout.setSpacing(6)
@@ -1206,7 +1239,11 @@ class ModeScreen(QWidget):
         btn_auto.setFixedWidth(200)
         btn_auto.setFixedHeight(36)
         btn_auto.clicked.connect(lambda: self._select_mode("auto"))
-        a_layout.addWidget(btn_auto)
+        a_button_row = QHBoxLayout()
+        a_button_row.addStretch()
+        a_button_row.addWidget(btn_auto)
+        a_button_row.addStretch()
+        a_layout.addLayout(a_button_row)
         auto_card.viewLayout.addLayout(a_layout)
         layout.addWidget(auto_card)
 
@@ -1214,6 +1251,7 @@ class ModeScreen(QWidget):
         manual_card = HeaderCardWidget(self)
         manual_card.setTitle("手动模式")
         manual_card.setBorderRadius(10)
+        manual_card.setMinimumHeight(150)
         manual_card.viewLayout.setContentsMargins(24, 6, 24, 14)
         m_layout = QVBoxLayout()
         m_layout.setSpacing(6)
@@ -1231,7 +1269,11 @@ class ModeScreen(QWidget):
         btn_manual.setFixedWidth(200)
         btn_manual.setFixedHeight(36)
         btn_manual.clicked.connect(lambda: self._select_mode("manual"))
-        m_layout.addWidget(btn_manual)
+        m_button_row = QHBoxLayout()
+        m_button_row.addStretch()
+        m_button_row.addWidget(btn_manual)
+        m_button_row.addStretch()
+        m_layout.addLayout(m_button_row)
         manual_card.viewLayout.addLayout(m_layout)
         layout.addWidget(manual_card)
 
@@ -1261,6 +1303,8 @@ class ModeScreen(QWidget):
         if not dlg.exec():
             return
         win.cfg_mode = mode
+        if hasattr(win, "update_learning_navigation"):
+            win.update_learning_navigation()
         # 互斥：选择一种模式即清空另一种模式的配置，避免两套设置混在一起
         try:
             cfg = {}
@@ -1424,7 +1468,10 @@ class ManualScreen(QWidget):
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
             pass
-        win.next_screen()  # → dashboard
+        if getattr(win, "_settings_mode", False):
+            win.return_to_dashboard(restart=True)
+        else:
+            win.next_screen()  # → dashboard
 
 
 # ─── Dashboard Screen ──────────────────────────────────────────────
@@ -1461,7 +1508,7 @@ class DashboardScreen(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         # Header
@@ -1496,11 +1543,7 @@ class DashboardScreen(QWidget):
         btn_update.clicked.connect(self._check_update_manual)
         header.addWidget(btn_update)
 
-        btn_settings = ToolButton(FIF.SETTING)
-        btn_settings.setToolTip("设置")
-        btn_settings.clicked.connect(lambda: self.window().show_settings())
-        header.addWidget(btn_settings)
-        self.btn_log_open = ToolButton(FIF.CHECKBOX)
+        self.btn_log_open = ToolButton(FIF.DOCUMENT)
         self.btn_log_open.setToolTip("展开日志")
         self.btn_log_open.clicked.connect(self._toggle_log)
         header.addWidget(self.btn_log_open)
@@ -1635,7 +1678,7 @@ class DashboardScreen(QWidget):
         log_header = QHBoxLayout()
         log_header.setContentsMargins(16, 12, 16, 8)
         log_header.setSpacing(6)
-        log_icon = IconWidget(FIF.CHECKBOX, self)
+        log_icon = IconWidget(FIF.DOCUMENT, self)
         log_icon.setFixedSize(16, 16)
         log_header.addWidget(log_icon)
         log_header.addWidget(SubtitleLabel("日志"))
@@ -3007,33 +3050,39 @@ from PySide6.QtWidgets import QMainWindow
 
 
 class _BaseWindow(QMainWindow):
-    """跨平台统一应用壳层：原生窗口 + 自定义侧栏 + 页面堆栈。"""
+    """原生窗口壳层 + QFluentWidgets 官方 NavigationInterface。"""
 
     def __init__(self):
         super().__init__()
         self._stack = QStackedWidget()
-        self._nav = NavigationRail(self)
-        self._nav.hide()
+        self.navigationInterface = NavigationInterface(
+            self, showMenuButton=False, showReturnButton=False, collapsible=False)
+        self.navigationInterface.setExpandWidth(176)
+        self.navigationInterface.expand()
         shell = QWidget(self)
         shell_layout = QHBoxLayout(shell)
         shell_layout.setContentsMargins(12, 12, 12, 12)
         shell_layout.setSpacing(12)
-        shell_layout.addWidget(self._nav)
+        shell_layout.addWidget(self.navigationInterface)
         shell_layout.addWidget(self._stack, 1)
         self.setCentralWidget(shell)
 
     def addSubInterface(self, widget, icon, text, **kw):
         self._stack.addWidget(widget)
+        route_key = widget.objectName()
+        on_click = (lambda key=route_key: self._on_navigation(key)) \
+            if hasattr(self, "_on_navigation") else (lambda: self.switchTo(widget))
+        self.navigationInterface.addItem(
+            route_key, icon, text,
+            onClick=on_click,
+            position=kw.get("position", NavigationItemPosition.TOP),
+        )
 
     def switchTo(self, widget):
         self._stack.setCurrentWidget(widget)
 
-    @property
-    def navigationInterface(self):
-        return self._nav
-
     def set_navigation_visible(self, visible: bool):
-        self._nav.setVisible(bool(visible))
+        self.navigationInterface.setVisible(bool(visible))
 
 
 class MainWindow(_BaseWindow):
@@ -3104,6 +3153,11 @@ class MainWindow(_BaseWindow):
         self.setMinimumSize(900, 640)
         self._drag_pos = None
         self._in_main_shell = False
+        self._settings_mode = False
+        self._update_in_progress = False
+        self._update_download_path = ""
+        self._update_wait_started = 0.0
+        self._update_wait_timer = None
 
         # 设置窗口图标
         icon_path = _get_resource_path("icon.png")
@@ -3150,11 +3204,13 @@ class MainWindow(_BaseWindow):
         # 检查是否有保存的配置，有则自动开始
         has_config = self._load_saved_config()
         apply_theme(QApplication.instance(), getattr(self, "cfg_theme_mode", "auto"))
+        self.update_learning_navigation()
         if has_config:
             self._screen_index = 5
             self._in_main_shell = True
+            self._settings_mode = False
             self.set_navigation_visible(True)
-            self.navigationInterface.set_active("dashboard")
+            self.navigationInterface.setCurrentItem("dashboard")
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
         elif os.path.exists(CONFIG_PATH):
@@ -3184,46 +3240,90 @@ class MainWindow(_BaseWindow):
         self.screen_goal.setObjectName("goal")
         self.screen_manual = ManualScreen(self)
         self.screen_manual.setObjectName("manual")
+        # 主界面设置：与首次使用向导共用表单逻辑，但不再串行跳转。
+        self.screen_account = LoginScreen(self, sidebar_mode=True)
+        self.screen_account.setObjectName("account")
+        self.screen_runtime = ConfigScreen(self, section="runtime", sidebar_mode=True)
+        self.screen_runtime.setObjectName("runtime")
+        self.screen_exam = ConfigScreen(self, section="exam", sidebar_mode=True)
+        self.screen_exam.setObjectName("exam")
+        self.screen_appearance = ConfigScreen(self, section="appearance", sidebar_mode=True)
+        self.screen_appearance.setObjectName("appearance")
         self.screen_dashboard = DashboardScreen(self)
         self.screen_dashboard.setObjectName("dashboard")
 
-        # Add sub interfaces with icons
-        self.addSubInterface(self.screen_welcome, FIF.HOME, "欢迎")
-        self.addSubInterface(self.screen_config, FIF.SETTING, "配置")
-        self.addSubInterface(self.screen_login, FIF.PEOPLE, "登录")
-        self.addSubInterface(self.screen_mode, FIF.TILES, "模式")
-        self.addSubInterface(self.screen_goal, FIF.FLAG, "目标")
-        self.addSubInterface(self.screen_manual, FIF.LINK, "手动")
+        # Official QFluentWidgets navigation owns the application shell.
+        for wizard_screen in (self.screen_welcome, self.screen_config, self.screen_login,
+                              self.screen_goal, self.screen_manual):
+            self._stack.addWidget(wizard_screen)
+        brand_widget = BrandNavigationWidget(
+            _get_resource_path("icon.png"), self.navigationInterface)
+        self.navigationInterface.addWidget(
+            "brand", brand_widget, position=NavigationItemPosition.TOP)
+
         self.addSubInterface(self.screen_dashboard, FIF.HOME, "仪表盘")
+        self.addSubInterface(self.screen_mode, FIF.TILES, "学习方式")
+        self.navigationInterface.addItem(
+            "learning", FIF.FLAG, "学习目标",
+            onClick=lambda: self._on_navigation("learning"),
+            position=NavigationItemPosition.TOP,
+        )
+        self.addSubInterface(self.screen_account, FIF.PEOPLE, "账号登录")
+        self.addSubInterface(self.screen_runtime, FIF.SETTING, "运行与浏览器")
+        self.addSubInterface(self.screen_exam, FIF.CHECKBOX, "考试设置")
+        self.addSubInterface(self.screen_appearance, FIF.PALETTE, "外观设置")
+
+        # 官方导航项的点击信号负责更新当前页面状态；显式连接可避免不同
+        # QFluentWidgets 版本对 onClick 参数签名的差异。
+        for route_key in ("dashboard", "mode", "account", "runtime", "exam", "appearance"):
+            item = self.navigationInterface.panel.items[route_key].widget
+            item.clicked.connect(lambda _checked, key=route_key: self._on_navigation(key))
+        self.navigationInterface.panel.items["learning"].widget.clicked.connect(
+            lambda _checked: self._on_navigation("learning"))
 
         self._screen_index = 0
         self._main_pages = {
             "dashboard": self.screen_dashboard,
             "mode": self.screen_mode,
-            "manual": self.screen_manual,
-            "settings": self.screen_config,
+            "learning": self.screen_goal,
+            "account": self.screen_account,
+            "runtime": self.screen_runtime,
+            "exam": self.screen_exam,
+            "appearance": self.screen_appearance,
         }
-        self.navigationInterface.add_item("dashboard", FIF.HOME, "仪表盘")
-        self.navigationInterface.add_item("mode", FIF.TILES, "学习方式")
-        self.navigationInterface.add_item("manual", FIF.LINK, "手动学习")
-        self.navigationInterface.add_item("settings", FIF.SETTING, "设置")
-        self.navigationInterface.pageSelected.connect(self._on_navigation)
+        self.update_learning_navigation()
         self.set_navigation_visible(False)
 
     def _on_navigation(self, key):
+        if key == "learning":
+            self.update_learning_navigation()
         widget = self._main_pages.get(key)
         if not widget:
             return
-        if key == "settings":
-            self._screen_index = 1
-        elif key == "mode":
+        if key == "mode":
             self._screen_index = 3
-        elif key == "manual":
+        elif key == "learning":
             self._screen_index = 4
+            widget = self.screen_goal if self.cfg_mode == "auto" else self.screen_manual
+        elif key in ("account", "runtime", "exam", "appearance"):
+            self._screen_index = 1
         elif key == "dashboard":
             self._screen_index = 5
+        self._settings_mode = key != "dashboard"
         self.switchTo(widget)
-        self.navigationInterface.set_active(key)
+        self.navigationInterface.setCurrentItem(key)
+
+    def update_learning_navigation(self):
+        """根据当前模式更新侧栏的动态学习入口。"""
+        if not hasattr(self, "navigationInterface") or "learning" not in self.navigationInterface.panel.items:
+            return
+        item = self.navigationInterface.panel.items["learning"].widget
+        if getattr(self, "cfg_mode", "auto") == "manual":
+            item.setText("手动学习")
+            item.setIcon(FIF.LINK)
+        else:
+            item.setText("学习目标")
+            item.setIcon(FIF.FLAG)
 
     def _check_update(self):
         """检查是否有新版本（后台线程，避免阻塞GUI）"""
@@ -3405,6 +3505,60 @@ class MainWindow(_BaseWindow):
         threading.Thread(target=do_download, daemon=True).start()
 
     def _apply_update(self, download_path):
+        """下载完成后先结束学习和浏览器，再启动更新进程。"""
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self._update_download_path = download_path
+        self._update_wait_started = __import__("time").monotonic()
+        self._set_update_status("正在关闭学习任务和浏览器…")
+        dash = getattr(self, "screen_dashboard", None)
+        worker = getattr(dash, "_worker", None) if dash else None
+        if worker and worker.isRunning():
+            dash._stop_current_learning()
+            self._update_wait_timer = QTimer(self)
+            self._update_wait_timer.setInterval(200)
+            self._update_wait_timer.timeout.connect(self._poll_update_shutdown)
+            self._update_wait_timer.start()
+        else:
+            self._finish_update_shutdown(False)
+
+    def _set_update_status(self, message):
+        dash = getattr(self, "screen_dashboard", None)
+        if dash is not None:
+            dash.lbl_session_state.setText(message)
+
+    def _poll_update_shutdown(self):
+        dash = getattr(self, "screen_dashboard", None)
+        worker = getattr(dash, "_worker", None) if dash else None
+        if not worker or not worker.isRunning():
+            self._finish_update_shutdown(False)
+            return
+        elapsed = __import__("time").monotonic() - self._update_wait_started
+        if elapsed < 20:
+            self._set_update_status(f"正在关闭学习任务… {int(elapsed)} / 20 秒")
+            return
+        try:
+            from main import _kill_playwright_chrome
+            _kill_playwright_chrome()
+        except Exception:
+            pass
+        try:
+            worker.terminate()
+            worker.wait(3000)
+        except Exception:
+            pass
+        self._finish_update_shutdown(True)
+
+    def _finish_update_shutdown(self, forced):
+        if self._update_wait_timer:
+            self._update_wait_timer.stop()
+            self._update_wait_timer.deleteLater()
+            self._update_wait_timer = None
+        self._set_update_status("浏览器关闭超时，正在强制重启…" if forced else "浏览器已关闭，正在重启…")
+        QTimer.singleShot(250, self._launch_update_process)
+
+    def _launch_update_process(self):
         """用下载的文件替换自己（通过外部脚本 / 同目录直接启动新版本）"""
         import platform as _plat
         import subprocess
@@ -3419,11 +3573,16 @@ class MainWindow(_BaseWindow):
             if same_dir:
                 # 同目录更新（推荐）：直接启动新 exe，由新实例启动时删除旧版并改回规范名，
                 # 完全绕开"覆盖正在运行的 exe"与临时目录替换问题
-                subprocess.Popen(
-                    [download_path, "--post-update-old", current],
-                    cwd=os.path.dirname(os.path.abspath(current)),
-                    creationflags=0x08000000,
-                )
+                try:
+                    subprocess.Popen(
+                        [download_path, "--post-update-old", current],
+                        cwd=os.path.dirname(os.path.abspath(current)),
+                        creationflags=0x08000000,
+                    )
+                except Exception as exc:
+                    self._update_in_progress = False
+                    InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
+                    return
                 InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
                 QTimer.singleShot(300, sys.exit)
                 return
@@ -3446,7 +3605,12 @@ start "" "{current}"
 del "%~f0"
 """)
             # 启动bat脚本，退出自己
-            subprocess.Popen(["cmd", "/c", bat_path], creationflags=0x08000000)
+            try:
+                subprocess.Popen(["cmd", "/c", bat_path], creationflags=0x08000000)
+            except Exception as exc:
+                self._update_in_progress = False
+                InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
+                return
             InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
             QTimer.singleShot(500, sys.exit)
 
@@ -3456,12 +3620,14 @@ del "%~f0"
             import webbrowser
             webbrowser.open(DOWNLOAD_URL)
             InfoBar.info("更新", "请下载新版本 DMG 并手动替换应用", parent=self, position=InfoBarPosition.TOP)
+            self._update_in_progress = False
         else:
             # 源码运行，打开下载目录
             try:
                 os.system(f'open "{os.path.dirname(download_path)}"')
             except Exception:
                 pass
+            self._update_in_progress = False
 
     def _load_saved_config(self):
         """加载保存的配置，返回是否有完整配置"""
@@ -3566,29 +3732,45 @@ del "%~f0"
         elif self._screen_index == 5:
             # 目标/手动 → 仪表盘，或启动时恢复配置自动进入
             self._in_main_shell = True
+            self._settings_mode = False
             self.set_navigation_visible(True)
-            self.navigationInterface.set_active("dashboard")
+            self.navigationInterface.setCurrentItem("dashboard")
             self.switchTo(self.screen_dashboard)
             self.screen_dashboard.start_learning()
 
     def go_to_manual(self):
         """从模式选择跳到手动URL输入"""
         self._screen_index = 4
+        if hasattr(self, "update_learning_navigation"):
+            self.update_learning_navigation()
         self.switchTo(self.screen_manual)
 
     def show_mode_screen(self):
         """从手动URL输入返回模式选择"""
         self._screen_index = 3
+        self._settings_mode = False
         self.set_navigation_visible(self._in_main_shell)
         self.switchTo(self.screen_mode)
 
     def show_settings(self):
-        """从仪表盘返回设置界面"""
+        """兼容旧调用：从仪表盘打开运行与浏览器设置。"""
         self._screen_index = 1
         self._in_main_shell = True
+        self._settings_mode = True
         self.set_navigation_visible(True)
-        self.navigationInterface.set_active("settings")
-        self.switchTo(self.screen_config)
+        self.navigationInterface.setCurrentItem("runtime")
+        self.switchTo(self.screen_runtime)
+
+    def return_to_dashboard(self, restart: bool = False):
+        """从侧栏设置页返回仪表盘，并按需重新启动当前学习会话。"""
+        self._screen_index = 5
+        self._in_main_shell = True
+        self._settings_mode = False
+        self.set_navigation_visible(True)
+        self.navigationInterface.setCurrentItem("dashboard")
+        self.switchTo(self.screen_dashboard)
+        if restart:
+            self.screen_dashboard.start_learning()
 
 
 # ─── Entry ─────────────────────────────────────────────────────────
@@ -3654,7 +3836,9 @@ def _handle_self_update():
                 except Exception:
                     return
 
-        threading.Thread(target=_cleanup, daemon=True).start()
+        # 更新前旧进程已经完成浏览器清理，这里同步完成文件替换，
+        # 避免新版本 GUI 和后台重命名线程同时运行。
+        _cleanup()
     except Exception:
         pass
 

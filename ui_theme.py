@@ -5,13 +5,14 @@
 
 from dataclasses import dataclass
 from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QSizePolicy, QVBoxLayout,
     QWidget,
 )
 
 from qfluentwidgets import Theme, setTheme
+from qfluentwidgets import NavigationWidget
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,19 @@ def _stylesheet(t: ThemeTokens) -> str:
     QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {{
         border: 2px solid {t.accent}; padding: 6px 9px;
     }}
+    QComboBox::drop-down {{
+        width: 28px; border: none; background: transparent;
+    }}
+    QComboBox QAbstractItemView {{
+        background: {t.surface}; color: {t.text};
+        border: 1px solid {t.border}; outline: none;
+        selection-background-color: {t.accent_soft};
+        selection-color: {t.text}; padding: 4px;
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: 28px; padding: 5px 8px; border-radius: 6px;
+    }}
+    QComboBox QAbstractItemView::item:hover {{ background: {t.accent_soft}; }}
     QPushButton {{ border-radius: 9px; padding: 7px 14px; }}
     QPushButton:hover {{ background: {t.accent_soft}; }}
     QPushButton:pressed {{ padding-top: 8px; padding-bottom: 6px; }}
@@ -131,8 +145,30 @@ def apply_theme(app, mode: str = "auto") -> ThemeTokens:
     app.setPalette(_palette(tokens))
     family = app.font().family().replace("'", "")
     app.setStyleSheet(f"* {{ font-family: '{family}'; }}\n" + _stylesheet(tokens))
+    combos = []
+    for window in app.topLevelWidgets():
+        combos.extend(window.findChildren(QComboBox))
+    for combo in combos:
+        view = combo.view()
+        popup_palette = view.palette()
+        popup_palette.setColor(QPalette.Base, QColor(tokens.surface))
+        popup_palette.setColor(QPalette.Window, QColor(tokens.surface))
+        popup_palette.setColor(QPalette.AlternateBase, QColor(tokens.surface_alt))
+        popup_palette.setColor(QPalette.Text, QColor(tokens.text))
+        popup_palette.setColor(QPalette.Highlight, QColor(tokens.accent_soft))
+        popup_palette.setColor(QPalette.HighlightedText, QColor(tokens.text))
+        view.setPalette(popup_palette)
+        view.setAutoFillBackground(True)
+        view.setStyleSheet(
+            f"QAbstractItemView {{ background: {tokens.surface}; color: {tokens.text}; "
+            f"border: 1px solid {tokens.border}; selection-background-color: {tokens.accent_soft}; "
+            f"selection-color: {tokens.text}; }}"
+        )
     app.setProperty("moisten_theme_mode", mode)
     app.setProperty("moisten_tokens", tokens)
+    navigation = app.property("moisten_navigation")
+    if navigation is not None and hasattr(navigation, "refresh_icons"):
+        navigation.refresh_icons(mode, tokens.text_muted, tokens.accent_strong)
     return tokens
 
 
@@ -179,44 +215,24 @@ class StepBar(QWidget):
         layout.addStretch()
 
 
-class NavigationRail(QFrame):
-    pageSelected = Signal(str)
+class BrandNavigationWidget(NavigationWidget):
+    """官方 NavigationInterface 顶部品牌图标，不参与页面选择。"""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("navRail")
-        self.setFixedWidth(190)
-        self._buttons = {}
+    def __init__(self, image_path: str, parent=None):
+        super().__init__(False, parent)
+        self.setFixedHeight(72)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 16, 12, 12)
-        layout.setSpacing(6)
-        self.brand = QLabel("润物\nMOISTEN")
-        self.brand.setObjectName("heroTitle")
-        self.brand.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.brand)
-        self._items_layout = QVBoxLayout()
-        self._items_layout.setSpacing(5)
-        layout.addLayout(self._items_layout)
-        layout.addStretch()
-        self.caption = QLabel("学习工作台")
-        self.caption.setObjectName("muted")
-        self.caption.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.caption)
+        layout.setContentsMargins(4, 8, 4, 8)
+        layout.setAlignment(Qt.AlignCenter)
+        label = QLabel(self)
+        label.setAlignment(Qt.AlignCenter)
+        pixmap = QPixmap(image_path)
+        if not pixmap.isNull():
+            label.setPixmap(pixmap.scaled(QSize(40, 40), Qt.KeepAspectRatio,
+                                          Qt.SmoothTransformation))
+        layout.addWidget(label)
 
-    def add_item(self, key: str, icon, text: str):
-        button = QPushButton(self)
-        button.setToolTip(text)
-        button.setIcon(icon.icon() if hasattr(icon, "icon") else icon)
-        button.setText(text)
-        button.setIconSize(QSize(18, 18))
-        button.setFixedHeight(42)
-        button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        button.clicked.connect(lambda: self.pageSelected.emit(key))
-        self._items_layout.addWidget(button)
-        self._buttons[key] = button
-
-    def set_active(self, key: str):
-        for name, button in self._buttons.items():
-            button.setProperty("active", name == key)
-            button.style().unpolish(button)
-            button.style().polish(button)
+    def setCompacted(self, isCompacted: bool):
+        """官方基类会把自定义项强制设为 36px 高，这里保留品牌图标高度。"""
+        super().setCompacted(isCompacted)
+        self.setFixedHeight(72)
