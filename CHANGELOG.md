@@ -1,6 +1,14 @@
 # 更新日志
 
 ## 2.2.5
+- release: v2.2.5 visible study waves
+- chore: VERSION 2.2.4
+- docs: CHANGELOG 2.2.4
+- chore: VERSION 2.2.3
+- docs: CHANGELOG 2.2.3
+# 更新日志
+
+## 2.2.5
 - fix(motion): 增强学习背景与当前任务卡的横向流动波浪，让动效更易察觉
 - fix(motion): 将波浪循环缩短至约 6 秒，并继续遵循“减少动效”设置
 
