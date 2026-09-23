@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2.2.7
+- fix(网络自学): 兼容课程列表直接进入播放页、详情页学习入口及新窗口播放；总进度 100% 时跳过，不再反复刷新详情页
+- fix(更新): 修复 Windows 更新启动路径错误与旧版 EXE 替换失败，改进学习任务关闭和异常提示
+- test: Windows、macOS 构建前运行课程入口与更新回归测试
+
 ## 2.2.6
 - release: v2.2.6 sync goal progress indicators
 - chore: VERSION 2.2.5

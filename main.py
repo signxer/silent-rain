@@ -1974,11 +1974,16 @@ class AutoLearner:
         # O4：3 分钟进度无变化判定卡住，提前放弃（替代最长 20 分钟空转）
         try:
             debug(f"[工作线程 {worker_id+1}] 正在查找视频元素...")
+            if ("/course/#/detail/" in page.url
+                    and not await page.query_selector("video, audio, .prism-player")):
+                debug(f"[工作线程 {worker_id+1}] 当前仍是课程详情页，不刷新查找视频")
+                return False
 
             # 等待视频元素出现，找不到就刷新重试
             video_found = False
             video_selectors = ["video", "audio", "[class*='video']", "[class*='audio']", ".prism-player"]
-            for refresh_attempt in range(10):
+            max_load_refreshes = 3
+            for refresh_attempt in range(max_load_refreshes + 1):
                 if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     # 用户停止或心跳超时触发重试，立即结束当前播放。
                     return False
@@ -1993,8 +1998,8 @@ class AutoLearner:
                         pass
                 if video_found:
                     break
-                if refresh_attempt < 9:
-                    debug(f"[工作线程 {worker_id+1}] 视频未加载，刷新重试({refresh_attempt+1}/4)")
+                if refresh_attempt < max_load_refreshes:
+                    debug(f"[工作线程 {worker_id+1}] 视频未加载，刷新重试({refresh_attempt+1}/{max_load_refreshes})")
                     try:
                         await page.reload(wait_until="domcontentloaded", timeout=15000)
                         await page.wait_for_timeout(5000)
@@ -3603,6 +3608,10 @@ class AutoLearner:
     async def _refresh_video_page(self, page: Page, worker_id: int) -> bool:
         """刷新课程页并重新进入播放（卡住时重试），返回是否恢复成功"""
         try:
+            if ("/course/#/detail/" in page.url
+                    and not await page.query_selector("video, audio, .prism-player")):
+                debug(f"[工作线程 {worker_id+1}] 当前是课程详情页，不能刷新重试播放器")
+                return False
             await page.reload(wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(5000)
             # 刷新后播放器状态丢失，重新点击学习按钮
@@ -4152,6 +4161,59 @@ class AutoLearner:
                 pass
         console.print("课程模式学习完成", style="bold green")
 
+    async def _enter_online_course_player(self, detail_page: Page, worker_id: int) -> Optional[Page]:
+        """直接播放页原样返回；详情页 100% 返回 None，否则点击入口。"""
+        if "/course/#/detail/" not in detail_page.url:
+            return detail_page
+
+        percent = -1.0
+        progress = detail_page.locator(".progress-contain [role='progressbar']").first
+        if await progress.count():
+            try:
+                percent = float(await progress.get_attribute("aria-valuenow") or -1)
+            except (TypeError, ValueError):
+                percent = -1
+            if percent >= 100:
+                debug(f"[工作线程 {worker_id+1}] 课程详情页总进度 100%，跳过播放")
+                return None
+
+        button = detail_page.locator("button.to-learn").first
+        if await button.count() == 0:
+            for label in ("立即学习", "我要学习", "开始学习", "进入课程",
+                          "继续学习", "学习课程", "进入课程学习", "重新学习"):
+                candidate = detail_page.get_by_role("button", name=label, exact=True)
+                if await candidate.count():
+                    button = candidate.first
+                    break
+            else:
+                raise RuntimeError("课程详情页没有学习入口按钮")
+
+        existing_pages = set(detail_page.context.pages)
+        label = (await button.inner_text()).strip()
+        if label == "重新学习" and percent < 0:
+            raise RuntimeError("课程详情页进度未加载，暂不点击“重新学习”以免重学已完成课程")
+        debug(f"[工作线程 {worker_id+1}] 点击课程详情页入口: {label}")
+        await button.click()
+        for _ in range(16):
+            if self._stop_event.is_set():
+                raise RuntimeError("学习任务已停止")
+            new_pages = [p for p in detail_page.context.pages if p not in existing_pages]
+            if new_pages:
+                player_page = new_pages[-1]
+                try:
+                    await player_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    if not player_page.is_closed():
+                        await player_page.close()
+                    raise
+                return player_page
+            if not detail_page.is_closed() and "/course/#/detail/" not in detail_page.url:
+                return detail_page
+            if not detail_page.is_closed() and await detail_page.query_selector("video, audio, .prism-player"):
+                return detail_page
+            await detail_page.wait_for_timeout(500)
+        raise RuntimeError(f"点击“{label}”后仍停留在课程详情页，未进入播放页")
+
     async def learn_course_list(self, list_url: str = "https://u.ccb.com/course/#/list/1",
                                 log_callback=None, progress_callback=None, hours_callback=None):
         """网络自学：从课程列表页 /course/#/list/1 采集课程并学习（GUI自动模式使用）。
@@ -4361,6 +4423,7 @@ class AutoLearner:
         _log(f"课程池初始采集 {course_queue.qsize()} 门课程，启动 {nw} 个线程", "bold blue")
 
         ok_count = [0]
+        skipped_count = [0]
         fail_count = [0]
 
         async def course_task_stream():
@@ -4387,8 +4450,10 @@ class AutoLearner:
                 _log(f"[线程{wid+1}] {ctitle}", "blue")
                 _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "加载中"})
                 done_ok = False
+                already_complete = False
                 for attempt in range(1, 3):  # 每门课程最多重试1次
                     cp = None
+                    play_page = None
                     try:
                         # 1) 回到列表页并翻到目标页码
                         await wp.goto(list_url, wait_until="domcontentloaded", timeout=20000)
@@ -4434,43 +4499,26 @@ class AutoLearner:
                             await cp.wait_for_timeout(5000)
                         except Exception as e:
                             _log(f"[线程{wid+1}] 打开课程失败: {ctitle} - {e}", "yellow")
-                            if cp:
-                                try: await cp.close()
-                                except: pass
                             raise
-                        # 3) 点击学习按钮
-                        for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
-                            try:
-                                sb = cp.locator(f"text={kw}").first
-                                if await sb.count() > 0:
-                                    await sb.click()
-                                    await cp.wait_for_timeout(5000)
-                                    break
-                            except:
-                                pass
+                        # 3) 详情页先进入播放器；不能在信息页反复刷新找视频。
+                        play_page = await self._enter_online_course_player(cp, wid)
+                        if play_page is None:
+                            already_complete = True
+                            done_ok = True
+                            break
                         # 4) 播放视频（检查返回值：失败走重试）
                         _progress({"wid": wid, "course": ctitle[:40], "progress": "0%", "eta": "-", "status": "学习中"})
                         def on_progress(pct):
                             _progress({"wid": wid, "course": ctitle[:40],
                                        "progress": f"{pct:.0f}%", "eta": "-", "status": "学习中"})
-                        ok = await self.find_and_play_video(cp, wid, on_progress)
-                        try:
-                            await cp.close()
-                        except:
-                            pass
+                        ok = await self.find_and_play_video(play_page, wid, on_progress)
                         if not ok:
                             raise RuntimeError("视频未完成（未找到播放器或进度停滞）")
                         done_ok = True
                         break
                     except asyncio.CancelledError:
-                        if cp:
-                            try: await cp.close()
-                            except: pass
                         raise
                     except Exception as e:
-                        if cp:
-                            try: await cp.close()
-                            except: pass
                         if attempt < 2:
                             _log(f"[线程{wid+1}] 第{attempt}次失败，重试: {ctitle}", "yellow")
                             await asyncio.sleep(2)
@@ -4478,16 +4526,27 @@ class AutoLearner:
                         _log(f"[线程{wid+1}] 课程失败: {ctitle} - {e}", "red")
                         _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "异常"})
                         break
+                    finally:
+                        for opened in (play_page, cp):
+                            if opened and not opened.is_closed():
+                                try:
+                                    await opened.close()
+                                except Exception:
+                                    pass
 
                 if done_ok:
-                    ok_count[0] += 1
+                    if already_complete:
+                        skipped_count[0] += 1
+                    else:
+                        ok_count[0] += 1
                     # O3 断点续学：记录已学课程，中断后重跑自动跳过
                     try:
                         self.mark_course_completed(ctitle, ckey)
                     except Exception:
                         pass
-                    _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-", "status": "✓ 完成"})
-                    _log(f"[线程{wid+1}] 完成: {ctitle}", "green")
+                    _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-",
+                               "status": "已完成" if already_complete else "✓ 完成"})
+                    _log(f"[线程{wid+1}] {'已学完，跳过' if already_complete else '完成'}: {ctitle}", "green")
                 else:
                     fail_count[0] += 1
 
@@ -4527,9 +4586,10 @@ class AutoLearner:
             except Exception:
                 pass
         self.last_stats = (ok_count[0], fail_count[0])
-        _log(f"网络自学阶段完成: 成功 {ok_count[0]} 门, 失败 {fail_count[0]} 门", "bold green")
+        _log(f"网络自学阶段完成: 新学 {ok_count[0]} 门, 已学跳过 {skipped_count[0]} 门, 失败 {fail_count[0]} 门", "bold green")
         # 只有全部课程成功且没有被用户停止，阶段才算完成。
-        return bool(ok_count[0] > 0 and fail_count[0] == 0 and not self._stop_event.is_set())
+        return bool(ok_count[0] + skipped_count[0] > 0 and fail_count[0] == 0
+                    and not self._stop_event.is_set())
 
     @staticmethod
     def _is_learnable(action: str, hours: str = "") -> bool:

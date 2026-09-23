@@ -26,6 +26,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller pillow
 
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Sync Windows icon from source artwork
         shell: bash
         run: python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('icon.ico', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(72,72),(80,80),(96,96),(128,128),(256,256)])"
@@ -70,6 +73,9 @@ jobs:
           python3 -m pip install --upgrade pip
           pip3 install -r requirements.txt
           pip3 install pyinstaller
+
+      - name: Run regression tests
+        run: python3 -m unittest discover -s tests -v
 
       - name: Get version
         id: version
@@ -174,19 +180,21 @@ jobs:
           else
             NOTES=$(git log --pretty=format:"- %s" --no-merges -10)
           fi
-          # 更新本仓库 CHANGELOG.md（用 API 直接写，避免 detached HEAD 上 git push 失败被吞）
-          NEW_CHANGELOG="# 更新日志
+          # 已在发布提交中维护日志时，不再由 CI 重复追加同一版本。
+          if ! grep -qx "## ${VER}" CHANGELOG.md; then
+            NEW_CHANGELOG="# 更新日志
 
-          ## ${VER}
-          ${NOTES}
-          $(cat CHANGELOG.md)"
-          SHA=$(gh api repos/${{ github.repository }}/contents/CHANGELOG.md --jq '.sha' 2>/dev/null || echo "")
-          if [ -n "$SHA" ]; then
-            gh api repos/${{ github.repository }}/contents/CHANGELOG.md \
-              --method PUT \
-              --field message="docs: CHANGELOG ${VER}" \
-              --field content="$(echo "$NEW_CHANGELOG" | base64)" \
-              --field sha="$SHA"
+            ## ${VER}
+            ${NOTES}
+            $(cat CHANGELOG.md)"
+            SHA=$(gh api repos/${{ github.repository }}/contents/CHANGELOG.md --jq '.sha' 2>/dev/null || echo "")
+            if [ -n "$SHA" ]; then
+              gh api repos/${{ github.repository }}/contents/CHANGELOG.md \
+                --method PUT \
+                --field message="docs: CHANGELOG ${VER}" \
+                --field content="$(echo "$NEW_CHANGELOG" | base64)" \
+                --field sha="$SHA"
+            fi
           fi
           # 创建release（发布仓库）
           gh release create "${TAG}" \
@@ -223,6 +231,10 @@ jobs:
           TAG="${{ github.ref_name }}"
           case "$TAG" in v*) ;; *) exit 0 ;; esac
           VER="${TAG#v}"
+          if [ "$(cat VERSION)" = "$VER" ]; then
+            echo "VERSION 已是 ${VER}，无需重复写入"
+            exit 0
+          fi
           SHA=$(gh api repos/${{ github.repository }}/contents/VERSION --jq '.sha' 2>/dev/null || echo "")
           if [ -n "$SHA" ]; then
             gh api repos/${{ github.repository }}/contents/VERSION \

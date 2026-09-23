@@ -420,9 +420,9 @@ EXAM_RETRY_TIMEOUT = 30
 RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json"
 REPO_NAME = "signxer/silent-rain"
 
-# GitHub 加速代理（前缀拼接即可加速公开资源，见 https://gh-proxy.com/docs/github-accelerator）。
+# GitHub 加速代理（前缀拼接即可加速公开资源）。
 # 国内直连 github.com / raw.githubusercontent.com 经常超时，因此默认走加速节点，不通再退回直连。
-GH_PROXY_PREFIXES = ("https://gh-proxy.com/", "https://gh-proxy.org/")
+GH_PROXY_PREFIXES = ("https://v4.gh-proxy.org/", "https://gh-proxy.org/")
 _GITHUB_HOSTS = ("https://github.com/", "https://raw.githubusercontent.com/",
                  "https://api.github.com/", "https://objects.githubusercontent.com/")
 
@@ -4336,6 +4336,7 @@ class MainWindow(_BaseWindow):
         self._update_in_progress = True
         self._update_download_path = download_path
         self._update_wait_started = __import__("time").monotonic()
+        self._update_cancel_requested = False
         self._set_update_status("正在关闭学习任务和浏览器…")
         dash = getattr(self, "screen_dashboard", None)
         worker = getattr(dash, "_worker", None) if dash else None
@@ -4360,6 +4361,11 @@ class MainWindow(_BaseWindow):
             self._finish_update_shutdown(False)
             return
         elapsed = __import__("time").monotonic() - self._update_wait_started
+        if elapsed >= 3 and not getattr(self, "_update_cancel_requested", False):
+            # Playwright 的导航等待可能不检查协作停止标志；取消主协程后
+            # 仍由 worker 的 finally 保存会话并关闭浏览器。
+            self._update_cancel_requested = True
+            worker.cancel_pending()
         if elapsed < 20:
             self._set_update_status(f"正在关闭学习任务… {int(elapsed)} / 20 秒")
             return
@@ -4373,6 +4379,15 @@ class MainWindow(_BaseWindow):
             worker.wait(3000)
         except Exception:
             pass
+        if worker.isRunning():
+            self._update_wait_timer.stop()
+            self._update_wait_timer.deleteLater()
+            self._update_wait_timer = None
+            self._update_in_progress = False
+            self._set_update_status("学习任务未能关闭；请手动退出后运行已下载的新版本")
+            InfoBar.error("更新未完成", "学习任务仍在运行，未启动新版以避免文件占用",
+                          parent=self, position=InfoBarPosition.TOP)
+            return
         self._finish_update_shutdown(True)
 
     def _finish_update_shutdown(self, forced):
@@ -4388,11 +4403,15 @@ class MainWindow(_BaseWindow):
         import platform as _plat
         import subprocess
         import tempfile
-        import shutil
-
+        download_path = self._update_download_path
+        if not download_path or not os.path.isfile(download_path):
+            self._update_in_progress = False
+            InfoBar.error("更新失败", "下载文件不存在，请重新下载更新", parent=self,
+                          position=InfoBarPosition.TOP)
+            return
         current = sys.executable
 
-        if _plat.system() == "Windows" and current.endswith(".exe"):
+        if _plat.system() == "Windows" and current.lower().endswith(".exe"):
             same_dir = (os.path.dirname(os.path.abspath(download_path))
                         == os.path.dirname(os.path.abspath(current)))
             if same_dir:
@@ -4409,7 +4428,7 @@ class MainWindow(_BaseWindow):
                     InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
                     return
                 InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
-                QTimer.singleShot(300, sys.exit)
+                QTimer.singleShot(300, QApplication.instance().quit)
                 return
 
             # 兜底（安装目录不可写）：bat 等主程序退出 → 备份旧版 → 替换 → 重启
@@ -4437,7 +4456,7 @@ del "%~f0"
                 InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
                 return
             InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
-            QTimer.singleShot(500, sys.exit)
+            QTimer.singleShot(500, QApplication.instance().quit)
 
         elif _plat.system() == "Darwin":
             # macOS 发布物是 .dmg，不能直接覆盖二进制（会导致应用损坏），
@@ -4629,7 +4648,7 @@ def _handle_self_update():
     """新版本启动时清理旧版（Windows 同目录更新方案）。
 
     旧版启动新 exe（Moisten.new.exe --post-update-old <旧exe路径>）后退出；
-    新实例在后台线程等待旧进程释放文件锁 → 删除旧 exe → 把自己改回规范名，
+    新实例在启动时等待旧进程释放文件锁 → 删除旧 exe → 把自己改回规范名，
     之后快捷方式/下次启动仍指向 Moisten.exe。
     """
     try:
@@ -4650,11 +4669,13 @@ def _handle_self_update():
             target = os.path.join(os.path.dirname(old_path), _updated_exe_name(old_path))
             for _ in range(60):  # 最多等 60 秒（旧进程约 300ms 后退出）
                 try:
-                    if os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(target):
-                        os.remove(old_path)  # 删除旧版（旧进程已退出，文件已解锁）
-                    # 把自己改名为目标名（Windows 允许重命名运行中的 exe）
+                    # 对无版本号的 Moisten.exe，target 正是旧文件路径，也必须先
+                    # 删除旧版；否则 Windows 的 os.rename 不会覆盖它，重试 60 秒仍失败。
+                    if os.path.exists(old_path):
+                        os.remove(old_path)  # 旧进程退出后解锁；占用时下一轮重试
+                    # 把自己改名为目标名；若上次更新留下同名文件，也能覆盖。
                     if os.path.abspath(target) != current:
-                        os.rename(current, target)
+                        os.replace(current, target)
                     return
                 except OSError:
                     _t.sleep(1)
