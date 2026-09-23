@@ -216,7 +216,7 @@ def _stylesheet(t: ThemeTokens) -> str:
     QTableWidget::item:selected {{ background: {t.accent_soft}; color: {t.text}; }}
     QHeaderView::section {{ background: {table_header}; color: {t.text_muted}; border: none; padding: 5px 8px; font-weight: 700; }}
     QProgressBar {{ background: {progress_track}; color: {t.text}; border: none; border-radius: 7px; text-align: center; min-height: 14px; max-height: 14px; padding: 0; }}
-    QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {progress_start}, stop:0.38 {progress_mid}, stop:0.72 #25BDBD, stop:1 {progress_end}); border-radius: 7px; margin: 0; }}
+    QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {progress_start}, stop:0.38 {progress_mid}, stop:0.72 #25BDBD, stop:1 {progress_end}); border-radius: 7px; min-width: 14px; margin: 0; }}
     QLabel#workerProgressPercent {{ color: {t.text}; font-size: 12px; font-weight: 500; }}
     QFrame#heroCard {{ background: transparent; border: none; border-radius: 20px; }}
     QFrame#heroArt {{ background: transparent; border: none; border-radius: 18px; }}

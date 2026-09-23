@@ -10,6 +10,7 @@ from main import (
     AutoLearner, OnlineCourseListUnavailable,
     _build_online_playlist_tasks, _defer_online_course, _online_course_target_url,
 )
+from ui_theme import LIGHT, _stylesheet
 
 
 class FakeButton:
@@ -373,6 +374,14 @@ class UpdateLaunchTests(unittest.TestCase):
             gui._handle_self_update()
         remove.assert_called_once_with(os.path.abspath(old_path))
         replace.assert_called_once_with(os.path.abspath(new_path), os.path.abspath(target))
+
+
+class ProgressStyleTests(unittest.TestCase):
+    def test_progress_chunk_keeps_pill_shape_at_tiny_values(self):
+        stylesheet = _stylesheet(LIGHT)
+        chunk_style = stylesheet.split("QProgressBar::chunk", 1)[1].split("}", 1)[0]
+        self.assertIn("border-radius: 7px", chunk_style)
+        self.assertIn("min-width: 14px", chunk_style)
 
 
 if __name__ == "__main__":

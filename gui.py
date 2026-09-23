@@ -1824,6 +1824,14 @@ class DashboardScreen(QWidget):
         self._unread_logs = 0
         self._wave_phase = 0.0
         self._progress_animations = {}
+        self._worker_display_states = {}
+        self._worker_cycle_index = 0
+        self._hero_worker_id = None
+        self._hero_transitioning = False
+        self._pending_hero_snapshot = None
+        self._worker_cycle_timer = QTimer(self)
+        self._worker_cycle_timer.setInterval(4200)
+        self._worker_cycle_timer.timeout.connect(self._cycle_worker_snapshot)
         # 实时倒计时定时器
         self._eta_timer = QTimer(self)
         self._eta_timer.setInterval(1000)
@@ -1844,6 +1852,7 @@ class DashboardScreen(QWidget):
 
     def hideEvent(self, event):
         self._wave_timer.stop()
+        self._worker_cycle_timer.stop()
         super().hideEvent(event)
 
     def set_motion_enabled(self, enabled):
@@ -1852,8 +1861,11 @@ class DashboardScreen(QWidget):
         if enabled and self.isVisible():
             if not self._wave_timer.isActive():
                 self._wave_timer.start()
+            if len(self._worker_cycle_candidates()) > 1 and not self._worker_cycle_timer.isActive():
+                self._worker_cycle_timer.start()
         else:
             self._wave_timer.stop()
+            self._worker_cycle_timer.stop()
         self.update()
 
     def _advance_wave(self):
@@ -2086,7 +2098,9 @@ class DashboardScreen(QWidget):
         hero_layout.setContentsMargins(24, 20, 20, 20)
         hero_layout.setSpacing(18)
         hero_layout.addWidget(icon_box("book", "#256BD3"))
-        hero_text = QVBoxLayout()
+        hero_text_widget = QWidget(self.current_card)
+        hero_text = QVBoxLayout(hero_text_widget)
+        hero_text.setContentsMargins(0, 0, 0, 0)
         hero_text.setSpacing(7)
         kicker = QLabel("当前任务")
         kicker.setObjectName("heroKicker")
@@ -2097,7 +2111,11 @@ class DashboardScreen(QWidget):
         hero_text.addWidget(self.lbl_current_task)
         self.lbl_current_hint = QLabel("启动后，这里会显示当前 worker 正在处理的课程")
         self.lbl_current_hint.setObjectName("heroHint")
+        self.lbl_current_hint.setWordWrap(False)
         hero_text.addWidget(self.lbl_current_hint)
+        self._hero_content_opacity = QGraphicsOpacityEffect(hero_text_widget)
+        self._hero_content_opacity.setOpacity(1.0)
+        hero_text_widget.setGraphicsEffect(self._hero_content_opacity)
         self.current_progress = QProgressBar(self)
         self.current_progress.setRange(0, 100)
         self.current_progress.setValue(0)
@@ -2105,7 +2123,7 @@ class DashboardScreen(QWidget):
         self.current_progress.setFixedHeight(18)
         # 参考稿的 Hero 卡只保留任务信息，进度条放在“学习目标”卡内。
         self.current_progress.setVisible(False)
-        hero_layout.addLayout(hero_text, 1)
+        hero_layout.addWidget(hero_text_widget, 1)
 
         hero_art = QFrame(self.current_card)
         hero_art.setObjectName("heroArt")
@@ -2342,6 +2360,7 @@ class DashboardScreen(QWidget):
 
     def _stop_current_learning(self):
         """停止正在运行的学习任务（配置变更/重新开始时调用）"""
+        self._stop_worker_rotation()
         # 1) 解除可能阻塞 worker 的对话框等待
         for ev in ("_tag_event", "_page_event", "_exam_retry_event"):
             ev_obj = getattr(self, ev, None)
@@ -2360,6 +2379,12 @@ class DashboardScreen(QWidget):
 
     def start_learning(self):
         # 已有学习线程在运行：先停止旧任务并关闭其浏览器，再用新配置重新开始
+        self._stop_worker_rotation()
+        self._worker_display_states.clear()
+        self._worker_cycle_index = 0
+        self._hero_worker_id = None
+        self._pending_hero_snapshot = None
+        self._hero_content_opacity.setOpacity(1.0)
         self._runtime_start = __import__("time").time()
         self._runtime_timer.start()
         self.lbl_session_state.setText("初始化")
@@ -3151,6 +3176,128 @@ class DashboardScreen(QWidget):
         self._progress_animations[key] = anim
         anim.start(QPropertyAnimation.DeleteWhenStopped)
 
+    def _worker_cycle_candidates(self):
+        inactive = {"等待下一门", "检查课程队列", "空闲", "目标达成", "已停止"}
+        return [
+            {"wid": wid, **state}
+            for wid, state in sorted(self._worker_display_states.items())
+            if state.get("course") not in (None, "", "-")
+            and state.get("status") not in inactive
+        ]
+
+    def _render_worker_snapshot(self, snapshot):
+        self.lbl_current_task.setElidedText(snapshot.get("course", "-"))
+        wid = snapshot.get("wid")
+        if wid is None:
+            self.lbl_current_hint.setText(snapshot.get("status", ""))
+        else:
+            self.lbl_current_hint.setText(
+                f"线程 {wid + 1} · {snapshot.get('status', '-')} · {snapshot.get('progress', '-')}")
+        self._hero_worker_id = wid
+
+    def _display_worker_snapshot(self, snapshot, animate=True):
+        if snapshot is None:
+            return
+        if self._hero_transitioning:
+            self._pending_hero_snapshot = snapshot
+            return
+        same_worker = self._hero_worker_id == snapshot["wid"]
+        if (not animate or same_worker or self._hero_worker_id is None
+                or getattr(self.window(), "cfg_reduced_motion", False)):
+            self._render_worker_snapshot(snapshot)
+            self._hero_content_opacity.setOpacity(1.0)
+            return
+
+        self._hero_transitioning = True
+        self._pending_hero_snapshot = snapshot
+        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", self)
+        fade.setDuration(180)
+        fade.setStartValue(self._hero_content_opacity.opacity())
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.OutCubic)
+        fade.finished.connect(self._finish_worker_fade_out)
+        self._hero_fade_animation = fade
+        fade.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _finish_worker_fade_out(self):
+        self._hero_fade_animation = None
+        snapshot = self._pending_hero_snapshot
+        self._pending_hero_snapshot = None
+        if snapshot is None:
+            self._hero_transitioning = False
+            self._hero_content_opacity.setOpacity(1.0)
+            return
+        self._render_worker_snapshot(snapshot)
+        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", self)
+        fade.setDuration(220)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.OutCubic)
+        fade.finished.connect(self._finish_worker_fade_in)
+        self._hero_fade_animation = fade
+        fade.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _finish_worker_fade_in(self):
+        self._hero_fade_animation = None
+        self._hero_transitioning = False
+        self._hero_content_opacity.setOpacity(1.0)
+        pending = self._pending_hero_snapshot
+        self._pending_hero_snapshot = None
+        if pending:
+            if pending["wid"] != self._hero_worker_id:
+                self._display_worker_snapshot(pending, animate=True)
+            else:
+                self._render_worker_snapshot(pending)
+        self._sync_worker_rotation()
+
+    def _sync_worker_rotation(self):
+        if self._hero_transitioning:
+            return
+        candidates = self._worker_cycle_candidates()
+        can_rotate = not getattr(self.window(), "cfg_reduced_motion", False)
+        if len(candidates) > 1 and can_rotate:
+            if self.isVisible() and not self._worker_cycle_timer.isActive():
+                self._worker_cycle_timer.start()
+        else:
+            self._worker_cycle_timer.stop()
+
+        if candidates:
+            current = next((item for item in candidates if item["wid"] == self._hero_worker_id), None)
+            self._display_worker_snapshot(current or candidates[0], animate=current is None)
+        elif self._hero_worker_id is not None:
+            self._display_worker_snapshot(
+                {"wid": None, "course": "正在等待下一项任务", "status": "课程池更新中"},
+                animate=True,
+            )
+            self._hero_worker_id = None
+
+    def _cycle_worker_snapshot(self):
+        candidates = self._worker_cycle_candidates()
+        if len(candidates) < 2:
+            self._worker_cycle_timer.stop()
+            if candidates:
+                self._display_worker_snapshot(candidates[0], animate=False)
+            return
+        current_index = next(
+            (index for index, item in enumerate(candidates) if item["wid"] == self._hero_worker_id), -1)
+        self._worker_cycle_index = (current_index + 1) % len(candidates)
+        self._display_worker_snapshot(candidates[self._worker_cycle_index], animate=True)
+
+    def _stop_worker_rotation(self):
+        self._worker_cycle_timer.stop()
+        animation = getattr(self, "_hero_fade_animation", None)
+        if animation is not None:
+            try:
+                animation.stop()
+                animation.deleteLater()
+            except RuntimeError:
+                pass
+            self._hero_fade_animation = None
+        self._hero_transitioning = False
+        self._pending_hero_snapshot = None
+        if hasattr(self, "_hero_content_opacity"):
+            self._hero_content_opacity.setOpacity(1.0)
+
     def _on_progress(self, data):
         wid = data.get("wid", 0)
         if wid >= self.table.rowCount():
@@ -3184,13 +3331,16 @@ class DashboardScreen(QWidget):
             data.get("eta", "-"),
         )
         self.table.setItem(wid, 3, _item(eta_text))
+        self._worker_display_states[wid] = {
+            "course": course,
+            "status": status,
+            "progress": progress_text,
+        }
+        self._sync_worker_rotation()
         if status in {"学习中", "加载中", "查找按钮", "考试答题中"}:
             self.lbl_session_state.setText("学习中")
         elif "异常" in status or "失败" in status:
             self.lbl_session_state.setText("需要处理")
-        if course and course != "-":
-            self.lbl_current_task.setElidedText(course)
-            self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {progress_text}")
         self._set_status_cell(wid, status, self._status_kind(status))
 
     def _animate_ring(self, target):
@@ -3483,6 +3633,7 @@ class DashboardScreen(QWidget):
                     pass
 
     def _on_done(self, success, failed):
+        self._stop_worker_rotation()
         self._eta_timer.stop()
         self._runtime_timer.stop()
         self.btn_stop.setEnabled(False)

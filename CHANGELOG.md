@@ -1,5 +1,9 @@
 # 更新日志
 
+## 2.3.2
+- polish(dashboard): 当前任务卡按固定节奏轮播正在工作的 worker，并增加淡入淡出过渡
+- fix(ui): 极小进度值仍保持进度条两端圆角
+
 ## 2.3.1
 - fix(network-study): 将播放列表中的多个视频拆成独立任务加入共享课程池，支持不同 worker 并行处理
 - fix(network-study): 空闲 worker 等待正在展开的播放列表，避免因初始课程不足而提前退出
