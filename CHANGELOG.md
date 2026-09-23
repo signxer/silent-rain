@@ -1,5 +1,9 @@
 # 更新日志
 
+## 2.2.5
+- fix(motion): 增强学习背景与当前任务卡的横向流动波浪，让动效更易察觉
+- fix(motion): 将波浪循环缩短至约 6 秒，并继续遵循“减少动效”设置
+
 ## 2.2.4
 - release: v2.2.4 motion and icon fixes
 - chore: VERSION 2.2.2

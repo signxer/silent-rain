@@ -343,11 +343,20 @@ class _HeroCard(QFrame):
         def wy(base, amplitude=0.012, shift=0.0):
             return h * (base + amplitude * math.sin(phase * 0.78 + shift))
 
-        def wave(start_y, points, color):
+        def wave(start_y, points, color, phase_offset=0.0, amplitude=0.045):
+            def traveling_y(x, y):
+                return y + h * amplitude * math.sin(
+                    (x / max(1, w)) * math.tau - phase + phase_offset
+                )
+
             path = QPainterPath()
-            path.moveTo(-24, wy(start_y, 0.010))
+            path.moveTo(-24, traveling_y(-24, wy(start_y, 0.010)))
             for x, y, cx1, cy1, cx2, cy2 in points:
-                path.cubicTo(cx1, cy1, cx2, cy2, x, y)
+                path.cubicTo(
+                    cx1, traveling_y(cx1, cy1),
+                    cx2, traveling_y(cx2, cy2),
+                    x, traveling_y(x, y),
+                )
             path.lineTo(w + 24, h + 24)
             path.lineTo(-24, h + 24)
             path.closeSubpath()
@@ -358,18 +367,18 @@ class _HeroCard(QFrame):
             (w * 0.52, wy(0.74, 0.016, 0.8), w * 0.36, wy(0.38, 0.018, 0.3), w * 0.42, wy(0.90, 0.014, 0.5)),
             (w * 0.78, wy(0.27, 0.014, 1.2), w * 0.62, wy(0.62, 0.016, 0.6), w * 0.70, wy(0.28, 0.014, 0.9)),
             (w + 24, wy(0.10, 0.010, 1.5), w * 0.92, wy(0.04, 0.010, 1.0), w * 1.02, wy(0.15, 0.012, 1.3)),
-        ], (55, 143, 207, 54) if dark else (164, 215, 248, 58))
+        ], (55, 143, 207, 54) if dark else (164, 215, 248, 58), 0.0, 0.052)
         wave(0.82, [
             (w * 0.30, wy(0.70, 0.018, 1.0), w * 0.10, wy(0.80, 0.014, 0.6), w * 0.19, wy(0.95, 0.016, 0.8)),
             (w * 0.60, wy(0.84, 0.016, 1.6), w * 0.42, wy(0.56, 0.018, 1.0), w * 0.50, wy(0.98, 0.014, 1.3)),
             (w * 0.84, wy(0.43, 0.014, 2.1), w * 0.70, wy(0.75, 0.016, 1.7), w * 0.77, wy(0.42, 0.014, 1.9)),
             (w + 24, wy(0.22, 0.012, 2.4), w * 0.95, wy(0.13, 0.010, 2.0), w * 1.04, wy(0.26, 0.012, 2.2)),
-        ], (31, 124, 170, 42) if dark else (83, 199, 229, 28))
+        ], (31, 124, 170, 42) if dark else (83, 199, 229, 28), 1.4, 0.038)
         wave(0.64, [
             (w * 0.44, wy(0.62, 0.014, 2.4), w * 0.22, wy(0.32, 0.014, 2.0), w * 0.32, wy(0.80, 0.016, 2.2)),
             (w * 0.70, wy(0.34, 0.014, 2.9), w * 0.55, wy(0.55, 0.016, 2.5), w * 0.61, wy(0.32, 0.014, 2.7)),
             (w + 24, wy(0.18, 0.010, 3.2), w * 0.84, wy(0.05, 0.010, 2.8), w * 0.95, wy(0.20, 0.012, 3.0)),
-        ], (145, 207, 242, 58) if dark else (255, 255, 255, 132))
+        ], (145, 207, 242, 58) if dark else (255, 255, 255, 132), 2.5, 0.030)
 
         # 参考稿中的细白边让波纹显得轻，而不是一块突兀的色块。
         p.setPen(QPen(QColor(142, 207, 245, 135) if dark else QColor(255, 255, 255, 178), 1.4))
@@ -1825,7 +1834,9 @@ class DashboardScreen(QWidget):
         if getattr(self.window(), "cfg_reduced_motion", False):
             self._wave_timer.stop()
             return
-        self._wave_phase = (self._wave_phase + 0.028) % (math.pi * 2)
+        # 50ms tick + this angular step gives a calm ~6s loop. The previous
+        # smaller step changed the artwork too slowly to read as moving water.
+        self._wave_phase = (self._wave_phase + 0.052) % (math.pi * 2)
         self.update()
         hero = getattr(self, "current_card", None)
         if hero is not None and hasattr(hero, "set_wave_phase"):
@@ -1865,11 +1876,20 @@ class DashboardScreen(QWidget):
         def wy(base, amplitude=0.014, shift=0.0):
             return h * (base + amplitude * math.sin(phase * 0.62 + shift))
 
-        def wave(points, color):
+        def wave(points, color, phase_offset=0.0, amplitude=0.025):
+            def traveling_y(x, y):
+                return y + h * amplitude * math.sin(
+                    (x / max(1, w)) * math.tau - phase + phase_offset
+                )
+
             path = QPainterPath()
-            path.moveTo(0, points[0][1])
+            path.moveTo(0, traveling_y(0, points[0][1]))
             for x, y, cx1, cy1, cx2, cy2 in points[1:]:
-                path.cubicTo(cx1, cy1, cx2, cy2, x, y)
+                path.cubicTo(
+                    cx1, traveling_y(cx1, cy1),
+                    cx2, traveling_y(cx2, cy2),
+                    x, traveling_y(x, y),
+                )
             path.lineTo(w, h)
             path.lineTo(0, h)
             path.closeSubpath()
@@ -1880,13 +1900,13 @@ class DashboardScreen(QWidget):
             (w * 0.24, wy(0.67, 0.016), w * 0.07, wy(0.67, 0.014), w * 0.14, wy(0.82, 0.014, 0.4)),
             (w * 0.48, wy(0.78, 0.016, 0.8), w * 0.34, wy(0.61, 0.014, 0.3), w * 0.41, wy(0.84, 0.016, 0.5)),
             (w, wy(0.64, 0.014, 1.2), w * 0.74, wy(0.72, 0.014, 0.6), w * 0.86, wy(0.56, 0.016, 0.9)),
-        ], (44, 106, 157, 48) if dark else (169, 219, 247, 54))
+        ], (44, 106, 157, 48) if dark else (169, 219, 247, 54), 0.0, 0.026)
         wave([
             (0, wy(0.83, 0.014, 1.0)),
             (w * 0.25, wy(0.76, 0.016, 1.4), w * 0.10, wy(0.78, 0.014, 1.0), w * 0.16, wy(0.92, 0.016, 1.2)),
             (w * 0.58, wy(0.84, 0.016, 1.8), w * 0.36, wy(0.65, 0.014, 1.4), w * 0.47, wy(0.92, 0.016, 1.6)),
             (w, wy(0.73, 0.014, 2.2), w * 0.76, wy(0.72, 0.014, 1.8), w * 0.89, wy(0.64, 0.016, 2.0)),
-        ], (36, 91, 140, 32) if dark else (117, 190, 238, 35))
+        ], (36, 91, 140, 32) if dark else (117, 190, 238, 35), 1.2, 0.021)
         # 左下角的纸张颗粒与小点，模拟参考稿的手绘留白。
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(94, 157, 211, 35) if dark else QColor(92, 165, 222, 42))
