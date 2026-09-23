@@ -10,7 +10,7 @@ from main import (
     AutoLearner, OnlineCourseListUnavailable,
     _build_online_playlist_tasks, _defer_online_course, _online_course_target_url,
 )
-from ui_theme import LIGHT, _stylesheet
+from ui_theme import LIGHT, RoundedGradientProgressBar, _stylesheet
 
 
 class FakeButton:
@@ -382,6 +382,11 @@ class ProgressStyleTests(unittest.TestCase):
         chunk_style = stylesheet.split("QProgressBar::chunk", 1)[1].split("}", 1)[0]
         self.assertIn("border-radius: 7px", chunk_style)
         self.assertIn("min-width: 14px", chunk_style)
+
+    def test_custom_progress_paint_keeps_tiny_fill_wider_than_its_height(self):
+        fill_width = RoundedGradientProgressBar.fill_width(108, 13, 3, 100)
+        self.assertEqual(fill_width, 13)
+        self.assertEqual(RoundedGradientProgressBar.fill_width(108, 13, 0, 100), 0)
 
 
 if __name__ == "__main__":

@@ -5,10 +5,10 @@
 
 from dataclasses import dataclass
 from PySide6.QtCore import Qt, QSize, Signal, QRectF
-from PySide6.QtGui import QColor, QPalette, QPainter, QPixmap
+from PySide6.QtGui import QColor, QPalette, QPainter, QPixmap, QLinearGradient
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QSizePolicy, QVBoxLayout,
-    QDialog, QGraphicsDropShadowEffect, QWidget,
+    QDialog, QGraphicsDropShadowEffect, QProgressBar, QWidget,
 )
 
 from qfluentwidgets import Theme, setTheme
@@ -17,6 +17,57 @@ from qfluentwidgets.components.navigation.navigation_widget import NavigationTre
 
 
 _NAVIGATION_PATCHED = False
+
+
+class RoundedGradientProgressBar(QProgressBar):
+    """Paint a true capsule track/fill; QSS chunk clipping squares tiny values in Qt."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        # Prevent the application-wide QSS from painting a square base beneath
+        # our antialiased capsule; the custom paintEvent owns both track and fill.
+        self.setStyleSheet(
+            "QProgressBar { background: transparent; border: none; padding: 0; }"
+            "QProgressBar::chunk { background: transparent; border: none; }"
+        )
+
+    @staticmethod
+    def fill_width(track_width, bar_height, value, maximum):
+        if maximum <= 0 or value <= 0 or track_width <= 0:
+            return 0.0
+        return min(float(track_width), max(float(bar_height), track_width * value / maximum))
+
+    def paintEvent(self, event):
+        del event
+        rect = self.rect().adjusted(0.5, 0.5, -0.5, -0.5)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        dark = QApplication.instance().palette().color(QPalette.Window).lightness() < 128
+        track = QColor("#2B3B52" if dark else "#E1EBF3")
+        colors = (
+            ("#4CCDE0", "#2DBBCB", "#25BDBD", "#25B8B0") if dark else
+            ("#49D3E3", "#31C9D0", "#25BDBD", "#13AAA6")
+        )
+        radius = rect.height() / 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        width = self.fill_width(rect.width(), rect.height(), self.value(), self.maximum())
+        if width > 0:
+            fill = rect.adjusted(0, 0, -(rect.width() - width), 0)
+            gradient = QLinearGradient(fill.left(), fill.top(), fill.right(), fill.top())
+            gradient.setColorAt(0.0, QColor(colors[0]))
+            gradient.setColorAt(0.38, QColor(colors[1]))
+            gradient.setColorAt(0.72, QColor(colors[2]))
+            gradient.setColorAt(1.0, QColor(colors[3]))
+            painter.setBrush(gradient)
+            painter.drawRoundedRect(fill, min(radius, fill.width() / 2), radius)
+        painter.end()
 
 
 def _patch_navigation_item_paint():

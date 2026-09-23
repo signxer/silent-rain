@@ -13,8 +13,9 @@ import math
 from datetime import datetime
 
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QSize, QTimer, QEventLoop, QEvent,
-    QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve, Property,
+    Qt, QThread, Signal, QSize, QPoint, QTimer, QEventLoop, QEvent,
+    QPropertyAnimation, QPauseAnimation, QParallelAnimationGroup, QSequentialAnimationGroup,
+    QEasingCurve, Property,
 )
 from PySide6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QPen, QBrush, QFontMetrics,
@@ -45,7 +46,7 @@ from qfluentwidgets import (
 
 from ui_theme import (
     BrandNavigationWidget, PageHeader, StepBar, SurfaceCard,
-    apply_theme, normalize_theme_mode, style_moisten_dialog,
+    RoundedGradientProgressBar, apply_theme, normalize_theme_mode, style_moisten_dialog,
 )
 
 from main import (
@@ -1828,9 +1829,10 @@ class DashboardScreen(QWidget):
         self._worker_cycle_index = 0
         self._hero_worker_id = None
         self._hero_transitioning = False
+        self._hero_transition_base_pos = None
         self._pending_hero_snapshot = None
         self._worker_cycle_timer = QTimer(self)
-        self._worker_cycle_timer.setInterval(4200)
+        self._worker_cycle_timer.setInterval(6500)
         self._worker_cycle_timer.timeout.connect(self._cycle_worker_snapshot)
         # 实时倒计时定时器
         self._eta_timer = QTimer(self)
@@ -2116,6 +2118,7 @@ class DashboardScreen(QWidget):
         self._hero_content_opacity = QGraphicsOpacityEffect(hero_text_widget)
         self._hero_content_opacity.setOpacity(1.0)
         hero_text_widget.setGraphicsEffect(self._hero_content_opacity)
+        self._hero_text_widget = hero_text_widget
         self.current_progress = QProgressBar(self)
         self.current_progress.setRange(0, 100)
         self.current_progress.setValue(0)
@@ -2492,7 +2495,7 @@ class DashboardScreen(QWidget):
         self._progress_labels = []
         for i in range(workers):
             self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            bar = QProgressBar()
+            bar = RoundedGradientProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
             bar.setTextVisible(False)
@@ -3205,19 +3208,34 @@ class DashboardScreen(QWidget):
         if (not animate or same_worker or self._hero_worker_id is None
                 or getattr(self.window(), "cfg_reduced_motion", False)):
             self._render_worker_snapshot(snapshot)
+            self._hero_text_widget.move(self._hero_text_base_pos())
             self._hero_content_opacity.setOpacity(1.0)
             return
 
         self._hero_transitioning = True
         self._pending_hero_snapshot = snapshot
-        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", self)
-        fade.setDuration(180)
+        base_pos = self._hero_text_base_pos()
+        self._hero_transition_base_pos = base_pos
+        exit_group = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", exit_group)
+        fade.setDuration(170)
         fade.setStartValue(self._hero_content_opacity.opacity())
         fade.setEndValue(0.0)
         fade.setEasingCurve(QEasingCurve.OutCubic)
-        fade.finished.connect(self._finish_worker_fade_out)
-        self._hero_fade_animation = fade
-        fade.start(QPropertyAnimation.DeleteWhenStopped)
+        slide = QPropertyAnimation(self._hero_text_widget, b"pos", exit_group)
+        slide.setDuration(210)
+        slide.setStartValue(base_pos)
+        slide.setEndValue(base_pos + QPoint(0, -9))
+        slide.setEasingCurve(QEasingCurve.OutCubic)
+        exit_group.addAnimation(fade)
+        exit_group.addAnimation(slide)
+        exit_group.finished.connect(self._finish_worker_fade_out)
+        self._hero_fade_animation = exit_group
+        exit_group.start(QParallelAnimationGroup.DeleteWhenStopped)
+
+    def _hero_text_base_pos(self):
+        base_pos = self._hero_transition_base_pos
+        return base_pos if base_pos is not None else self._hero_text_widget.pos()
 
     def _finish_worker_fade_out(self):
         self._hero_fade_animation = None
@@ -3225,21 +3243,36 @@ class DashboardScreen(QWidget):
         self._pending_hero_snapshot = None
         if snapshot is None:
             self._hero_transitioning = False
+            self._hero_text_widget.move(self._hero_text_base_pos())
+            self._hero_transition_base_pos = None
             self._hero_content_opacity.setOpacity(1.0)
             return
         self._render_worker_snapshot(snapshot)
-        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", self)
-        fade.setDuration(220)
+        base_pos = self._hero_text_base_pos()
+        self._hero_text_widget.move(base_pos + QPoint(0, 10))
+        self._hero_content_opacity.setOpacity(0.0)
+        enter_group = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self._hero_content_opacity, b"opacity", enter_group)
+        fade.setDuration(240)
         fade.setStartValue(0.0)
         fade.setEndValue(1.0)
         fade.setEasingCurve(QEasingCurve.OutCubic)
-        fade.finished.connect(self._finish_worker_fade_in)
-        self._hero_fade_animation = fade
-        fade.start(QPropertyAnimation.DeleteWhenStopped)
+        slide = QPropertyAnimation(self._hero_text_widget, b"pos", enter_group)
+        slide.setDuration(260)
+        slide.setStartValue(base_pos + QPoint(0, 10))
+        slide.setEndValue(base_pos)
+        slide.setEasingCurve(QEasingCurve.OutCubic)
+        enter_group.addAnimation(fade)
+        enter_group.addAnimation(slide)
+        enter_group.finished.connect(self._finish_worker_fade_in)
+        self._hero_fade_animation = enter_group
+        enter_group.start(QParallelAnimationGroup.DeleteWhenStopped)
 
     def _finish_worker_fade_in(self):
         self._hero_fade_animation = None
         self._hero_transitioning = False
+        self._hero_text_widget.move(self._hero_text_base_pos())
+        self._hero_transition_base_pos = None
         self._hero_content_opacity.setOpacity(1.0)
         pending = self._pending_hero_snapshot
         self._pending_hero_snapshot = None
@@ -3296,6 +3329,8 @@ class DashboardScreen(QWidget):
         self._hero_transitioning = False
         self._pending_hero_snapshot = None
         if hasattr(self, "_hero_content_opacity"):
+            self._hero_text_widget.move(self._hero_text_base_pos())
+            self._hero_transition_base_pos = None
             self._hero_content_opacity.setOpacity(1.0)
 
     def _on_progress(self, data):
