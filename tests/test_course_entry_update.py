@@ -4,9 +4,12 @@ import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from main import AutoLearner
+from main import (
+    AutoLearner, OnlineCourseListUnavailable,
+    _defer_online_course, _online_course_target_url,
+)
 
 
 class FakeButton:
@@ -114,6 +117,147 @@ class CourseEntryTests(unittest.TestCase):
         page = FakePage("https://example.test/course/#/detail/123")
         result = asyncio.run(self.learner.find_and_play_video(page, 0))
         self.assertFalse(result)
+
+    def test_list_timeout_is_classified_as_recoverable(self):
+        class UnavailablePage:
+            async def goto(self, *args, **kwargs):
+                pass
+
+            async def wait_for_selector(self, *args, **kwargs):
+                raise TimeoutError("course cards did not load")
+
+        task = {"page": 1, "title": "example", "href": ""}
+        with self.assertRaises(OnlineCourseListUnavailable):
+            asyncio.run(self.learner._open_online_course_from_list(
+                UnavailablePage(), "https://example.test/course/#/list/1", task))
+
+    def test_list_card_can_open_player_in_same_tab(self):
+        async def run():
+            worker = MagicMock()
+            worker.url = "https://example.test/course/#/list/1"
+            worker.goto = AsyncMock()
+            worker.wait_for_selector = AsyncMock()
+            worker.wait_for_timeout = AsyncMock()
+            worker.is_closed.return_value = False
+
+            async def wait_for_popup(*args, **kwargs):
+                await asyncio.Future()
+
+            worker.wait_for_event = wait_for_popup
+            card = MagicMock()
+            card.get_attribute = AsyncMock(side_effect=["Example", "javascript:void(0)"])
+
+            async def click():
+                worker.url = "https://example.test/course/#/play/123"
+
+            card.click = click
+            links = MagicMock()
+            links.count = AsyncMock(return_value=1)
+            links.nth.return_value = card
+            worker.locator.return_value = links
+            task = {"page": 1, "title": "Example", "href": ""}
+            result = await self.learner._open_online_course_from_list(
+                worker, "https://example.test/course/#/list/1", task)
+            self.assertIs(result, worker)
+
+        asyncio.run(run())
+
+    def test_list_card_popup_is_tied_to_its_worker_page(self):
+        async def run():
+            worker = MagicMock()
+            worker.url = "https://example.test/course/#/list/1"
+            worker.goto = AsyncMock()
+            worker.wait_for_selector = AsyncMock()
+
+            async def tick(*args):
+                await asyncio.sleep(0)
+
+            worker.wait_for_timeout = tick
+            worker.is_closed.return_value = False
+            popup_ready = asyncio.Event()
+            player = MagicMock()
+            player.wait_for_load_state = AsyncMock()
+
+            async def wait_for_popup(*args, **kwargs):
+                await popup_ready.wait()
+                return player
+
+            worker.wait_for_event = wait_for_popup
+            card = MagicMock()
+            card.get_attribute = AsyncMock(side_effect=["Example", "javascript:void(0)"])
+            card.click = AsyncMock(side_effect=popup_ready.set)
+            links = MagicMock()
+            links.count = AsyncMock(return_value=1)
+            links.nth.return_value = card
+            worker.locator.return_value = links
+            task = {"page": 1, "title": "Example", "href": ""}
+            result = await self.learner._open_online_course_from_list(
+                worker, "https://example.test/course/#/list/1", task)
+            self.assertIs(result, player)
+
+        asyncio.run(run())
+
+    def test_failed_popup_load_closes_partial_page(self):
+        async def run():
+            worker = MagicMock()
+            worker.url = "https://example.test/course/#/list/1"
+            worker.goto = AsyncMock()
+            worker.wait_for_selector = AsyncMock()
+
+            async def tick(*args):
+                await asyncio.sleep(0)
+
+            worker.wait_for_timeout = tick
+            worker.is_closed.return_value = False
+            popup_ready = asyncio.Event()
+            player = MagicMock()
+            player.wait_for_load_state = AsyncMock(side_effect=TimeoutError("load failed"))
+            player.is_closed.return_value = False
+            player.close = AsyncMock()
+
+            async def wait_for_popup(*args, **kwargs):
+                await popup_ready.wait()
+                return player
+
+            worker.wait_for_event = wait_for_popup
+            card = MagicMock()
+            card.get_attribute = AsyncMock(side_effect=["Example", "javascript:void(0)"])
+            card.click = AsyncMock(side_effect=popup_ready.set)
+            links = MagicMock()
+            links.count = AsyncMock(return_value=1)
+            links.nth.return_value = card
+            worker.locator.return_value = links
+            task = {"page": 1, "title": "Example", "href": ""}
+            with self.assertRaises(TimeoutError):
+                await self.learner._open_online_course_from_list(
+                    worker, "https://example.test/course/#/list/1", task)
+            player.close.assert_awaited_once()
+
+        asyncio.run(run())
+
+
+class CourseQueueTests(unittest.TestCase):
+    def test_card_href_resolves_only_navigable_same_site_urls(self):
+        base = "https://u.ccb.com/course/#/list/1"
+        self.assertEqual(_online_course_target_url(base, "#/detail/123"),
+                         "https://u.ccb.com/course/#/detail/123")
+        self.assertEqual(_online_course_target_url(base, "/course/#/play/123"),
+                         "https://u.ccb.com/course/#/play/123")
+        for href in ("", "#", "javascript:void(0)", "https://example.test/course/123"):
+            self.assertEqual(_online_course_target_url(base, href), "")
+
+    def test_unavailable_course_is_deferred_then_exhausted(self):
+        async def run():
+            queue = asyncio.Queue()
+            task = {"title": "example"}
+            for failure in (1, 2):
+                self.assertTrue(_defer_online_course(queue, task))
+                self.assertIs(queue.get_nowait(), task)
+                self.assertEqual(task["list_failures"], failure)
+            self.assertFalse(_defer_online_course(queue, task))
+            self.assertTrue(queue.empty())
+
+        asyncio.run(run())
 
 
 class UpdateLaunchTests(unittest.TestCase):

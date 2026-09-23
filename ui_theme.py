@@ -276,10 +276,13 @@ def style_moisten_dialog(dialog):
         button_group = getattr(dialog, "buttonGroup", None)
         button_layout = getattr(dialog, "buttonLayout", None)
         if button_group is not None:
-            button_group.setFixedHeight(64)
+            button_group.setFixedHeight(82)
         if button_layout is not None:
-            button_layout.setContentsMargins(24, 8, 24, 16)
+            button_layout.setContentsMargins(24, 8, 24, 26)
             button_layout.setSpacing(10)
+            for button in (dialog.yesButton, dialog.cancelButton):
+                button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+                button.setFixedHeight(40)
         # Dialog 基类初始化时锁定了默认尺寸；释放后按紧凑布局重新计算，
         # 只固定高度，保留长更新说明所需的自适应宽度。
         dialog.setMinimumSize(0, 0)
@@ -315,8 +318,9 @@ def style_moisten_dialog(dialog):
             border: none;
         }}
         QDialog#moistenDialog QPushButton {{
-            min-height: 36px;
-            padding: 8px 16px;
+            min-height: 0px;
+            max-height: 40px;
+            padding: 0px 16px;
             border: 1px solid {tokens.border};
             border-radius: 11px;
             color: {tokens.text};
@@ -330,8 +334,8 @@ def style_moisten_dialog(dialog):
             border-color: {tokens.accent};
         }}
         QDialog#moistenDialog QPushButton:pressed {{
-            padding-top: 9px;
-            padding-bottom: 7px;
+            padding-top: 0px;
+            padding-bottom: 0px;
         }}
         QDialog#moistenDialog QPushButton#dialogPrimaryButton {{
             color: #FFFFFF;

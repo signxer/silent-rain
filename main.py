@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import traceback
+from urllib.parse import urljoin, urlsplit
 from datetime import datetime
 from typing import List, Dict, Optional, Union
 
@@ -115,6 +116,36 @@ class GoalReached(Exception):
 class StopLearning(Exception):
     """用户变更配置请求停止当前学习任务"""
     pass
+
+
+class OnlineCourseListUnavailable(RuntimeError):
+    """课程列表暂时未加载，不应将单门课程直接判为学习失败。"""
+
+
+def _online_course_target_url(list_url: str, href: str) -> str:
+    """仅将同站课程卡片的可导航 href 解析为直达地址。"""
+    href = (href or "").strip()
+    if not href or href == "#":
+        return ""
+    target = urljoin(list_url, href)
+    base, parsed = urlsplit(list_url), urlsplit(target)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != base.netloc.lower():
+        return ""
+    if (parsed.path, parsed.query, parsed.fragment) == (base.path, base.query, base.fragment):
+        return ""
+    if parsed.path == base.path and not parsed.fragment:
+        return ""
+    return target
+
+
+def _defer_online_course(course_queue: asyncio.Queue, task: dict, max_retries: int = 2) -> bool:
+    """列表暂不可用时把课程放回队尾，让 worker 先尝试其他课程。"""
+    failures = task.get("list_failures", 0) + 1
+    if failures > max_retries:
+        return False
+    task["list_failures"] = failures
+    course_queue.put_nowait(task)
+    return True
 
 
 def _kill_playwright_chrome():
@@ -4161,6 +4192,77 @@ class AutoLearner:
                 pass
         console.print("课程模式学习完成", style="bold green")
 
+    async def _open_online_course_from_list(self, worker_page: Page, list_url: str,
+                                            task: dict) -> Page:
+        """仅在卡片没有可用直达地址时，回列表页定位并打开课程。"""
+        try:
+            await worker_page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+            await worker_page.wait_for_selector("a.p-cursor[title]", timeout=12000)
+        except Exception as exc:
+            debug(f"网络自学课程列表加载失败: {exc}")
+            raise OnlineCourseListUnavailable("课程列表未加载") from exc
+
+        for _ in range(task["page"] - 1):
+            try:
+                next_button = worker_page.locator("[class*=page-next]:not([class*=page_disabled])")
+                if await next_button.count() == 0:
+                    raise OnlineCourseListUnavailable("课程列表翻页入口不可用")
+                await next_button.first.click()
+                await worker_page.wait_for_timeout(1500)
+                await worker_page.wait_for_selector("a.p-cursor[title]", timeout=12000)
+            except OnlineCourseListUnavailable:
+                raise
+            except Exception as exc:
+                raise OnlineCourseListUnavailable("课程列表翻页失败") from exc
+
+        links = worker_page.locator("a.p-cursor[title]")
+        count = await links.count()
+        href = task.get("href", "")
+        title = task["title"]
+        match = None
+        title_match = None
+        for index in range(count):
+            candidate = links.nth(index)
+            try:
+                candidate_title = (await candidate.get_attribute("title") or "").strip()
+                candidate_href = (await candidate.get_attribute("href") or "").strip()
+            except Exception:
+                continue
+            if href and candidate_href and href.rstrip("/") == candidate_href.rstrip("/"):
+                match = candidate
+                break
+            if candidate_title and title in candidate_title and title_match is None:
+                title_match = candidate
+        if match is None:
+            match = title_match
+        if match is None:
+            raise OnlineCourseListUnavailable("课程列表已变化，暂未找到目标课程")
+
+        # 监听该 worker 页自己的 popup，避免并发 worker 的弹窗被误认。
+        popup = asyncio.create_task(worker_page.wait_for_event("popup", timeout=10000))
+        await asyncio.sleep(0)
+        old_url = worker_page.url
+        try:
+            await match.click()
+            for _ in range(20):
+                if popup.done() and not popup.cancelled() and popup.exception() is None:
+                    course_page = popup.result()
+                    try:
+                        await course_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        if not course_page.is_closed():
+                            await course_page.close()
+                        raise
+                    return course_page
+                if not worker_page.is_closed() and worker_page.url != old_url:
+                    return worker_page
+                await worker_page.wait_for_timeout(500)
+            raise OnlineCourseListUnavailable("点击课程后未打开详情页或播放页")
+        finally:
+            if not popup.done():
+                popup.cancel()
+            await asyncio.gather(popup, return_exceptions=True)
+
     async def _enter_online_course_player(self, detail_page: Page, worker_id: int) -> Optional[Page]:
         """直接播放页原样返回；详情页 100% 返回 None，否则点击入口。"""
         if "/course/#/detail/" not in detail_page.url:
@@ -4294,13 +4396,13 @@ class AutoLearner:
         async def collect_current_page():
             nonlocal no_more_pages, retry_current_page, saw_courses
             loaded = False
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
-                    await page.wait_for_selector("a.p-cursor[title]", timeout=15000)
+                    await page.wait_for_selector("a.p-cursor[title]", timeout=10000)
                     loaded = True
                     break
                 except Exception:
-                    if attempt < 2:
+                    if attempt < 1:
                         await page.wait_for_timeout(2000)
             if not loaded:
                 # 网络抖动不能等价于“没有下一页”；保留当前页，后续补课时重试。
@@ -4310,9 +4412,8 @@ class AutoLearner:
             cards = page.locator("a.p-cursor[title]")
             cnt = await cards.count()
             if cnt == 0:
-                _log(f"课程列表第 {page_num} 页没有课程", "yellow")
-                no_more_pages = True
-                retry_current_page = False
+                _log(f"课程列表第 {page_num} 页暂时为空，稍后重试", "yellow")
+                retry_current_page = True
                 return 0
             saw_courses = True
 
@@ -4330,9 +4431,8 @@ class AutoLearner:
             # 防止翻页点击未生效时重复扫描当前页。
             fingerprint = tuple((item["title"], item["href"]) for item in cards_data)
             if fingerprint in seen_pages:
-                _log("课程列表翻页后内容未变化，停止继续采集", "yellow")
-                no_more_pages = True
-                retry_current_page = False
+                _log("课程列表翻页后内容未变化，稍后重试当前页", "yellow")
+                retry_current_page = True
                 return 0
             seen_pages.add(fingerprint)
 
@@ -4363,6 +4463,14 @@ class AutoLearner:
 
                 if retry_current_page:
                     retry_current_page = False
+                    # 翻页状态通常只保存在前端内存；非首页刷新会跳回第 1 页。
+                    if page_num == 1:
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=20000)
+                        except Exception as exc:
+                            retry_current_page = True
+                            _log(f"课程列表刷新失败，稍后重试: {exc}", "yellow")
+                            return 0
                     added = await collect_current_page()
                     if added > 0:
                         _log(f"重试当前页后新增 {added} 门课程", "green")
@@ -4372,14 +4480,18 @@ class AutoLearner:
                     try:
                         nxt = page.locator("[class*=page-next]:not([class*=page_disabled])")
                         if await nxt.count() == 0:
+                            if await page.locator("a.p-cursor[title]").count() == 0:
+                                retry_current_page = True
+                                _log("课程列表暂时为空，保留翻页位置稍后重试", "yellow")
+                                return 0
                             no_more_pages = True
                             return 0
                         await nxt.first.click()
-                        await page.wait_for_timeout(4000)
                         page_num += 1
+                        await page.wait_for_timeout(4000)
                     except Exception as e:
-                        _log(f"翻到下一页失败: {e}", "yellow")
-                        no_more_pages = True
+                        _log(f"翻到下一页失败，稍后重试: {e}", "yellow")
+                        retry_current_page = True
                         return 0
 
                     added = await collect_current_page()
@@ -4403,6 +4515,11 @@ class AutoLearner:
             task.add_done_callback(prefetch_tasks.discard)
 
         await collect_current_page()
+        initial_retries = 0
+        while retry_current_page and course_queue.empty() and initial_retries < 2:
+            initial_retries += 1
+            await asyncio.sleep(2 * initial_retries)
+            await fetch_more_courses(force=True)
         # 启动时尽量给每个 worker 一门课；之后再按需补充，避免提前扫完所有页面。
         while course_queue.qsize() < self.workers and not no_more_pages:
             before = course_queue.qsize()
@@ -4425,11 +4542,14 @@ class AutoLearner:
         ok_count = [0]
         skipped_count = [0]
         fail_count = [0]
+        list_open_semaphore = asyncio.Semaphore(2)
 
         async def course_task_stream():
+            list_retries = 0
             while not self._stop_event.is_set() and not goal_reached.is_set():
                 try:
                     task = course_queue.get_nowait()
+                    list_retries = 0
                     if course_queue.empty() and not no_more_pages:
                         # 趁 worker 正在学习当前课程时预取下一页，减少池空后的等待。
                         schedule_prefetch()
@@ -4438,68 +4558,48 @@ class AutoLearner:
                 except asyncio.QueueEmpty:
                     added = await fetch_more_courses()
                     if added <= 0:
-                        return
+                        if no_more_pages:
+                            return
+                        list_retries += 1
+                        if list_retries >= 3:
+                            raise OnlineCourseListUnavailable("课程列表连续加载失败，已暂停当前阶段；未完成课程下次仍可继续")
+                        _log(f"课程列表暂不可用，{min(5 * list_retries, 10)} 秒后重试补课", "yellow")
+                        await asyncio.sleep(min(5 * list_retries, 10))
 
         async def cworker(wid: int, wp: Page):
             async for task in course_task_stream():
                 # 用户变更配置：停止取新课程
                 if self._stop_event.is_set():
                     break
-                cpage, ctitle = task["page"], task["title"]
+                if wp.is_closed():
+                    wp = await self.context.new_page()
+                    self.pages[wid] = wp
+                ctitle = task["title"]
                 chref, ckey = task.get("href", ""), task.get("key", "")
                 _log(f"[线程{wid+1}] {ctitle}", "blue")
                 _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "加载中"})
                 done_ok = False
                 already_complete = False
+                deferred = False
                 for attempt in range(1, 3):  # 每门课程最多重试1次
                     cp = None
                     play_page = None
                     try:
-                        # 1) 回到列表页并翻到目标页码
-                        await wp.goto(list_url, wait_until="domcontentloaded", timeout=20000)
-                        await wp.wait_for_timeout(3000)
-                        await wp.wait_for_selector("a.p-cursor[title]", timeout=15000)
-                        for _ in range(cpage - 1):
-                            nxt = wp.locator("[class*=page-next]:not([class*=page_disabled])")
-                            if await nxt.count() == 0:
-                                break
-                            await nxt.first.click()
-                            await wp.wait_for_timeout(2500)
-                        # 2) 按标题找到课程链接并点击（弹新窗口）
-                        links = wp.locator("a.p-cursor[title]")
-                        ln = await links.count()
-                        link = None
-                        title_candidate = None
-                        for i in range(ln):
+                        # 采集时已有可导航地址，就让 worker 直达课程，避免十几个
+                        # worker 每门课都刷新列表页导致页面限流或超时。
+                        target_url = _online_course_target_url(list_url, chref)
+                        if target_url:
                             try:
-                                candidate = links.nth(i)
-                                t = (await candidate.get_attribute("title") or "").strip()
-                                h = (await candidate.get_attribute("href") or "").strip()
-                            except:
-                                t = ""
-                                h = ""
-                            if ((chref and h == chref) or
-                                    (chref and h and chref.rstrip('/') == h.rstrip('/')) or
-                                    (not chref and t and ctitle in t)):
-                                link = candidate
-                                break
-                            if chref and t and ctitle in t and title_candidate is None:
-                                title_candidate = candidate
-                        if link is None and title_candidate is not None:
-                            # 列表页可能改写 href；标题仅作为地址匹配失败时的兼容兜底。
-                            link = title_candidate
-                        if link is None:
-                            # 未找到：可能是翻页未生效，抛错走重试而不是直接放弃
-                            raise RuntimeError("未找到课程链接")
-                        try:
-                            async with wp.expect_event("popup", timeout=20000) as pi:
-                                await link.click()
-                            cp = await pi.value
-                            await cp.wait_for_load_state()
-                            await cp.wait_for_timeout(5000)
-                        except Exception as e:
-                            _log(f"[线程{wid+1}] 打开课程失败: {ctitle} - {e}", "yellow")
-                            raise
+                                await wp.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                                await wp.wait_for_timeout(3000)
+                                if wp.url == list_url:
+                                    raise OnlineCourseListUnavailable("课程地址返回列表页")
+                                cp = wp
+                            except Exception as exc:
+                                _log(f"[线程{wid+1}] 课程直达失败，回列表重试: {str(exc)[:120]}", "yellow")
+                        if cp is None:
+                            async with list_open_semaphore:
+                                cp = await self._open_online_course_from_list(wp, list_url, task)
                         # 3) 详情页先进入播放器；不能在信息页反复刷新找视频。
                         play_page = await self._enter_online_course_player(cp, wid)
                         if play_page is None:
@@ -4518,9 +4618,20 @@ class AutoLearner:
                         break
                     except asyncio.CancelledError:
                         raise
+                    except OnlineCourseListUnavailable as e:
+                        if not self._stop_event.is_set() and _defer_online_course(course_queue, task):
+                            deferred = True
+                            _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-",
+                                       "status": "等待列表恢复"})
+                            _log(f"[线程{wid+1}] {e}，延后重试: {ctitle}", "yellow")
+                            await asyncio.sleep(3 * task["list_failures"])
+                        else:
+                            _log(f"[线程{wid+1}] 课程列表持续不可用，保留待下次运行: {ctitle} - {e}", "red")
+                            _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "异常"})
+                        break
                     except Exception as e:
                         if attempt < 2:
-                            _log(f"[线程{wid+1}] 第{attempt}次失败，重试: {ctitle}", "yellow")
+                            _log(f"[线程{wid+1}] 第{attempt}次失败，重试: {ctitle} - {str(e)[:180]}", "yellow")
                             await asyncio.sleep(2)
                             continue
                         _log(f"[线程{wid+1}] 课程失败: {ctitle} - {e}", "red")
@@ -4528,12 +4639,14 @@ class AutoLearner:
                         break
                     finally:
                         for opened in (play_page, cp):
-                            if opened and not opened.is_closed():
+                            if opened and opened is not wp and not opened.is_closed():
                                 try:
                                     await opened.close()
                                 except Exception:
                                     pass
 
+                if deferred:
+                    continue
                 if done_ok:
                     if already_complete:
                         skipped_count[0] += 1
@@ -4578,6 +4691,20 @@ class AutoLearner:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except:
                 pass
+        except OnlineCourseListUnavailable as exc:
+            _log(str(exc), "red")
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.last_stats = (ok_count[0], fail_count[0])
+            return False
+        except Exception:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         finally:
             if prefetch_tasks:
                 await asyncio.gather(*list(prefetch_tasks), return_exceptions=True)

@@ -2228,8 +2228,8 @@ class DashboardScreen(QWidget):
         header_view.setSectionResizeMode(4, QHeaderView.Fixed)
         header_view.setFixedHeight(31)
         self.table.setColumnWidth(0, 54)
-        # 进度与预计保持同宽，课程列使用剩余空间，避免长课程名被压缩。
-        self.table.setColumnWidth(2, 84)
+        # 进度条需要足够宽来分辨百分比；课程列继续使用剩余空间。
+        self.table.setColumnWidth(2, 170)
         self.table.setColumnWidth(3, 84)
         self.table.setColumnWidth(4, 180)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
