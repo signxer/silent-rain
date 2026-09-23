@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2.3.6
+- fix(network-study): 课程列表是 hash 路由，标签页已停在列表地址时 goto 只是同文档导航、不派发 hashchange，SPA 不会重新渲染；一次偶发的渲染失败会让该 worker 之后每轮都空等 12 秒并报「课程列表未加载」。现在同地址改为 reload 重新加载，可自动恢复
+- fix(network-study): 列表加载增加课程卡片可见性校验与空白页重置重试，并区分「页面空白」和「网络失败」，网络异常时不再反复重置标签页
+- test(network-study): 增加 hash 路由列表标签页卡死的回归测试
+
 ## 2.3.5
 - fix(startup): 恢复欢迎页入场动画和页面切换所需的 QGraphicsOpacityEffect 导入，修复启动时报 NameError
 

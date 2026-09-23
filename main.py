@@ -123,6 +123,39 @@ class OnlineCourseListUnavailable(RuntimeError):
     """课程列表暂时未加载，不应将单门课程直接判为学习失败。"""
 
 
+ONLINE_COURSE_LIST_CARD_SELECTOR = "a.p-cursor[title]"
+
+
+def _same_document_url(current_url: str, target_url: str) -> bool:
+    """判断 goto(target_url) 是否只会做同文档导航（scheme/host/path 相同）。
+
+    网络自学列表 /course/#/list/N 是 hash 路由：同文档内的跳转不会重新加载页面。
+    """
+    try:
+        current, target = urlsplit(current_url or ""), urlsplit(target_url or "")
+    except Exception:
+        return False
+    return ((current.scheme, current.netloc, current.path)
+            == (target.scheme, target.netloc, target.path))
+
+
+def _same_hash_url(current_url: str, target_url: str) -> bool:
+    """同文档且 hash 完全一致：浏览器不会派发 hashchange，SPA 不会重新渲染。"""
+    try:
+        return (_same_document_url(current_url, target_url)
+                and urlsplit(current_url or "").fragment == urlsplit(target_url or "").fragment)
+    except Exception:
+        return False
+
+
+def _page_url(page) -> str:
+    """安全读取页面地址；page 可能是不带 url 的替身对象。"""
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
 def _online_course_target_url(list_url: str, href: str) -> str:
     """仅将同站课程卡片的可导航 href 解析为直达地址。"""
     href = (href or "").strip()
@@ -4290,6 +4323,68 @@ class AutoLearner:
                 pass
         console.print("课程模式学习完成", style="bold green")
 
+    async def _wait_online_course_cards(self, page: Page, timeout: int) -> bool:
+        """等待课程卡片可见；只做判定，不抛异常。"""
+        try:
+            await page.wait_for_selector(ONLINE_COURSE_LIST_CARD_SELECTOR,
+                                         state="visible", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    async def _load_online_course_list(self, page: Page, list_url: str, *,
+                                       worker_id: int = -1, attempts: int = 2) -> bool:
+        """打开网络自学课程列表页，确保课程卡片真正渲染出来。
+
+        列表地址 /course/#/list/N 是 hash 路由，而 goto() 到同文档地址只是同文档
+        导航：hash 没变化时浏览器连 hashchange 都不会派发，SPA 也就不会重新渲染。
+        于是「卡片为空」这种一次性的渲染失败会变成该标签页的永久故障——地址始终正确、
+        卡片始终为空，之后每一轮都白等一个超时，最终报「课程列表未加载」。
+        所以标签页已经停在列表地址上时必须 reload()（或先重置页面）拿到真正的新文档。
+        """
+        tag = f"[工作线程 {worker_id + 1}] " if worker_id >= 0 else ""
+        reload_page = getattr(page, "reload", None)
+
+        for attempt in range(1, max(1, attempts) + 1):
+            current_url = _page_url(page)
+            # 已经停在列表页且卡片可见：直接复用，不做无谓的重新加载。
+            if _same_hash_url(current_url, list_url) and await self._wait_online_course_cards(page, 1500):
+                debug(f"{tag}phase=list_reuse attempt={attempt}; {_page_debug_state(page)}")
+                return True
+
+            navigated = False
+            try:
+                if _same_document_url(current_url, list_url) and callable(reload_page):
+                    debug(f"{tag}phase=list_reload attempt={attempt}; "
+                          f"同文档 goto 不会重渲染，改为 reload; {_page_debug_state(page)}")
+                    await reload_page(wait_until="domcontentloaded", timeout=20000)
+                else:
+                    await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                navigated = True
+            except Exception as exc:
+                debug(f"{tag}phase=list_nav_error attempt={attempt}; "
+                      f"error={type(exc).__name__}: {_safe_debug_error(exc)}; {_page_debug_state(page)}")
+
+            if await self._wait_online_course_cards(page, 12000):
+                debug(f"{tag}phase=list_ready attempt={attempt}; {_page_debug_state(page)}")
+                return True
+
+            if not navigated:
+                # 导航本身就没成功，属于网络问题：交给上层稍后整体重试，别再折腾标签页。
+                break
+
+            if attempt < attempts:
+                # 页面地址变了但卡片没渲染：SPA 残留状态，重置标签页后再来一次。
+                debug(f"{tag}phase=list_empty attempt={attempt}; 重置标签页后重试; "
+                      f"{_page_debug_state(page)}")
+                try:
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    break
+
+        debug(f"{tag}phase=list_unavailable; {_page_debug_state(page)}")
+        return False
+
     async def _advance_online_course_page(self, page: Page, list_url: str,
                                           current_page: int) -> Optional[bool]:
         """Advance the online-course list using visible controls or its SPA route.
@@ -4365,25 +4460,24 @@ class AutoLearner:
     async def _open_online_course_from_list(self, worker_page: Page, list_url: str,
                                             task: dict, worker_id: int = -1) -> Page:
         """仅在卡片没有可用直达地址时，回列表页定位并打开课程。"""
-        try:
-            await worker_page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
-            await worker_page.wait_for_selector("a.p-cursor[title]", timeout=12000)
-        except Exception as exc:
-            debug(f"网络自学课程列表加载失败: {exc}")
-            raise OnlineCourseListUnavailable("课程列表未加载") from exc
+        if not await self._load_online_course_list(worker_page, list_url, worker_id=worker_id):
+            debug(f"[工作线程 {worker_id+1}] 网络自学课程列表加载失败: 课程卡片未渲染; "
+                  f"{_page_debug_state(worker_page)}")
+            raise OnlineCourseListUnavailable("课程列表未加载")
 
         for _ in range(task["page"] - 1):
             try:
                 moved = await self._advance_online_course_page(worker_page, list_url, _ + 1)
                 if moved is not True:
                     raise OnlineCourseListUnavailable("课程列表翻页入口不可用")
-                await worker_page.wait_for_selector("a.p-cursor[title]", timeout=12000)
+                if not await self._wait_online_course_cards(worker_page, 12000):
+                    raise OnlineCourseListUnavailable("课程列表翻页后未加载")
             except OnlineCourseListUnavailable:
                 raise
             except Exception as exc:
                 raise OnlineCourseListUnavailable("课程列表翻页失败") from exc
 
-        links = worker_page.locator("a.p-cursor[title]")
+        links = worker_page.locator(ONLINE_COURSE_LIST_CARD_SELECTOR)
         count = await links.count()
         href = task.get("href", "")
         title = task["title"]
@@ -4640,11 +4734,8 @@ class AutoLearner:
         # 使用独立列表页采集课程，避免与学习中的 worker 页面争用。
         page = await self.context.new_page()
         _log(f"网络自学: 从课程列表加载 {list_url}", "blue")
-        try:
-            await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(5000)
-        except Exception as e:
-            _log(f"课程列表加载失败: {e}", "red")
+        if not await self._load_online_course_list(page, list_url):
+            _log("课程列表加载失败: 课程卡片未渲染", "red")
             self.last_stats = (0, 0)
             try:
                 await page.close()
@@ -4673,10 +4764,8 @@ class AutoLearner:
                     except:
                         pass
                 _log("登录成功，继续加载...", "green")
-                try:
-                    await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
-                    await page.wait_for_timeout(5000)
-                except:
+                if not await self._load_online_course_list(page, list_url):
+                    _log("课程列表加载失败: 课程卡片未渲染", "red")
                     self.last_stats = (0, 0)
                     try:
                         await page.close()
@@ -4710,7 +4799,7 @@ class AutoLearner:
             loaded = False
             for attempt in range(2):
                 try:
-                    await page.wait_for_selector("a.p-cursor[title]", timeout=10000)
+                    await page.wait_for_selector(ONLINE_COURSE_LIST_CARD_SELECTOR, timeout=10000)
                     loaded = True
                     break
                 except Exception:
@@ -4721,7 +4810,7 @@ class AutoLearner:
                 retry_current_page = True
                 _log(f"课程列表第 {page_num} 页暂时未加载，稍后重试", "yellow")
                 return 0
-            cards = page.locator("a.p-cursor[title]")
+            cards = page.locator(ONLINE_COURSE_LIST_CARD_SELECTOR)
             cnt = await cards.count()
             if cnt == 0:
                 _log(f"课程列表第 {page_num} 页暂时为空，稍后重试", "yellow")

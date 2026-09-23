@@ -5,10 +5,12 @@ import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 from main import (
-    AutoLearner, OnlineCourseListUnavailable,
+    AutoLearner, OnlineCourseListUnavailable, ONLINE_COURSE_LIST_CARD_SELECTOR,
     _build_online_playlist_tasks, _defer_online_course, _online_course_target_url,
+    _same_document_url, _same_hash_url,
 )
 from ui_theme import LIGHT, RoundedGradientProgressBar, _stylesheet
 
@@ -94,6 +96,81 @@ class RoutePage:
         pass
 
 
+class HashRouteListPage:
+    """模型化 /course/#/list/N 这个 hash 路由标签页的导航语义。
+
+    行为对齐 Chromium 实测结果：goto() 到同一个文档只是同文档导航，hash 完全没变
+    时浏览器不会派发 hashchange，SPA 因此不会重新渲染；只有真正的新文档加载
+    （首次 goto 或 reload()）才会按当前路由重新渲染。
+    """
+
+    def __init__(self, url, rendered=None):
+        self.url = url
+        self.rendered = rendered      # DOM 里当前真正渲染出来的路由
+        self.reloads = 0
+        self.gotos = 0
+        self.clicked_titles = []
+        self.context = SimpleNamespace(pages=[self])
+
+    async def goto(self, url, **kwargs):
+        self.gotos += 1
+        old, new = urlsplit(self.url), urlsplit(url)
+        if (old.scheme, old.netloc, old.path) != (new.scheme, new.netloc, new.path):
+            self.url = self.rendered = url          # 新文档：SPA 按路由启动渲染
+            return
+        self.url = url
+        if old.fragment != new.fragment:
+            self.rendered = url                     # hashchange 触发路由重渲染
+        # hash 相同：不派发 hashchange，DOM 保持原样（故障点）
+
+    async def reload(self, **kwargs):
+        self.reloads += 1
+        self.rendered = self.url                    # 真实文档加载 -> 重新渲染
+
+    async def wait_for_selector(self, selector, **kwargs):
+        if selector == ONLINE_COURSE_LIST_CARD_SELECTOR and self.rendered:
+            return object()
+        raise TimeoutError(f"{selector} did not load")
+
+    async def wait_for_timeout(self, milliseconds):
+        pass
+
+    def is_closed(self):
+        return False
+
+    async def wait_for_event(self, event, **kwargs):
+        await asyncio.Future()                      # 该标签页不会弹窗
+
+    def locator(self, selector):
+        return _ListCards(self)
+
+
+class _ListCards:
+    def __init__(self, page):
+        self.page = page
+
+    async def count(self):
+        return 2 if self.page.rendered else 0
+
+    def nth(self, index):
+        return _Card(self.page, index)
+
+
+class _Card:
+    def __init__(self, page, index):
+        self.page = page
+        self.index = index
+
+    async def get_attribute(self, name):
+        if name == "title":
+            return "Example" if self.index == 0 else "Another"
+        return ""
+
+    async def click(self):
+        # 同标签页打开播放页（真实站点也会这样做）。
+        self.page.url = "https://example.test/course/#/play/123"
+
+
 class CourseEntryTests(unittest.TestCase):
     def setUp(self):
         self.learner = AutoLearner.__new__(AutoLearner)
@@ -167,6 +244,73 @@ class CourseEntryTests(unittest.TestCase):
         with self.assertRaises(OnlineCourseListUnavailable):
             asyncio.run(self.learner._open_online_course_from_list(
                 UnavailablePage(), "https://example.test/course/#/list/1", task))
+
+    def test_same_hash_url_detects_identical_hash_route(self):
+        base = "https://example.test/course/#/list/1"
+        self.assertTrue(_same_document_url(base, "https://example.test/course/#/list/2"))
+        self.assertTrue(_same_hash_url(base, base))
+        # 只有 hash 不同时 goto 仍会派发 hashchange，不算“完全同址”。
+        self.assertFalse(_same_hash_url(base, "https://example.test/course/#/list/2"))
+        self.assertFalse(_same_document_url(base, "https://example.test/portal/#/list/1"))
+        self.assertFalse(_same_hash_url("about:blank", base))
+
+    def test_stuck_list_tab_is_recovered_by_reload(self):
+        """已在列表地址但卡片为空的标签页必须 reload，而不是再做一次 goto。"""
+        list_url = "https://example.test/course/#/list/1"
+        stuck = HashRouteListPage(list_url, rendered=None)
+        result = asyncio.run(self.learner._load_online_course_list(
+            stuck, list_url, worker_id=0))
+        self.assertTrue(result)
+        self.assertEqual(stuck.reloads, 1)
+        self.assertEqual(stuck.gotos, 0)
+        self.assertEqual(stuck.rendered, list_url)
+
+    def test_healthy_list_tab_is_reused_without_navigation(self):
+        list_url = "https://example.test/course/#/list/1"
+        page = HashRouteListPage(list_url, rendered=list_url)
+        self.assertTrue(asyncio.run(self.learner._load_online_course_list(page, list_url)))
+        self.assertEqual((page.reloads, page.gotos), (0, 0))
+
+    def test_blank_reset_recovers_tab_that_reload_cannot_fix(self):
+        """reload 也拿不到卡片时，走一次空白页丢弃 SPA 残留状态后应恢复。"""
+        list_url = "https://example.test/course/#/list/1"
+
+        class ReloadIsBroken(HashRouteListPage):
+            async def reload(self, **kwargs):
+                self.reloads += 1
+                self.rendered = None          # reload 后依然空白
+
+        page = ReloadIsBroken(list_url, rendered=None)
+        self.assertTrue(asyncio.run(self.learner._load_online_course_list(
+            page, list_url, attempts=2)))
+        self.assertEqual(page.reloads, 1)
+        self.assertEqual(page.gotos, 2)        # 一次空白重置 + 一次重新打开列表
+        self.assertEqual(page.rendered, list_url)
+
+    def test_network_failure_does_not_thrash_the_tab(self):
+        """导航本身失败时直接判定不可用，不再重置标签页反复重试。"""
+        list_url = "https://example.test/course/#/list/1"
+
+        class OfflinePage(HashRouteListPage):
+            async def goto(self, url, **kwargs):
+                self.gotos += 1
+                raise TimeoutError("net::ERR_CONNECTION_TIMED_OUT")
+
+        page = OfflinePage("about:blank", rendered=None)
+        self.assertFalse(asyncio.run(self.learner._load_online_course_list(
+            page, list_url, attempts=2)))
+        self.assertEqual(page.gotos, 1)
+
+    def test_open_from_list_recovers_stuck_worker_page(self):
+        """回归：报“课程列表未加载”的场景现在应能自愈并打开课程。"""
+        list_url = "https://example.test/course/#/list/1"
+        worker = HashRouteListPage(list_url, rendered=None)
+        task = {"page": 1, "title": "Example", "href": ""}
+        result = asyncio.run(self.learner._open_online_course_from_list(
+            worker, list_url, task, worker_id=0))
+        self.assertIs(result, worker)
+        self.assertEqual(worker.reloads, 1)
+        self.assertIn("/play/", worker.url)
 
     def test_list_card_can_open_player_in_same_tab(self):
         async def run():
