@@ -783,7 +783,7 @@ class AutoLearner:
                         raise
             else:
                 raise
-        
+
         # 创建浏览器上下文（不硬编码user_agent，让Playwright自动匹配当前OS）
         context_opts = {
             "viewport": {"width": 1920, "height": 1080},
@@ -4245,6 +4245,78 @@ class AutoLearner:
                 pass
         console.print("课程模式学习完成", style="bold green")
 
+    async def _advance_online_course_page(self, page: Page, list_url: str,
+                                          current_page: int) -> Optional[bool]:
+        """Advance the online-course list using visible controls or its SPA route.
+
+        Returns True when navigation was initiated, False only when the next
+        page is explicitly disabled/absent on a recognized list route, and
+        None when pagination is temporarily unavailable or unrecognized.
+        """
+        disabled_seen = False
+        candidates = [
+            (page.locator("[class*=page-next]"), False),
+            (page.locator("span.pagetext").filter(has_text=re.compile(r"下一页|Next", re.I)), True),
+            (page.locator("a,button,li").filter(has_text=re.compile(r"^\s*(?:下一页|Next)\s*$", re.I)), True),
+        ]
+        for locator, require_next_text in candidates:
+            try:
+                count = await locator.count()
+            except Exception:
+                continue
+            for index in range(count):
+                item = locator.nth(index)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    label = (await item.inner_text()).strip()
+                    if require_next_text and not re.search(r"下一页|Next", label, re.I):
+                        continue
+                    classes = (await item.get_attribute("class") or "").lower()
+                    aria_disabled = (await item.get_attribute("aria-disabled") or "").lower()
+                    disabled = await item.get_attribute("disabled")
+                    if (disabled is not None or aria_disabled == "true"
+                            or any(token in classes for token in ("page_disabled", "is-disabled", "disabled"))):
+                        disabled_seen = True
+                        continue
+                    await item.click(timeout=5000)
+                    try:
+                        await page.wait_for_timeout(3500)
+                    except Exception:
+                        pass
+                    debug(f"网络课程分页: 通过控件翻页 current={current_page}; label={label!r}; class={classes!r}")
+                    return True
+                except Exception as exc:
+                    debug(f"网络课程分页控件不可用 current={current_page}; error={type(exc).__name__}: {_safe_debug_error(exc)}")
+
+        if disabled_seen:
+            debug(f"网络课程分页: 下一页控件明确禁用 current={current_page}")
+            return False
+
+        # The site route is usually /course/#/list/<page>. Use it as a fallback
+        # if its pagination markup changes or the next control is not exposed.
+        try:
+            parts = urlsplit(page.url or list_url)
+            route = parts.fragment.rstrip("/")
+            match = re.match(r"^(.*?/list/)\d+$", route)
+            if match:
+                next_page = current_page + 1
+                target = parts._replace(fragment=f"{match.group(1)}{next_page}").geturl()
+                await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(3500)
+                landed_route = urlsplit(page.url).fragment.rstrip("/")
+                if re.search(rf"/list/{next_page}$", landed_route):
+                    debug(f"网络课程分页: 通过 SPA 路由翻页 current={current_page}; target={_safe_debug_url(target)}")
+                    return True
+                if re.search(rf"/list/{current_page}$", landed_route):
+                    debug(f"网络课程分页: SPA 路由未前进，判定末页 current={current_page}")
+                    return False
+        except Exception as exc:
+            debug(f"网络课程分页路由兜底失败 current={current_page}; error={type(exc).__name__}: {_safe_debug_error(exc)}")
+
+        debug(f"网络课程分页: 未识别下一页控件 current={current_page}; url={_page_debug_state(page)}")
+        return None
+
     async def _open_online_course_from_list(self, worker_page: Page, list_url: str,
                                             task: dict, worker_id: int = -1) -> Page:
         """仅在卡片没有可用直达地址时，回列表页定位并打开课程。"""
@@ -4257,11 +4329,9 @@ class AutoLearner:
 
         for _ in range(task["page"] - 1):
             try:
-                next_button = worker_page.locator("[class*=page-next]:not([class*=page_disabled])")
-                if await next_button.count() == 0:
+                moved = await self._advance_online_course_page(worker_page, list_url, _ + 1)
+                if moved is not True:
                     raise OnlineCourseListUnavailable("课程列表翻页入口不可用")
-                await next_button.first.click()
-                await worker_page.wait_for_timeout(1500)
                 await worker_page.wait_for_selector("a.p-cursor[title]", timeout=12000)
             except OnlineCourseListUnavailable:
                 raise
@@ -4577,17 +4647,15 @@ class AutoLearner:
 
                 while not no_more_pages and not self._stop_event.is_set():
                     try:
-                        nxt = page.locator("[class*=page-next]:not([class*=page_disabled])")
-                        if await nxt.count() == 0:
-                            if await page.locator("a.p-cursor[title]").count() == 0:
-                                retry_current_page = True
-                                _log("课程列表暂时为空，保留翻页位置稍后重试", "yellow")
-                                return 0
+                        moved = await self._advance_online_course_page(page, list_url, page_num)
+                        if moved is False:
                             no_more_pages = True
+                            _log(f"课程列表已到最后一页（第 {page_num} 页）", "blue")
                             return 0
-                        await nxt.first.click()
+                        if moved is None:
+                            _log(f"暂未识别第 {page_num} 页的下一页入口，稍后重试补课", "yellow")
+                            return 0
                         page_num += 1
-                        await page.wait_for_timeout(4000)
                     except Exception as e:
                         _log(f"翻到下一页失败，稍后重试: {e}", "yellow")
                         retry_current_page = True
@@ -4620,11 +4688,22 @@ class AutoLearner:
             await asyncio.sleep(2 * initial_retries)
             await fetch_more_courses(force=True)
         # 启动时尽量给每个 worker 一门课；之后再按需补充，避免提前扫完所有页面。
+        bootstrap_attempts = 0
         while course_queue.qsize() < self.workers and not no_more_pages:
             before = course_queue.qsize()
+            before_page = page_num
             await fetch_more_courses(force=True)
-            if course_queue.qsize() == before and not no_more_pages:
+            if course_queue.qsize() > before:
+                bootstrap_attempts = 0
+                continue
+            if no_more_pages:
                 break
+            bootstrap_attempts += 1
+            if bootstrap_attempts >= 3:
+                _log(f"初始补充课程池暂不可用，先以 {course_queue.qsize()} 门课程启动；worker 空闲时会继续补充", "yellow")
+                break
+            if page_num == before_page:
+                await asyncio.sleep(2 * bootstrap_attempts)
 
         if course_queue.qsize() == 0:
             _log("课程列表没有待学习课程" if saw_courses else "课程列表未获取到课程", "yellow")
@@ -4643,30 +4722,47 @@ class AutoLearner:
         fail_count = [0]
         list_open_semaphore = asyncio.Semaphore(2)
 
-        async def course_task_stream():
+        async def course_task_stream(wid: int):
             list_retries = 0
             while not self._stop_event.is_set() and not goal_reached.is_set():
                 try:
                     task = course_queue.get_nowait()
                     list_retries = 0
+                    debug(f"[线程{wid+1}] phase=dequeue course={task.get('title', '')!r}; queued={course_queue.qsize()}; no_more_pages={no_more_pages}")
                     if course_queue.empty() and not no_more_pages:
                         # 趁 worker 正在学习当前课程时预取下一页，减少池空后的等待。
                         schedule_prefetch()
                     yield task
+                    if not self._stop_event.is_set() and not goal_reached.is_set():
+                        _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
+                                   "status": "等待下一门"})
                     continue
                 except asyncio.QueueEmpty:
+                    _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
+                               "status": "检查课程队列"})
+                    debug(f"[线程{wid+1}] phase=queue_empty queued=0; no_more_pages={no_more_pages}; retry_current_page={retry_current_page}")
                     added = await fetch_more_courses()
+                    debug(f"[线程{wid+1}] phase=queue_fetch_done added={added}; queued={course_queue.qsize()}; no_more_pages={no_more_pages}; retry_current_page={retry_current_page}")
                     if added <= 0:
                         if no_more_pages:
+                            _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
+                                       "status": "空闲"})
+                            debug(f"[线程{wid+1}] phase=worker_idle reason=course_list_exhausted")
                             return
                         list_retries += 1
                         if list_retries >= 3:
+                            _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
+                                       "status": "列表异常"})
                             raise OnlineCourseListUnavailable("课程列表连续加载失败，已暂停当前阶段；未完成课程下次仍可继续")
                         _log(f"课程列表暂不可用，{min(5 * list_retries, 10)} 秒后重试补课", "yellow")
                         await asyncio.sleep(min(5 * list_retries, 10))
+            if goal_reached.is_set():
+                _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-", "status": "目标达成"})
+            elif self._stop_event.is_set():
+                _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-", "status": "已停止"})
 
         async def cworker(wid: int, wp: Page):
-            async for task in course_task_stream():
+            async for task in course_task_stream(wid):
                 # 用户变更配置：停止取新课程
                 if self._stop_event.is_set():
                     break
@@ -4774,24 +4870,32 @@ class AutoLearner:
                     _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-",
                                "status": "已完成" if already_complete else "✓ 完成"})
                     _log(f"[线程{wid+1}] {'已学完，跳过' if already_complete else '完成'}: {ctitle}", "green")
+                    debug(f"[线程{wid+1}] phase=course_done course={ctitle!r}; queued={course_queue.qsize()}; no_more_pages={no_more_pages}")
                 else:
                     fail_count[0] += 1
 
                 # 5) 完成一门课后检查目标（O1 节流：60s TTL 缓存合并并发查询）
                 if self.study_goal > 0:
                     try:
+                        _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-",
+                                   "status": "更新学时"})
+                        debug(f"[线程{wid+1}] phase=study_hours_check_start course={ctitle!r}")
                         h = await self._get_study_hours(wp)
                         _hours({"central": h.get("central", 0), "online": h.get("online", 0),
                                 "updated": datetime.now().strftime("%H:%M:%S")})
                         cur = h.get(self.goal_type, 0)
                         _log(f"网络自学进度: {cur:.1f}/{self.study_goal} 学时", "blue")
+                        debug(f"[线程{wid+1}] phase=study_hours_check_done current={cur:.1f}; target={self.study_goal:.1f}")
                         if cur >= self.study_goal:
                             _log(f"✓ 网络自学目标已达成!", "bold green")
                             goal_reached.set()
+                            _progress({"wid": wid, "course": ctitle[:40], "progress": "100%", "eta": "-",
+                                       "status": "目标达成"})
                             raise GoalReached()
                     except GoalReached:
                         raise
-                    except Exception:
+                    except Exception as exc:
+                        debug(f"[线程{wid+1}] phase=study_hours_check_failed exception={type(exc).__name__}: {_safe_debug_error(exc)}")
                         pass
 
         tasks = [asyncio.create_task(cworker(wid, self.pages[wid])) for wid in range(nw)]

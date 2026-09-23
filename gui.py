@@ -13,11 +13,11 @@ import math
 from datetime import datetime
 
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QSize, QTimer, QEventLoop,
+    Qt, QThread, Signal, QSize, QTimer, QEventLoop, QEvent,
     QPropertyAnimation, QPauseAnimation, QSequentialAnimationGroup, QEasingCurve, Property,
 )
 from PySide6.QtGui import (
-    QColor, QIcon, QPainter, QPainterPath, QPen, QBrush,
+    QColor, QIcon, QPainter, QPainterPath, QPen, QBrush, QFontMetrics,
     QLinearGradient, QRadialGradient, QPalette,
 )
 from PySide6.QtWidgets import (
@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QFrame,
     QDialog, QLabel, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
-    QComboBox, QProgressBar,
+    QComboBox, QProgressBar, QSizePolicy,
 )
 
 from qfluentwidgets import (
@@ -60,6 +60,36 @@ def _is_dark_theme():
     if app is None:
         return False
     return app.palette().color(QPalette.Window).lightness() < 128
+
+
+class ElidedLabel(QLabel):
+    """Single-line label that keeps its full text and elides to available width."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setWordWrap(False)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def setElidedText(self, text):
+        self._full_text = str(text or "")
+        self._update_elided_text()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange, QEvent.ApplicationFontChange):
+            self._update_elided_text()
+
+    def _update_elided_text(self):
+        width = max(0, self.contentsRect().width())
+        shown = QFontMetrics(self.font()).elidedText(self._full_text, Qt.ElideRight, width)
+        if QLabel.text(self) != shown:
+            QLabel.setText(self, shown)
 
 
 # ─── Async Thread ──────────────────────────────────────────────────
@@ -2061,9 +2091,9 @@ class DashboardScreen(QWidget):
         kicker = QLabel("当前任务")
         kicker.setObjectName("heroKicker")
         hero_text.addWidget(kicker)
-        self.lbl_current_task = QLabel("尚未开始学习")
+        self.lbl_current_task = ElidedLabel()
+        self.lbl_current_task.setElidedText("尚未开始学习")
         self.lbl_current_task.setObjectName("heroTitle")
-        self.lbl_current_task.setWordWrap(True)
         hero_text.addWidget(self.lbl_current_task)
         self.lbl_current_hint = QLabel("启动后，这里会显示当前 worker 正在处理的课程")
         self.lbl_current_hint.setObjectName("heroHint")
@@ -2333,7 +2363,7 @@ class DashboardScreen(QWidget):
         self._runtime_start = __import__("time").time()
         self._runtime_timer.start()
         self.lbl_session_state.setText("初始化")
-        self.lbl_current_task.setText("正在准备学习任务…")
+        self.lbl_current_task.setElidedText("正在准备学习任务…")
         self.lbl_current_hint.setText("正在启动浏览器并读取课程列表")
         self.btn_stop.setEnabled(True)
         self.current_progress.setValue(0)
@@ -2394,13 +2424,13 @@ class DashboardScreen(QWidget):
     @staticmethod
     def _status_kind(status):
         status = str(status or "").strip()
-        if status in {"", "-", "等待中"}:
+        if status in {"", "-", "等待中", "等待下一门", "检查课程队列", "空闲"}:
             return "waiting"
         if any(k in status for k in ("完成", "目标达成")):
             return "success"
         if any(k in status for k in ("异常", "失败", "放弃", "超时")):
             return "danger"
-        if any(k in status for k in ("学习", "加载", "查找", "考试")):
+        if any(k in status for k in ("学习", "加载", "查找", "考试", "更新学时")):
             return "active"
         return "warning"
 
@@ -2448,8 +2478,9 @@ class DashboardScreen(QWidget):
             progress_layout.setSpacing(6)
             progress_layout.addWidget(bar, 1)
             percent_label = QLabel("0%")
+            percent_label.setObjectName("workerProgressPercent")
             percent_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            percent_label.setMinimumWidth(28)
+            percent_label.setFixedWidth(36)
             progress_layout.addWidget(percent_label)
             self.table.setCellWidget(i, 2, progress_cell)
             self._progress_bars.append(bar)
@@ -3158,7 +3189,7 @@ class DashboardScreen(QWidget):
         elif "异常" in status or "失败" in status:
             self.lbl_session_state.setText("需要处理")
         if course and course != "-":
-            self.lbl_current_task.setText(course)
+            self.lbl_current_task.setElidedText(course)
             self.lbl_current_hint.setText(f"线程 {wid + 1} · {status} · {progress_text}")
         self._set_status_cell(wid, status, self._status_kind(status))
 
@@ -3456,7 +3487,7 @@ class DashboardScreen(QWidget):
         self._runtime_timer.stop()
         self.btn_stop.setEnabled(False)
         self.lbl_session_state.setText("已完成" if not failed else "已完成 · 有失败")
-        self.lbl_current_task.setText("本次学习已结束")
+        self.lbl_current_task.setElidedText("本次学习已结束")
         self.lbl_current_hint.setText(f"成功 {success} 门 · 失败 {failed} 门")
         # 表格标题栏显示汇总
         if success or failed:

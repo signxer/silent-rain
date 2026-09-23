@@ -70,6 +70,29 @@ class FakePage:
         pass
 
 
+class EmptyLocator:
+    def filter(self, **kwargs):
+        return self
+
+    async def count(self):
+        return 0
+
+
+class RoutePage:
+    def __init__(self, page_number=1, redirect_to=None):
+        self.url = f"https://example.test/course/#/list/{page_number}"
+        self.redirect_to = redirect_to
+
+    def locator(self, selector):
+        return EmptyLocator()
+
+    async def goto(self, url, **kwargs):
+        self.url = self.redirect_to or url
+
+    async def wait_for_timeout(self, milliseconds):
+        pass
+
+
 class CourseEntryTests(unittest.TestCase):
     def setUp(self):
         self.learner = AutoLearner.__new__(AutoLearner)
@@ -79,6 +102,19 @@ class CourseEntryTests(unittest.TestCase):
         page = FakePage("https://example.test/course/#/play/123")
         result = asyncio.run(self.learner._enter_online_course_player(page, 0))
         self.assertIs(result, page)
+
+    def test_pagination_falls_back_to_list_spa_route(self):
+        page = RoutePage(page_number=1)
+        moved = asyncio.run(self.learner._advance_online_course_page(
+            page, "https://example.test/course/#/list/1", 1))
+        self.assertTrue(moved)
+        self.assertTrue(page.url.endswith("#/list/2"))
+
+    def test_pagination_route_fallback_detects_last_page_redirect(self):
+        page = RoutePage(page_number=3, redirect_to="https://example.test/course/#/list/3")
+        moved = asyncio.run(self.learner._advance_online_course_page(
+            page, "https://example.test/course/#/list/1", 3))
+        self.assertFalse(moved)
 
     def test_completed_detail_does_not_restart_course(self):
         page = FakePage("https://example.test/course/#/detail/123", progress=100)
