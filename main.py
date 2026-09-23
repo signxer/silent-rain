@@ -4354,11 +4354,15 @@ class AutoLearner:
 
             navigated = False
             try:
-                if _same_document_url(current_url, list_url) and callable(reload_page):
+                if _same_hash_url(current_url, list_url) and callable(reload_page):
+                    # 地址与目标完全一致，goto 是空操作（不派发 hashchange），
+                    # 只有 reload 才能按同一地址真正重新加载。
                     debug(f"{tag}phase=list_reload attempt={attempt}; "
-                          f"同文档 goto 不会重渲染，改为 reload; {_page_debug_state(page)}")
+                          f"同址 goto 不会重渲染，改为 reload; {_page_debug_state(page)}")
                     await reload_page(wait_until="domcontentloaded", timeout=20000)
                 else:
+                    # 文档不同或 hash 不同：hash 变化会触发路由，goto 即可切到目标页。
+                    # 这里不能改成 reload：reload 会停留在标签页当前所在的页（例如第 2 页）。
                     await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
                 navigated = True
             except Exception as exc:

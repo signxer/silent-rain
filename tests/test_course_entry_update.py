@@ -271,6 +271,16 @@ class CourseEntryTests(unittest.TestCase):
         self.assertTrue(asyncio.run(self.learner._load_online_course_list(page, list_url)))
         self.assertEqual((page.reloads, page.gotos), (0, 0))
 
+    def test_other_page_tab_uses_goto_not_reload(self):
+        """标签页停在第 2 页时必须靠 goto 切回第 1 页：reload 会停留在第 2 页。"""
+        list_url = "https://example.test/course/#/list/1"
+        page = HashRouteListPage("https://example.test/course/#/list/2",
+                                 rendered="https://example.test/course/#/list/2")
+        self.assertTrue(asyncio.run(self.learner._load_online_course_list(page, list_url)))
+        self.assertEqual(page.reloads, 0)
+        self.assertEqual(page.gotos, 1)
+        self.assertEqual(page.rendered, list_url)
+
     def test_blank_reset_recovers_tab_that_reload_cannot_fix(self):
         """reload 也拿不到卡片时，走一次空白页丢弃 SPA 残留状态后应恢复。"""
         list_url = "https://example.test/course/#/list/1"
