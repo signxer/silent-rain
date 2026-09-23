@@ -1,6 +1,12 @@
 # 更新日志
 
 ## 2.2.6
+- release: v2.2.6 sync goal progress indicators
+- chore: VERSION 2.2.5
+- docs: CHANGELOG 2.2.5
+# 更新日志
+
+## 2.2.6
 - fix(dashboard): 学习目标条形进度与圆形进度统一按目标学时计算
 - fix(dashboard): 避免当前课程进度覆盖整体学习目标进度
 
