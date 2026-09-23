@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from main import (
     AutoLearner, OnlineCourseListUnavailable,
-    _defer_online_course, _online_course_target_url,
+    _build_online_playlist_tasks, _defer_online_course, _online_course_target_url,
 )
 
 
@@ -294,6 +294,36 @@ class CourseQueueTests(unittest.TestCase):
             self.assertTrue(queue.empty())
 
         asyncio.run(run())
+
+    def test_playlist_videos_become_independent_queue_tasks(self):
+        parent = {
+            "page": 2,
+            "title": "Parent course",
+            "href": "https://u.ccb.com/course/#/play/course-id?pKnowledgeId=first&cid=course-id",
+            "key": "course-key",
+        }
+        entries = [
+            {"id": "video-1", "title": "第一节", "href": "https://u.ccb.com/course/#/play/course-id?pKnowledgeId=video-1&cid=course-id"},
+            {"id": "video-2", "title": "第二节", "href": "https://u.ccb.com/course/#/play/course-id?pKnowledgeId=video-2&cid=course-id"},
+            {"id": "video-2", "title": "第二节重复", "href": "https://u.ccb.com/course/#/play/course-id?pKnowledgeId=video-2&cid=course-id"},
+            {"id": "foreign", "title": "外部链接", "href": "https://example.test/course/#/play/x?pKnowledgeId=foreign&cid=x"},
+            {"id": "wrong", "title": "参数不匹配", "href": "https://u.ccb.com/course/#/play/x?pKnowledgeId=other&cid=x"},
+        ]
+        tasks = _build_online_playlist_tasks(parent, entries)
+        self.assertEqual(len(tasks), 2)
+        self.assertTrue(all(task["playlist_child"] for task in tasks))
+        self.assertEqual([task["video_id"] for task in tasks], ["video-1", "video-2"])
+        self.assertEqual(tasks[0]["key"], "course-key::video:video-1")
+        self.assertIn("pKnowledgeId=video-2", tasks[1]["href"])
+
+    def test_playlist_children_skip_individually_completed_videos(self):
+        parent = {"title": "Parent", "key": "parent-key"}
+        entries = [
+            {"id": "done", "title": "Done video", "href": "https://u.ccb.com/course/#/play/x?pKnowledgeId=done&cid=x"},
+            {"id": "todo", "title": "Todo video", "href": "https://u.ccb.com/course/#/play/x?pKnowledgeId=todo&cid=x"},
+        ]
+        tasks = _build_online_playlist_tasks(parent, entries, done_keys={"parent-key::video:done"})
+        self.assertEqual([task["video_id"] for task in tasks], ["todo"])
 
 
 class UpdateLaunchTests(unittest.TestCase):

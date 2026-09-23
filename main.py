@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 from datetime import datetime
 from typing import List, Dict, Optional, Union
 
@@ -147,6 +147,51 @@ def _defer_online_course(course_queue: asyncio.Queue, task: dict, max_retries: i
     task["list_failures"] = failures
     course_queue.put_nowait(task)
     return True
+
+
+def _build_online_playlist_tasks(parent: dict, entries: list, done_keys=None) -> list:
+    """把同一播放页中的视频目录项转换为可独立排队的任务。"""
+    done_keys = set(done_keys or ())
+    tasks = []
+    seen = set()
+    for entry in entries or ():
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get("id") or "").strip()
+        href = str(entry.get("href") or "").strip()
+        title = str(entry.get("title") or "").strip()
+        if not video_id or not href or not title:
+            continue
+        try:
+            parent_url = urlsplit(parent.get("href") or href)
+            video_url = urlsplit(urljoin(parent.get("href") or href, href))
+            route, _, query = video_url.fragment.partition("?")
+            params = parse_qs(query)
+            if (video_url.scheme not in {"http", "https"}
+                    or video_url.netloc.lower() != parent_url.netloc.lower()
+                    or not route.startswith("/play/")
+                    or params.get("pKnowledgeId", [""])[0] != video_id
+                    or not params.get("cid")):
+                continue
+        except (TypeError, ValueError):
+            continue
+        key = f"{parent.get('key') or parent.get('href') or parent.get('title', '')}::video:{video_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in done_keys:
+            continue
+        tasks.append({
+            "page": parent.get("page", 1),
+            "title": f"{parent.get('title', '')} · {title}"[:120],
+            "href": href,
+            "key": key,
+            "playlist_child": True,
+            "parent_title": parent.get("title", ""),
+            "video_title": title,
+            "video_id": video_id,
+        })
+    return tasks
 
 
 def _kill_playwright_chrome():
@@ -4398,6 +4443,102 @@ class AutoLearner:
                 popup.cancel()
             await asyncio.gather(popup, return_exceptions=True)
 
+    async def _collect_online_playlist_tasks(self, page: Page, parent: dict,
+                                             done_keys=None) -> Optional[list]:
+        """读取网络自学播放页的目录，目录视频分别成为共享队列任务。
+
+        只接受路由中明确带有 pKnowledgeId 的目录项；单视频页面或无法确认
+        目录身份的页面返回空列表，由原有单视频流程继续处理。
+        """
+        entries = await page.evaluate(r"""() => {
+            const current = new URL(location.href);
+            const hashParts = current.hash.split('?');
+            const route = (hashParts[0] || '').replace(/^#/, '');
+            if (!/\/play\//.test(route)) return [];
+            const paramsFrom = (value) => {
+                const hash = String(value || '').split('#').pop() || '';
+                const query = hash.includes('?') ? hash.slice(hash.indexOf('?') + 1) : '';
+                return new URLSearchParams(query);
+            };
+            const makeHref = (id, rawHref) => {
+                if (rawHref) {
+                    try {
+                        const resolved = new URL(rawHref, location.href);
+                        const hash = resolved.hash || '';
+                        if (/\/play\//.test(hash) && paramsFrom(hash).get('pKnowledgeId')) return resolved.href;
+                    } catch (e) {}
+                }
+                const params = new URLSearchParams(hashParts[1] || '');
+                if (!params.has('cid') || !id) return '';
+                params.set('pKnowledgeId', String(id));
+                return current.origin + current.pathname + '#' + route + '?' + params.toString();
+            };
+            const result = new Map();
+            const add = (id, title, rawHref) => {
+                id = String(id || '').trim();
+                title = String(title || '').replace(/\s+/g, ' ').trim();
+                const href = makeHref(id, rawHref);
+                if (!id || !title || !href) return;
+                const params = paramsFrom(href);
+                if (params.get('pKnowledgeId') !== id) return;
+                if (id === paramsFrom(location.href).get('pKnowledgeId')) {
+                    // 当前选中项也要参与统一去重/进度判断，故仍加入目录。
+                }
+                if (!result.has(id)) result.set(id, {id, title: title.slice(0, 100), href});
+            };
+
+            // 先取带完整播放路由的链接，以及平台常见的知识点 data-* 属性。
+            const selectors = 'a[href], [data-pknowledgeid], [data-p-knowledge-id], [data-knowledgeid], [data-knowledge-id], [pknowledgeid]';
+            for (const el of document.querySelectorAll(selectors)) {
+                const href = el.getAttribute('href') || el.getAttribute('data-href') || '';
+                const attrs = ['data-pknowledgeid', 'data-p-knowledge-id', 'data-knowledgeid', 'data-knowledge-id', 'pknowledgeid'];
+                let id = '';
+                for (const name of attrs) { id = el.getAttribute(name) || ''; if (id) break; }
+                if (!id && href) id = paramsFrom(href).get('pKnowledgeId') || '';
+                if (id) add(id, el.getAttribute('title') || el.getAttribute('aria-label') || el.innerText, href);
+            }
+
+            // SPA 目录常把目录对象留在 Vue props/data，而不是暴露 href。
+            const visited = new Set();
+            const walk = (value, depth) => {
+                if (!value || typeof value !== 'object' || depth > 5 || visited.has(value)) return;
+                visited.add(value);
+                if (Array.isArray(value)) {
+                    for (const item of value.slice(0, 300)) walk(item, depth + 1);
+                    return;
+                }
+                const keys = Object.keys(value);
+                const idKey = keys.find(k => /^(pKnowledgeId|knowledgeId|p_knowledge_id)$/i.test(k));
+                const nameKey = keys.find(k => /^(resourceName|knowledgeName|videoName|chapterName|title|name)$/i.test(k));
+                if (idKey && nameKey) {
+                    const id = value[idKey];
+                    const title = value[nameKey];
+                    const rawHref = value.href || value.url || value.route || '';
+                    if (typeof id === 'string' || typeof id === 'number') add(id, title, rawHref);
+                }
+                for (const key of keys) {
+                    if (/list|knowledge|video|chapter|lesson|resource|node|item|data|children/i.test(key)) {
+                        walk(value[key], depth + 1);
+                    }
+                }
+            };
+            for (const el of document.querySelectorAll('*')) {
+                if (el.__vue__) {
+                    const vm = el.__vue__;
+                    walk(vm.$props, 0);
+                    walk(vm.$data, 0);
+                    walk(vm.item, 0);
+                    walk(vm.data, 0);
+                }
+            }
+            return [...result.values()];
+        }""")
+        tasks = _build_online_playlist_tasks(parent, entries, done_keys)
+        if len(entries or []) > 1:
+            debug(f"网络课程目录识别: course={parent.get('title', '')!r}; items={len(entries)}; pending={len(tasks)}")
+            return tasks
+        return None
+
     async def _enter_online_course_player(self, detail_page: Page, worker_id: int) -> Optional[Page]:
         """直接播放页原样返回；详情页 100% 返回 None，否则点击入口。"""
         entry_labels = ("立即学习", "我要学习", "开始学习", "进入课程",
@@ -4560,6 +4701,8 @@ class AutoLearner:
         course_queue = asyncio.Queue()
         fetch_lock = asyncio.Lock()
         goal_reached = asyncio.Event()
+        pool_changed = asyncio.Event()
+        active_workers = [0]
         prefetch_tasks = set()
 
         async def collect_current_page():
@@ -4619,6 +4762,8 @@ class AutoLearner:
                 course_queue.put_nowait({"page": page_num, "title": title[:60],
                                          "href": href, "key": course_key})
                 added += 1
+            if added:
+                pool_changed.set()
             _log(f"课程列表第 {page_num} 页: {cnt} 门（新增 {added}）", "blue")
             return added
 
@@ -4714,7 +4859,9 @@ class AutoLearner:
                 pass
             return bool(saw_courses and not self._stop_event.is_set())
 
-        nw = min(self.workers, course_queue.qsize())
+        # 即使初始课程数少于 worker，也全部启动：某个列表型课程展开后会
+        # 把多个视频子任务补入同一个池，空闲 worker 不能提前退出。
+        nw = min(self.workers, len(self.pages))
         _log(f"课程池初始采集 {course_queue.qsize()} 门课程，启动 {nw} 个线程", "bold blue")
 
         ok_count = [0]
@@ -4729,15 +4876,31 @@ class AutoLearner:
                     task = course_queue.get_nowait()
                     list_retries = 0
                     debug(f"[线程{wid+1}] phase=dequeue course={task.get('title', '')!r}; queued={course_queue.qsize()}; no_more_pages={no_more_pages}")
+                    active_workers[0] += 1
                     if course_queue.empty() and not no_more_pages:
                         # 趁 worker 正在学习当前课程时预取下一页，减少池空后的等待。
                         schedule_prefetch()
-                    yield task
+                    try:
+                        yield task
+                    finally:
+                        active_workers[0] = max(0, active_workers[0] - 1)
+                        pool_changed.set()
                     if not self._stop_event.is_set() and not goal_reached.is_set():
                         _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
                                    "status": "等待下一门"})
                     continue
                 except asyncio.QueueEmpty:
+                    if active_workers[0] > 0:
+                        # 仍有 worker 正在打开/识别课程目录或播放视频；
+                        # 等它补入列表子任务，而不是把本 worker 永久置为空闲。
+                        pool_changed.clear()
+                        if not course_queue.empty():
+                            continue
+                        try:
+                            await asyncio.wait_for(pool_changed.wait(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
                     _progress({"wid": wid, "course": "-", "progress": "-", "eta": "-",
                                "status": "检查课程队列"})
                     debug(f"[线程{wid+1}] phase=queue_empty queued=0; no_more_pages={no_more_pages}; retry_current_page={retry_current_page}")
@@ -4776,6 +4939,7 @@ class AutoLearner:
                 done_ok = False
                 already_complete = False
                 deferred = False
+                expanded_count = 0
                 for attempt in range(1, 3):  # 每门课程最多重试1次
                     cp = None
                     play_page = None
@@ -4813,6 +4977,22 @@ class AutoLearner:
                             already_complete = True
                             done_ok = True
                             break
+                        # 播放页若包含多个带独立 pKnowledgeId 的目录项，就拆成
+                        # 子任务共享给所有 worker；普通单视频页保持旧流程。
+                        if not task.get("playlist_child"):
+                            child_tasks = await self._collect_online_playlist_tasks(play_page, task, done_keys)
+                            if child_tasks is not None:
+                                for child in child_tasks:
+                                    course_queue.put_nowait(child)
+                                expanded_count = len(child_tasks)
+                                if expanded_count:
+                                    pool_changed.set()
+                                    debug(f"[线程{wid+1}] phase=playlist_expanded parent={ctitle!r}; children={expanded_count}; queued={course_queue.qsize()}")
+                                else:
+                                    # 目录存在但每个视频的独立断点键都已完成。
+                                    already_complete = True
+                                    done_ok = True
+                                break
                         # 4) 播放视频（检查返回值：失败走重试）
                         phase = "find_play_video"
                         debug(f"[线程{wid+1}] phase={phase} course={ctitle!r}; course_page={_page_debug_state(cp)}; player_page={_page_debug_state(play_page)}")
@@ -4856,6 +5036,11 @@ class AutoLearner:
                                     pass
 
                 if deferred:
+                    continue
+                if expanded_count:
+                    _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-",
+                               "status": f"已拆分 {expanded_count} 个视频"})
+                    _log(f"[线程{wid+1}] 列表课程已拆分为 {expanded_count} 个独立视频任务: {ctitle}", "green")
                     continue
                 if done_ok:
                     if already_complete:
