@@ -1,5 +1,8 @@
 # 更新日志
 
+## 2.3.5
+- fix(startup): 恢复欢迎页入场动画和页面切换所需的 QGraphicsOpacityEffect 导入，修复启动时报 NameError
+
 ## 2.3.4
 - fix(dashboard): worker 轮播改用图形效果位移，避免动画移动布局控件导致当前任务文字错位
 

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QStackedWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QFrame,
-    QDialog, QLabel, QGraphicsEffect, QGraphicsDropShadowEffect,
+    QDialog, QLabel, QGraphicsEffect, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
     QComboBox, QProgressBar, QSizePolicy,
 )
 
