@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QRectF
 from PySide6.QtGui import QColor, QPalette, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton, QSizePolicy, QVBoxLayout,
-    QDialog, QWidget,
+    QDialog, QGraphicsDropShadowEffect, QWidget,
 )
 
 from qfluentwidgets import Theme, setTheme
@@ -557,6 +557,11 @@ class BrandMark(QWidget):
         super().__init__(parent)
         self.setFixedSize(46, 46)
         self._pixmap = QPixmap(image_path) if image_path else QPixmap()
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(10)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(13, 66, 130, 72))
+        self.setGraphicsEffect(shadow)
 
     def paintEvent(self, event):
         del event
