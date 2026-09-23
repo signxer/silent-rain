@@ -3145,7 +3145,6 @@ class DashboardScreen(QWidget):
                     self._progress_labels[wid].setText(f"{pct}%")
                 if wid == 0:
                     self._animate_progress_bar(self.current_progress, pct)
-                    self._animate_progress_bar(self.goal_progress, pct)
             except (TypeError, ValueError):
                 pass
         status = str(data.get("status", "-"))
@@ -3218,6 +3217,7 @@ class DashboardScreen(QWidget):
         mode = getattr(win, "cfg_mode", "auto")
         if mode == "manual":
             self.progress_ring.setValue(0)
+            self._animate_progress_bar(self.goal_progress, 0)
             self.lbl_goal_info.setText(self._manual_goal_text())
             self.lbl_eta.setText("")
             return
@@ -3238,6 +3238,7 @@ class DashboardScreen(QWidget):
         # 没有目标
         if c_target <= 0 and o_target <= 0:
             self.progress_ring.setValue(0)
+            self._animate_progress_bar(self.goal_progress, 0)
             self.lbl_goal_info.setText("不学习")
             return
 
@@ -3252,6 +3253,7 @@ class DashboardScreen(QWidget):
             label = "网络自学"
         else:
             self._animate_ring(100)
+            self._animate_progress_bar(self.goal_progress, 100)
             tokens = QApplication.instance().property("moisten_tokens")
             done_color = getattr(tokens, "success", "#2e9e5b")
             self.progress_ring.setCustomBarColor(done_color, done_color)  # 完成变绿
@@ -3265,6 +3267,7 @@ class DashboardScreen(QWidget):
         pct_f = min(100.0, cur / goal * 100) if goal > 0 else 0
         pct = int(pct_f)
         self._animate_ring(pct)
+        self._animate_progress_bar(self.goal_progress, pct)
         remaining = max(0, goal - cur)
         self.lbl_goal_info.setText(f"{label} {cur:.1f}/{goal:.0f}学时 剩{remaining:.1f}")
 
