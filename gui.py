@@ -51,7 +51,7 @@ from ui_theme import (
 from main import (
     AutoLearner, CONFIG_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH,
     DEEPSEEK_DEFAULT_BASE_URL, DEEPSEEK_DEFAULT_MODEL, DeepSeekClient,
-    obfuscate_secret, deobfuscate_secret,
+    obfuscate_secret, deobfuscate_secret, init_debug_log,
 )
 
 
@@ -891,8 +891,8 @@ class ConfigScreen(QWidget):
         # 不再放置一个会让用户误以为需要提交的底部按钮。
         self.btn_start = None
         if not (self.sidebar_mode and self.section == "appearance"):
-            self.btn_start = PrimaryPushButton("  保存并返回" if self.sidebar_mode else "  开始")
-            self.btn_start.setIcon(FIF.PLAY)
+            self.btn_start = PrimaryPushButton("  保存" if self.sidebar_mode else "  开始")
+            self.btn_start.setIcon(FIF.SAVE if self.sidebar_mode else FIF.PLAY)
             self.btn_start.setFixedSize(160, 40)
             self.btn_start.clicked.connect(self._on_start)
             btn_layout = QHBoxLayout()
@@ -1221,7 +1221,9 @@ class GoalScreen(QWidget):
         except Exception:
             pass
         if hasattr(self, "btn_next"):
-            self.btn_next.setText("  保存并返回" if getattr(self.window(), "_settings_mode", False) else "  继续")
+            settings_mode = getattr(self.window(), "_settings_mode", False)
+            self.btn_next.setText("  保存" if settings_mode else "  继续")
+            self.btn_next.setIcon(FIF.SAVE if settings_mode else FIF.RIGHT_ARROW)
 
     def _load_goal(self):
         self._saved_central = 0
@@ -1407,22 +1409,16 @@ class GoalScreen(QWidget):
 
         layout.addStretch()
 
-        # 按钮
+        # 单一主操作居中；首次向导继续，侧栏设置保存。
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-
-        btn_skip = PushButton("  跳过")
-        btn_skip.setIcon(FIF.CLOSE)
-        btn_skip.setFixedSize(120, 40)
-        btn_skip.clicked.connect(lambda: self._on_done(False, 0, "target", False, 0, "target"))
-        btn_layout.addWidget(btn_skip)
-
         btn_next = PrimaryPushButton("  继续")
         btn_next.setIcon(FIF.RIGHT_ARROW)
-        btn_next.setFixedSize(120, 40)
+        btn_next.setFixedSize(160, 40)
         btn_next.clicked.connect(self._on_next)
         self.btn_next = btn_next
         btn_layout.addWidget(btn_next)
+        btn_layout.addStretch()
 
         layout.addLayout(btn_layout)
 
@@ -4709,6 +4705,7 @@ def main():
 def _main():
     import platform, multiprocessing
     multiprocessing.freeze_support()
+    init_debug_log()
     # 抑制 Qt 字体警告
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     # macOS 高DPI支持

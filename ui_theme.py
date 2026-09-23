@@ -283,6 +283,9 @@ def style_moisten_dialog(dialog):
             for button in (dialog.yesButton, dialog.cancelButton):
                 button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
                 button.setFixedHeight(40)
+                button.setAutoDefault(False)
+                button.setDefault(False)
+                button.setAttribute(Qt.WA_MacShowFocusRect, False)
         # Dialog 基类初始化时锁定了默认尺寸；释放后按紧凑布局重新计算，
         # 只固定高度，保留长更新说明所需的自适应宽度。
         dialog.setMinimumSize(0, 0)
@@ -370,6 +373,48 @@ def style_moisten_dialog(dialog):
                 stop:0 {tokens.accent}, stop:1 {tokens.success});
         }}
     """)
+    # Dialog's affirmative control is a Fluent PrimaryPushButton while cancel is
+    # a native QPushButton. Give both an explicit local style so Fluent's focus
+    # chrome cannot paint over the custom primary surface or alter its geometry.
+    shared_button = f"""
+        QPushButton {{
+            min-height: 40px; max-height: 40px;
+            padding: 0px 16px;
+            border: 1px solid {tokens.border};
+            border-radius: 11px;
+            color: {tokens.text};
+            background: {tokens.surface_alt};
+            font-size: 13px; font-weight: 700;
+            outline: none;
+        }}
+        QPushButton:hover {{
+            color: {tokens.accent_strong};
+            background: {tokens.accent_soft};
+            border-color: {tokens.accent};
+        }}
+        QPushButton:pressed {{ padding-top: 0px; padding-bottom: 0px; }}
+        QPushButton:focus {{ outline: none; }}
+    """
+    primary_button = f"""
+        QPushButton {{
+            min-height: 40px; max-height: 40px;
+            padding: 0px 16px;
+            border: none;
+            border-radius: 11px;
+            color: #FFFFFF;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 {tokens.accent}, stop:1 {tokens.success});
+            font-size: 13px; font-weight: 700;
+            outline: none;
+        }}
+        QPushButton:hover {{ color: #FFFFFF; background: {tokens.accent_strong}; }}
+        QPushButton:pressed {{ padding-top: 0px; padding-bottom: 0px; }}
+        QPushButton:focus {{ outline: none; }}
+    """
+    if getattr(dialog, "yesButton", None) is not None:
+        dialog.yesButton.setStyleSheet(primary_button)
+    if getattr(dialog, "cancelButton", None) is not None:
+        dialog.cancelButton.setStyleSheet(shared_button)
     if hasattr(dialog, "setTitleBarVisible"):
         # 样式表会改变标题和正文的 sizeHint，再计算一次高度，避免按钮被推到过低位置。
         dialog.setMinimumHeight(0)

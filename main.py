@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import inspect
 import os
 import platform
 import queue
@@ -206,22 +207,59 @@ def safe_print(text, style=None):
 
 
 DEBUG_LOG = "moisten_debug.log"
+_DEBUG_LOG_LOCK = threading.Lock()
 
 def init_debug_log():
-    # 清空调试日志
+    # Append a run marker instead of discarding prior diagnostics.
     try:
-        with open(DEBUG_LOG, "w", encoding="utf-8") as f:
-            f.write(f"=== Moisten Debug Log ===\n")
+        with _DEBUG_LOG_LOCK, open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n=== Moisten Debug Run | started {datetime.now().astimezone().isoformat(timespec='seconds')} ===\n")
     except:
         pass
 
 def debug(msg: str):
-    # 写入调试日志，不显示在控制台
+    # Timestamp every event; keep this file free of page bodies and credentials.
     try:
-        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{msg}\n")
+        stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        with _DEBUG_LOG_LOCK, open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {msg}\n")
     except:
         pass
+
+def _safe_debug_url(url: str) -> str:
+    """Keep only origin/path and a generic SPA route; never log query/hash secrets."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        route = ""
+        segments = [part for part in parts.fragment.split("?")[0].split("/") if part]
+        if segments:
+            route = f"#/{segments[0]}"
+        return f"{parts.scheme}://{host}{parts.path}{route}"
+    except Exception:
+        return "<url-unavailable>"
+
+def _safe_debug_error(error) -> str:
+    """Strip URL query/hash material from Playwright exceptions before logging."""
+    try:
+        return re.sub(
+            r"https?://[^\s\]\[()'\"]+",
+            lambda match: _safe_debug_url(match.group(0).rstrip(".,;:")),
+            str(error),
+        )
+    except Exception:
+        return type(error).__name__
+
+def _page_debug_state(page) -> str:
+    """Return a small, credential-free snapshot for browser lifecycle diagnostics."""
+    if page is None:
+        return "page=none"
+    try:
+        return f"closed={page.is_closed()} url={_safe_debug_url(page.url)}"
+    except Exception as exc:
+        return f"state-unavailable={type(exc).__name__}"
 
 # === 常驻 stdin 读取线程 ===
 # 单一线程读 stdin，通过 queue 分发给各 async_input 调用，
@@ -2004,16 +2042,18 @@ class AutoLearner:
         # 查找并播放视频，监控进度到100%
         # O4：3 分钟进度无变化判定卡住，提前放弃（替代最长 20 分钟空转）
         try:
-            debug(f"[工作线程 {worker_id+1}] 正在查找视频元素...")
+            debug(f"[工作线程 {worker_id+1}] phase=video_probe start {_page_debug_state(page)}")
             if ("/course/#/detail/" in page.url
                     and not await page.query_selector("video, audio, .prism-player")):
-                debug(f"[工作线程 {worker_id+1}] 当前仍是课程详情页，不刷新查找视频")
+                debug(f"[工作线程 {worker_id+1}] phase=video_probe still_on_detail {_page_debug_state(page)}")
                 return False
 
             # 等待视频元素出现，找不到就刷新重试
             video_found = False
             video_selectors = ["video", "audio", "[class*='video']", "[class*='audio']", ".prism-player"]
-            max_load_refreshes = 3
+            # Course pages may take a while to hydrate their embedded player.
+            # Keep the longer retry window used by the previously reliable flow.
+            max_load_refreshes = 9
             for refresh_attempt in range(max_load_refreshes + 1):
                 if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     # 用户停止或心跳超时触发重试，立即结束当前播放。
@@ -2030,12 +2070,13 @@ class AutoLearner:
                 if video_found:
                     break
                 if refresh_attempt < max_load_refreshes:
-                    debug(f"[工作线程 {worker_id+1}] 视频未加载，刷新重试({refresh_attempt+1}/{max_load_refreshes})")
+                    debug(f"[工作线程 {worker_id+1}] phase=video_probe player_not_found; refresh={refresh_attempt+1}/{max_load_refreshes}; {_page_debug_state(page)}")
                     try:
                         await page.reload(wait_until="domcontentloaded", timeout=15000)
                         await page.wait_for_timeout(5000)
-                    except:
-                        pass
+                        debug(f"[工作线程 {worker_id+1}] phase=video_probe refresh_complete={refresh_attempt+1}; {_page_debug_state(page)}")
+                    except Exception as exc:
+                        debug(f"[工作线程 {worker_id+1}] phase=video_probe refresh_error={type(exc).__name__}: {_safe_debug_error(exc)}; {_page_debug_state(page)}")
 
             if not video_found:
                 ctype = (course_type or "").lower()
@@ -2050,7 +2091,19 @@ class AutoLearner:
                         return True
                 except:
                     pass
-                debug(f"[工作线程 {worker_id+1}] 未找到视频")
+                try:
+                    media_snapshot = await page.evaluate("""() => ({
+                        readyState: document.readyState,
+                        video: document.querySelectorAll('video').length,
+                        audio: document.querySelectorAll('audio').length,
+                        iframes: document.querySelectorAll('iframe').length,
+                        mediaLike: document.querySelectorAll('[class*=video], [class*=audio], .prism-player').length,
+                        loginForm: !!document.querySelector('input[type=password]'),
+                        bodyChars: document.body ? document.body.innerText.length : 0
+                    })""")
+                except Exception as exc:
+                    media_snapshot = {"snapshotError": type(exc).__name__}
+                debug(f"[工作线程 {worker_id+1}] phase=video_probe exhausted; attempts={max_load_refreshes+1}; selectors={video_selectors}; dom={media_snapshot}; {_page_debug_state(page)}")
                 return False
 
             # 确保视频开始播放（JS控制）
@@ -2119,7 +2172,7 @@ class AutoLearner:
 
             return True
         except Exception as e:
-            debug(f"[工作线程 {worker_id+1}] 视频播放异常: {e}")
+            debug(f"[工作线程 {worker_id+1}] phase=video_play exception={type(e).__name__}: {_safe_debug_error(e)}; {_page_debug_state(page)}")
             return False
 
     # 训练营课程页的媒体状态快照。
@@ -4193,7 +4246,7 @@ class AutoLearner:
         console.print("课程模式学习完成", style="bold green")
 
     async def _open_online_course_from_list(self, worker_page: Page, list_url: str,
-                                            task: dict) -> Page:
+                                            task: dict, worker_id: int = -1) -> Page:
         """仅在卡片没有可用直达地址时，回列表页定位并打开课程。"""
         try:
             await worker_page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
@@ -4242,19 +4295,31 @@ class AutoLearner:
         popup = asyncio.create_task(worker_page.wait_for_event("popup", timeout=10000))
         await asyncio.sleep(0)
         old_url = worker_page.url
+        debug(f"[工作线程 {worker_id+1}] phase=open_course_from_list title={task.get('title', '')!r}; worker={_page_debug_state(worker_page)}")
         try:
             await match.click()
             for _ in range(20):
                 if popup.done() and not popup.cancelled() and popup.exception() is None:
                     course_page = popup.result()
+                    debug(f"[工作线程 {worker_id+1}] phase=course_popup_opened; {_page_debug_state(course_page)}")
                     try:
                         await course_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        # The learning site is an SPA: DOMContentLoaded often precedes
+                        # rendering its course detail content and action button.
+                        settle = getattr(course_page, "wait_for_timeout", None)
+                        if callable(settle):
+                            settled = settle(5000)
+                            if inspect.isawaitable(settled):
+                                await settled
+                        debug(f"[工作线程 {worker_id+1}] phase=course_popup_ready; {_page_debug_state(course_page)}")
                     except Exception:
+                        debug(f"[工作线程 {worker_id+1}] phase=course_popup_load_error; {_page_debug_state(course_page)}")
                         if not course_page.is_closed():
                             await course_page.close()
                         raise
                     return course_page
                 if not worker_page.is_closed() and worker_page.url != old_url:
+                    debug(f"[工作线程 {worker_id+1}] phase=course_same_tab_navigation; before={_safe_debug_url(old_url)}; after={_page_debug_state(worker_page)}")
                     return worker_page
                 await worker_page.wait_for_timeout(500)
             raise OnlineCourseListUnavailable("点击课程后未打开详情页或播放页")
@@ -4265,38 +4330,68 @@ class AutoLearner:
 
     async def _enter_online_course_player(self, detail_page: Page, worker_id: int) -> Optional[Page]:
         """直接播放页原样返回；详情页 100% 返回 None，否则点击入口。"""
-        if "/course/#/detail/" not in detail_page.url:
+        entry_labels = ("立即学习", "我要学习", "开始学习", "进入课程",
+                        "继续学习", "学习课程", "进入课程学习", "重新学习")
+        is_detail_route = "/detail/" in detail_page.url.lower()
+        initial_url = detail_page.url
+        debug(f"[工作线程 {worker_id+1}] phase=classify_page detail_route={is_detail_route}; {_page_debug_state(detail_page)}")
+        if not is_detail_route:
             return detail_page
 
-        percent = -1.0
-        progress = detail_page.locator(".progress-contain [role='progressbar']").first
-        if await progress.count():
-            try:
-                percent = float(await progress.get_attribute("aria-valuenow") or -1)
-            except (TypeError, ValueError):
-                percent = -1
-            if percent >= 100:
-                debug(f"[工作线程 {worker_id+1}] 课程详情页总进度 100%，跳过播放")
-                return None
-
-        button = detail_page.locator("button.to-learn").first
-        if await button.count() == 0:
-            for label in ("立即学习", "我要学习", "开始学习", "进入课程",
-                          "继续学习", "学习课程", "进入课程学习", "重新学习"):
-                candidate = detail_page.get_by_role("button", name=label, exact=True)
+        async def find_entry():
+            button = detail_page.locator("button.to-learn").first
+            if await button.count():
+                return button
+            for label in entry_labels:
+                candidate = detail_page.get_by_role("button", name=label, exact=True).first
                 if await candidate.count():
-                    button = candidate.first
-                    break
-            else:
-                raise RuntimeError("课程详情页没有学习入口按钮")
+                    return candidate
+                # Some versions render the call-to-action as an anchor or a
+                # styled div/span rather than a semantic button.
+                candidate = detail_page.get_by_text(label, exact=True).first
+                if await candidate.count():
+                    try:
+                        if await candidate.is_visible():
+                            return candidate
+                    except Exception:
+                        pass
+            return None
+
+        percent = -1.0
+        button = None
+        # Wait for the SPA to render progress and its action. Direct-play pages
+        # have neither, so they still pass through unchanged after a short probe.
+        for _ in range(10):
+            progress = detail_page.locator(".progress-contain [role='progressbar']").first
+            if await progress.count():
+                try:
+                    percent = float(await progress.get_attribute("aria-valuenow") or -1)
+                except (TypeError, ValueError):
+                    percent = -1
+                if percent >= 100:
+                    debug(f"[工作线程 {worker_id+1}] phase=classify_page progress={percent:g}; skip_playback; {_page_debug_state(detail_page)}")
+                    return None
+            button = await find_entry()
+            if button is not None:
+                break
+            if not is_detail_route:
+                return detail_page
+            await detail_page.wait_for_timeout(500)
+
+        if button is None:
+            if not is_detail_route:
+                debug(f"[工作线程 {worker_id+1}] phase=classify_page no_entry_but_not_detail; {_page_debug_state(detail_page)}")
+                return detail_page
+            debug(f"[工作线程 {worker_id+1}] phase=classify_page entry_not_found; initial_url={_safe_debug_url(initial_url)}; {_page_debug_state(detail_page)}")
+            raise RuntimeError("课程详情页没有学习入口按钮（页面内容未渲染或入口类型未知）")
 
         existing_pages = set(detail_page.context.pages)
         label = (await button.inner_text()).strip()
         if label == "重新学习" and percent < 0:
             raise RuntimeError("课程详情页进度未加载，暂不点击“重新学习”以免重学已完成课程")
-        debug(f"[工作线程 {worker_id+1}] 点击课程详情页入口: {label}")
+        debug(f"[工作线程 {worker_id+1}] phase=click_entry label={label!r}; progress={percent:g}; before={_page_debug_state(detail_page)}; open_pages={len(existing_pages)}")
         await button.click()
-        for _ in range(16):
+        for poll_index in range(16):
             if self._stop_event.is_set():
                 raise RuntimeError("学习任务已停止")
             new_pages = [p for p in detail_page.context.pages if p not in existing_pages]
@@ -4308,12 +4403,16 @@ class AutoLearner:
                     if not player_page.is_closed():
                         await player_page.close()
                     raise
+                debug(f"[工作线程 {worker_id+1}] phase=player_opened via=popup after={poll_index+1} polls; {_page_debug_state(player_page)}")
                 return player_page
             if not detail_page.is_closed() and "/course/#/detail/" not in detail_page.url:
+                debug(f"[工作线程 {worker_id+1}] phase=player_opened via=same_tab after={poll_index+1} polls; {_page_debug_state(detail_page)}")
                 return detail_page
             if not detail_page.is_closed() and await detail_page.query_selector("video, audio, .prism-player"):
+                debug(f"[工作线程 {worker_id+1}] phase=player_opened via=media_on_detail after={poll_index+1} polls; {_page_debug_state(detail_page)}")
                 return detail_page
             await detail_page.wait_for_timeout(500)
+        debug(f"[工作线程 {worker_id+1}] phase=player_open_timeout label={label!r}; initial_url={_safe_debug_url(initial_url)}; {_page_debug_state(detail_page)}; open_pages={len(detail_page.context.pages)}")
         raise RuntimeError(f"点击“{label}”后仍停留在课程详情页，未进入播放页")
 
     async def learn_course_list(self, list_url: str = "https://u.ccb.com/course/#/list/1",
@@ -4584,29 +4683,43 @@ class AutoLearner:
                 for attempt in range(1, 3):  # 每门课程最多重试1次
                     cp = None
                     play_page = None
+                    phase = "prepare"
                     try:
+                        if wp.is_closed():
+                            debug(f"[线程{wid+1}] phase=recover_worker_page attempt={attempt}; 原页面已关闭，重建标签页")
+                            wp = await self.context.new_page()
+                            self.pages[wid] = wp
                         # 采集时已有可导航地址，就让 worker 直达课程，避免十几个
                         # worker 每门课都刷新列表页导致页面限流或超时。
                         target_url = _online_course_target_url(list_url, chref)
                         if target_url:
                             try:
+                                phase = "navigate_direct"
+                                debug(f"[线程{wid+1}] phase={phase} attempt={attempt}; course={ctitle!r}; target={_safe_debug_url(target_url)}")
                                 await wp.goto(target_url, wait_until="domcontentloaded", timeout=20000)
                                 await wp.wait_for_timeout(3000)
                                 if wp.url == list_url:
                                     raise OnlineCourseListUnavailable("课程地址返回列表页")
                                 cp = wp
+                                debug(f"[线程{wid+1}] phase={phase}_ready; {_page_debug_state(cp)}")
                             except Exception as exc:
                                 _log(f"[线程{wid+1}] 课程直达失败，回列表重试: {str(exc)[:120]}", "yellow")
                         if cp is None:
+                            phase = "open_from_list"
+                            debug(f"[线程{wid+1}] phase={phase} attempt={attempt}; course={ctitle!r}; {_page_debug_state(wp)}")
                             async with list_open_semaphore:
-                                cp = await self._open_online_course_from_list(wp, list_url, task)
+                                cp = await self._open_online_course_from_list(wp, list_url, task, wid)
+                            debug(f"[线程{wid+1}] phase=course_page_ready; {_page_debug_state(cp)}")
                         # 3) 详情页先进入播放器；不能在信息页反复刷新找视频。
+                        phase = "enter_player"
                         play_page = await self._enter_online_course_player(cp, wid)
                         if play_page is None:
                             already_complete = True
                             done_ok = True
                             break
                         # 4) 播放视频（检查返回值：失败走重试）
+                        phase = "find_play_video"
+                        debug(f"[线程{wid+1}] phase={phase} course={ctitle!r}; course_page={_page_debug_state(cp)}; player_page={_page_debug_state(play_page)}")
                         _progress({"wid": wid, "course": ctitle[:40], "progress": "0%", "eta": "-", "status": "学习中"})
                         def on_progress(pct):
                             _progress({"wid": wid, "course": ctitle[:40],
@@ -4630,6 +4743,7 @@ class AutoLearner:
                             _progress({"wid": wid, "course": ctitle[:40], "progress": "-", "eta": "-", "status": "异常"})
                         break
                     except Exception as e:
+                        debug(f"[线程{wid+1}] phase={phase} attempt={attempt} course={ctitle!r} exception={type(e).__name__}: {_safe_debug_error(e)}; worker={_page_debug_state(wp)}; course_page={_page_debug_state(cp)}; player_page={_page_debug_state(play_page)}")
                         if attempt < 2:
                             _log(f"[线程{wid+1}] 第{attempt}次失败，重试: {ctitle} - {str(e)[:180]}", "yellow")
                             await asyncio.sleep(2)
