@@ -52,6 +52,8 @@ from ui_theme import (
 from main import (
     AutoLearner, CONFIG_PATH, STORAGE_STATE_PATH, USER_CREDENTIALS_PATH,
     DEEPSEEK_DEFAULT_BASE_URL, DEEPSEEK_DEFAULT_MODEL, DeepSeekClient,
+    EXAM_DELAY_PER_QUESTION_LIMIT, EXAM_DELAY_MIN_DEFAULT, EXAM_DELAY_MAX_DEFAULT,
+    _exam_delay_bounds,
     obfuscate_secret, deobfuscate_secret, init_debug_log,
 )
 
@@ -900,6 +902,41 @@ class ConfigScreen(QWidget):
         exam_hint.setObjectName("muted")
         exam_hint.setWordWrap(True)
         exam_layout.addWidget(exam_hint)
+
+        # 交卷节奏：AI 答题几乎瞬间完成，直接交卷会显得异常。
+        # 每题模拟耗时取区间内的随机值，交卷前等待「题量 × 该随机值」秒。
+        _delay_min, _delay_max = _exam_delay_bounds(
+            self._saved.get("exam_delay_min"), self._saved.get("exam_delay_max"))
+        row_delay = QHBoxLayout()
+        row_delay.setSpacing(12)
+        row_delay.addWidget(_row_label("交卷延时"))
+        self.spin_delay_min = SpinBox()
+        self.spin_delay_min.setRange(0, int(EXAM_DELAY_PER_QUESTION_LIMIT))
+        self.spin_delay_min.setValue(int(round(_delay_min)))
+        self.spin_delay_min.setFixedWidth(110)
+        row_delay.addWidget(self.spin_delay_min)
+        row_delay.addWidget(BodyLabel("~"))
+        self.spin_delay_max = SpinBox()
+        self.spin_delay_max.setRange(0, int(EXAM_DELAY_PER_QUESTION_LIMIT))
+        self.spin_delay_max.setValue(int(round(_delay_max)))
+        self.spin_delay_max.setFixedWidth(110)
+        row_delay.addWidget(self.spin_delay_max)
+        row_delay.addSpacing(4)
+        row_delay.addWidget(BodyLabel("秒/题"))
+        row_delay.addSpacing(16)
+        delay_hint = CaptionLabel("按题量随机延时后交卷，避免提交过快")
+        delay_hint.setObjectName("muted")
+        row_delay.addWidget(delay_hint)
+        row_delay.addStretch()
+        exam_layout.addLayout(row_delay)
+
+        delay_note = CaptionLabel(
+            "  每题耗时在该区间内随机取一个值，交卷前等待「题量 × 每题耗时」。"
+            "例如 20 题 × 10~20 秒 ≈ 等待 200~400 秒。填 0 则不延时。")
+        delay_note.setObjectName("muted")
+        delay_note.setWordWrap(True)
+        exam_layout.addWidget(delay_note)
+
         self.lbl_exam_validation = CaptionLabel("")
         self.lbl_exam_validation.setObjectName("muted")
         exam_layout.addWidget(self.lbl_exam_validation)
@@ -1078,6 +1115,11 @@ class ConfigScreen(QWidget):
         api_key = self.input_api_key.text().strip()
         model = self.input_model.text().strip() or DEEPSEEK_DEFAULT_MODEL
         thinking = self.switch_thinking.isChecked()
+        delay_min, delay_max = _exam_delay_bounds(
+            self.spin_delay_min.value(), self.spin_delay_max.value())
+        # 夹紧后回写控件，避免界面上留着保存后被规范化的非法值
+        self.spin_delay_min.setValue(int(round(delay_min)))
+        self.spin_delay_max.setValue(int(round(delay_max)))
         if exam_enabled and not api_key:
             InfoBar.warning("提示", "已开启考试自动答题，但未填写 DeepSeek API Key", parent=self,
                             position=InfoBarPosition.TOP, duration=4000)
@@ -1093,6 +1135,8 @@ class ConfigScreen(QWidget):
             cfg["exam_enabled"] = exam_enabled
             cfg["deepseek_model"] = model
             cfg["deepseek_thinking"] = thinking
+            cfg["exam_delay_min"] = delay_min
+            cfg["exam_delay_max"] = delay_max
             cfg["deepseek_base_url"] = DEEPSEEK_DEFAULT_BASE_URL
             cfg["theme_mode"] = self.combo_theme.currentData() or "auto"
             cfg["reduced_motion"] = self.switch_reduced_motion.isChecked()
@@ -1113,6 +1157,8 @@ class ConfigScreen(QWidget):
         win.cfg_deepseek_api_key = api_key
         win.cfg_deepseek_model = model
         win.cfg_deepseek_thinking = thinking
+        win.cfg_exam_delay_min = delay_min
+        win.cfg_exam_delay_max = delay_max
         win.cfg_theme_mode = self.combo_theme.currentData() or "auto"
         win.cfg_reduced_motion = self.switch_reduced_motion.isChecked()
         apply_theme(QApplication.instance(), win.cfg_theme_mode)
@@ -2705,11 +2751,15 @@ class DashboardScreen(QWidget):
                 "deepseek_model": getattr(win, "cfg_deepseek_model", ""),
                 "deepseek_base_url": DEEPSEEK_DEFAULT_BASE_URL,
                 "deepseek_thinking": getattr(win, "cfg_deepseek_thinking", False),
+                "exam_delay_min": getattr(win, "cfg_exam_delay_min", None),
+                "exam_delay_max": getattr(win, "cfg_exam_delay_max", None),
             })
             if learner.exam_enabled and not learner.deepseek_api_key:
                 log("已开启考试自动答题，但未配置 DeepSeek API Key，将跳过考试", "yellow")
             elif learner.exam_enabled:
                 log(f"考试自动答题已开启（模型 {learner.deepseek_model}）", "blue")
+                log(f"交卷延时：每题 {learner.exam_delay_min:g}~{learner.exam_delay_max:g} 秒"
+                    f"（按题量随机等待后交卷）", "blue")
             self._learner = learner  # 保存引用用于退出时清理
             await learner.init(
                 log_callback=log, chrome_path=cfg_chrome_path,
@@ -4253,6 +4303,8 @@ class MainWindow(_BaseWindow):
         self.cfg_deepseek_api_key = ""
         self.cfg_deepseek_model = DEEPSEEK_DEFAULT_MODEL
         self.cfg_deepseek_thinking = False
+        self.cfg_exam_delay_min = EXAM_DELAY_MIN_DEFAULT
+        self.cfg_exam_delay_max = EXAM_DELAY_MAX_DEFAULT
 
         # 创建子界面
         self._createSubInterfaces()
@@ -4756,6 +4808,9 @@ del "%~f0"
             self.cfg_deepseek_api_key = deobfuscate_secret(cfg.get("deepseek_api_key", ""))
             self.cfg_deepseek_model = cfg.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL
             self.cfg_deepseek_thinking = bool(cfg.get("deepseek_thinking", False))
+            (self.cfg_exam_delay_min,
+             self.cfg_exam_delay_max) = _exam_delay_bounds(cfg.get("exam_delay_min"),
+                                                           cfg.get("exam_delay_max"))
             # 加载账号
             creds_path = USER_CREDENTIALS_PATH
             if os.path.exists(creds_path):

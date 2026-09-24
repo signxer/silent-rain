@@ -5,6 +5,7 @@ import inspect
 import os
 import platform
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -419,6 +420,50 @@ TRAINCAMP_LOCAL_SETTLE_SECONDS = 180
 # 考试没考成/没通过时，最多允许用户手动选择重考的次数
 EXAM_RETRY_LIMIT = 3
 
+# 交卷节奏：AI 答题几乎是瞬间完成的，直接交卷会显得异常。
+# 每题模拟耗时取 [min, max] 区间内的一个随机值，交卷前等待「题量 × 每题耗时」秒。
+EXAM_DELAY_MIN_DEFAULT = 10.0
+EXAM_DELAY_MAX_DEFAULT = 20.0
+# 单题耗时上限：防止误填（例如 1000）导致一次考试等待数小时
+EXAM_DELAY_PER_QUESTION_LIMIT = 600.0
+
+
+def _exam_delay_bounds(delay_min, delay_max) -> tuple:
+    """规范化每题的模拟耗时区间（秒）。
+
+    非法值/负数回退到默认，超出上限则夹紧；min > max 时交换，保证区间可用。
+    """
+    def _coerce(value, fallback):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if number != number or number < 0:      # NaN / 负数
+            return fallback
+        return min(number, EXAM_DELAY_PER_QUESTION_LIMIT)
+
+    low = _coerce(delay_min, EXAM_DELAY_MIN_DEFAULT)
+    high = _coerce(delay_max, EXAM_DELAY_MAX_DEFAULT)
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _exam_delay_plan(question_count: int, delay_min, delay_max, rng=None) -> tuple:
+    """按题量算出本题交卷前的模拟答题时长，返回 (每题秒数, 总秒数)。
+
+    每题耗时在区间内随机取一次，整场考试共用该值；题量为 0 或区间为 0 时不延时。
+    """
+    try:
+        questions = max(0, int(question_count or 0))
+    except (TypeError, ValueError):
+        questions = 0
+    low, high = _exam_delay_bounds(delay_min, delay_max)
+    if questions <= 0 or high <= 0:
+        return 0.0, 0.0
+    per_question = (rng or random).uniform(low, high)
+    return per_question, per_question * questions
+
 
 def _exam_needs_retake_choice(result: Optional[Dict]) -> bool:
     """这次考试结果是否需要问用户「要不要重考」。
@@ -482,12 +527,16 @@ def deobfuscate_secret(value: str) -> str:
 def exam_settings_from_config(cfg: Dict) -> Dict:
     """从 moisten_config.json 里取出考试答题相关设置（密钥自动解密）。"""
     cfg = cfg or {}
+    delay_min, delay_max = _exam_delay_bounds(cfg.get("exam_delay_min"),
+                                              cfg.get("exam_delay_max"))
     return {
         "exam_enabled": bool(cfg.get("exam_enabled", False)),
         "deepseek_api_key": deobfuscate_secret(cfg.get("deepseek_api_key", "")),
         "deepseek_model": cfg.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL,
         "deepseek_base_url": cfg.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL,
         "deepseek_thinking": bool(cfg.get("deepseek_thinking", False)),
+        "exam_delay_min": delay_min,
+        "exam_delay_max": delay_max,
     }
 def _component_finished(component: Optional[Dict]) -> bool:
     """训练营组件是否已被平台记录完成（进度到达阈值，或带完成标记）"""
@@ -730,6 +779,9 @@ class AutoLearner:
         self.deepseek_model = DEEPSEEK_DEFAULT_MODEL
         self.deepseek_base_url = DEEPSEEK_DEFAULT_BASE_URL
         self.deepseek_thinking = False
+        # 交卷延时：每题模拟耗时（秒）的随机区间，交卷前等待「题量 × 区间内随机值」秒
+        self.exam_delay_min = EXAM_DELAY_MIN_DEFAULT
+        self.exam_delay_max = EXAM_DELAY_MAX_DEFAULT
         # 考试没考成/没通过时询问是否重考的回调（GUI 注入；命令行/无界面时保持 None → 不重考）
         self.exam_retry_hook = None
 
@@ -3315,6 +3367,8 @@ class AutoLearner:
         self.deepseek_model = settings.get("deepseek_model", "") or DEEPSEEK_DEFAULT_MODEL
         self.deepseek_base_url = settings.get("deepseek_base_url", "") or DEEPSEEK_DEFAULT_BASE_URL
         self.deepseek_thinking = bool(settings.get("deepseek_thinking", False))
+        self.exam_delay_min, self.exam_delay_max = _exam_delay_bounds(
+            settings.get("exam_delay_min"), settings.get("exam_delay_max"))
 
     async def _trainingcamp_components(self, page: Page) -> Optional[List[Dict]]:
         """读取训练营课程页的组件列表（含 cuExam 考试组件）"""
@@ -3525,6 +3579,23 @@ class AutoLearner:
         bits.append(f"状态 {last_status or '未知'}")
         return {"status": "passed", "detail": "，".join(bits)}
 
+    async def _pace_exam_submission(self, delay_seconds: float, prefix: str, _log) -> float:
+        """交卷前按模拟答题时长等待，返回实际等待的秒数。
+
+        分片 sleep 以便「停止学习」能及时中断。等待期间不动页面（不刷新、不点击），
+        避免打断答题页自身的状态；等待结束后由调用方正常提交。
+        """
+        total = max(0.0, float(delay_seconds or 0))
+        waited = 0.0
+        while waited < total:
+            if self._stop_event.is_set():
+                _log(f"{prefix} 已请求停止，跳过剩余交卷延时 {total - waited:.0f} 秒", "yellow")
+                break
+            chunk = min(1.0, total - waited)
+            await asyncio.sleep(chunk)
+            waited += chunk
+        return waited
+
     async def _solve_one_exam(self, task: Dict, worker_id: int, _log) -> Dict:
         """在独立标签页里完成一场考试：说明页 → 开始考试 → AI 答题 → 提交 → 读成绩"""
         prefix = f"[工作线程 {worker_id+1}] 考试"
@@ -3681,6 +3752,17 @@ class AutoLearner:
             }
             if unanswered:
                 _log(f"{prefix} 有 {unanswered} 题未能作答，将按未答提交", "yellow")
+
+            # 交卷节奏：AI 答题瞬间完成，直接交卷会显得异常。
+            # 按题量等待「题量 × 每题随机耗时」秒，模拟正常作答时间后再提交。
+            per_question, delay_seconds = _exam_delay_plan(
+                len(questions), self.exam_delay_min, self.exam_delay_max)
+            if delay_seconds > 0:
+                _log(f"{prefix} 模拟作答节奏：{len(questions)} 题 × "
+                     f"{per_question:.1f} 秒 ≈ {delay_seconds:.0f} 秒后交卷", "blue")
+                waited = await self._pace_exam_submission(delay_seconds, prefix, _log)
+                debug(f"{prefix} 交卷延时结束: 计划 {delay_seconds:.1f} 秒，"
+                      f"实际等待 {waited:.1f} 秒")
 
             result = await exam_page.evaluate(self._EXAM_SUBMIT_JS, {
                 "apiBase": OTE_API_BASE,
@@ -6775,6 +6857,9 @@ def start(headless, workers, target_hours, tags, exam, deepseek_key):
             if learner.exam_enabled:
                 if learner.deepseek_api_key:
                     console.print(f"考试自动答题已开启（模型 {learner.deepseek_model}）", style="blue")
+                    console.print(f"交卷延时：每题 {learner.exam_delay_min:g}~"
+                                  f"{learner.exam_delay_max:g} 秒（按题量随机等待后交卷）",
+                                  style="blue")
                 else:
                     console.print("考试自动答题已开启，但未配置 DeepSeek API Key，将跳过考试", style="yellow")
         except Exception:

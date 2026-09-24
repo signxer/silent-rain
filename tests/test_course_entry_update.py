@@ -2,6 +2,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,8 +10,10 @@ from urllib.parse import urlsplit
 
 from main import (
     AutoLearner, OnlineCourseListUnavailable, ONLINE_COURSE_LIST_CARD_SELECTOR,
-    _build_online_playlist_tasks, _defer_online_course, _online_course_target_url,
-    _same_document_url, _same_hash_url,
+    EXAM_DELAY_MIN_DEFAULT, EXAM_DELAY_MAX_DEFAULT, EXAM_DELAY_PER_QUESTION_LIMIT,
+    _build_online_playlist_tasks, _defer_online_course, _exam_delay_bounds,
+    _exam_delay_plan, _online_course_target_url, _same_document_url, _same_hash_url,
+    exam_settings_from_config,
 )
 from ui_theme import LIGHT, RoundedGradientProgressBar, _stylesheet
 
@@ -425,6 +428,208 @@ class CourseEntryTests(unittest.TestCase):
             player.close.assert_awaited_once()
 
         asyncio.run(run())
+
+
+class ExamPacingTests(unittest.TestCase):
+    """交卷延时：按题量 × 区间内随机值决定提交前的等待时长。"""
+
+    def setUp(self):
+        self.learner = AutoLearner.__new__(AutoLearner)
+        self.learner._stop_event = threading.Event()
+        self.logs = []
+
+    def _log(self, message, style=""):
+        self.logs.append(message)
+
+    def test_default_range_is_ten_to_twenty_seconds_per_question(self):
+        self.assertEqual((EXAM_DELAY_MIN_DEFAULT, EXAM_DELAY_MAX_DEFAULT), (10.0, 20.0))
+        self.assertEqual(_exam_delay_bounds(None, None), (10.0, 20.0))
+        # 未配置过延时项的旧配置文件也走默认区间
+        settings = exam_settings_from_config({})
+        self.assertEqual((settings["exam_delay_min"], settings["exam_delay_max"]),
+                         (10.0, 20.0))
+
+    def test_total_delay_is_question_count_times_per_question(self):
+        class FixedRandom:
+            def uniform(self, low, high):
+                self.seen = (low, high)
+                return 12.5
+
+        rng = FixedRandom()
+        per_question, total = _exam_delay_plan(20, 10, 20, rng=rng)
+        self.assertEqual(rng.seen, (10.0, 20.0))
+        self.assertEqual(per_question, 12.5)
+        self.assertEqual(total, 250.0)          # 20 题 × 12.5 秒
+
+    def test_per_question_delay_stays_inside_range(self):
+        for count in (1, 5, 40):
+            for _ in range(50):
+                per_question, total = _exam_delay_plan(count, 10, 20)
+                self.assertGreaterEqual(per_question, 10.0)
+                self.assertLessEqual(per_question, 20.0)
+                self.assertAlmostEqual(total, per_question * count)
+
+    def test_range_is_sanitized(self):
+        # min > max 交换；负数/非法值回退默认；超大值夹到上限
+        self.assertEqual(_exam_delay_bounds(30, 10), (10.0, 30.0))
+        self.assertEqual(_exam_delay_bounds(-5, None), (10.0, 20.0))
+        self.assertEqual(_exam_delay_bounds("abc", "xyz"), (10.0, 20.0))
+        self.assertEqual(_exam_delay_bounds(1e9, 1e9), (EXAM_DELAY_PER_QUESTION_LIMIT,) * 2)
+        # 整数 0 是合法值（表示不延时）
+        self.assertEqual(_exam_delay_bounds(0, 0), (0.0, 0.0))
+
+    def test_zero_questions_or_zero_range_means_no_delay(self):
+        self.assertEqual(_exam_delay_plan(0, 10, 20), (0.0, 0.0))
+        self.assertEqual(_exam_delay_plan(20, 0, 0), (0.0, 0.0))
+        self.assertEqual(_exam_delay_plan(None, 10, 20), (0.0, 0.0))
+
+    def test_settings_apply_and_sanitize(self):
+        self.learner.apply_exam_settings({"exam_delay_min": 3, "exam_delay_max": 7})
+        self.assertEqual((self.learner.exam_delay_min, self.learner.exam_delay_max), (3.0, 7.0))
+        # 缺省时回落到默认区间，而不是保留上一次的值
+        self.learner.apply_exam_settings({})
+        self.assertEqual((self.learner.exam_delay_min, self.learner.exam_delay_max),
+                         (EXAM_DELAY_MIN_DEFAULT, EXAM_DELAY_MAX_DEFAULT))
+
+    def test_pacing_waits_and_logs(self):
+        async def run():
+            started = asyncio.get_event_loop().time()
+            waited = await self.learner._pace_exam_submission(0.2, "[线程1]", self._log)
+            return waited, asyncio.get_event_loop().time() - started
+
+        waited, elapsed = asyncio.run(run())
+        self.assertGreaterEqual(waited, 0.2)
+        self.assertGreaterEqual(elapsed, 0.2)
+
+    def test_pacing_stops_early_when_learning_is_stopped(self):
+        self.learner._stop_event.set()
+
+        async def run():
+            started = asyncio.get_event_loop().time()
+            waited = await self.learner._pace_exam_submission(600, "[线程1]", self._log)
+            return waited, asyncio.get_event_loop().time() - started
+
+        waited, elapsed = asyncio.run(run())
+        self.assertEqual(waited, 0.0)            # 不等待，直接交卷
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(any("跳过剩余交卷延时" in line for line in self.logs))
+
+
+    def test_submission_happens_only_after_the_delay(self):
+        """回归：交卷请求必须在延时之后才发出，否则延时形同虚设。"""
+        events = []
+
+        class FixedRandom:
+            def uniform(self, low, high):
+                return 0.15                      # 每题 0.15 秒，2 题 → 0.3 秒
+
+        questions = [
+            {"id": 1, "index": 1, "type": "SingleChoice", "content": "q1",
+             "options": [{"id": 11, "code": "A", "text": "a"}]},
+            {"id": 2, "index": 2, "type": "Judge", "content": "q2",
+             "options": [{"id": 21, "code": "A", "text": "对"}]},
+        ]
+        paper = {"userExamId": 1, "arrangeId": 2, "userExamMapId": 3, "uniqueId": "u",
+                 "arrangeName": "随堂测试", "questions": questions}
+
+        page = FakeExamPage(events, paper)
+
+        class FakeModel:
+            def __init__(self, **kwargs):
+                pass
+
+            async def answer_exam(self, ai_questions, log=None):
+                return {1: {"choices": ["A"]}, 2: {"choices": ["A"]}}
+
+        async def run():
+            learner = self.learner
+            learner.context = SimpleNamespace(new_page=_new_page(page))
+            learner.apply_exam_settings({"deepseek_api_key": "sk-test",
+                                         "exam_delay_min": 0.15, "exam_delay_max": 0.15})
+            with patch("main.DeepSeekClient", FakeModel), \
+                 patch("main.random.uniform", FixedRandom().uniform):
+                return await learner._solve_one_exam(
+                    {"name": "随堂测试", "url": "https://example.test/exam/#/exampreview"},
+                    0, self._log)
+
+        result = asyncio.run(run())
+        self.assertEqual(result.get("status"), "passed")
+
+        marks = [name for name, _ in events]
+        self.assertIn("answers_ready", marks)
+        self.assertIn("submit", marks)
+        self.assertLess(marks.index("answers_ready"), marks.index("submit"))
+
+        gap = dict(events)["submit"] - dict(events)["answers_ready"]
+        self.assertGreaterEqual(gap, 0.3)        # 2 题 × 0.15 秒
+        self.assertTrue(any("模拟作答节奏" in line for line in self.logs))
+
+
+def _new_page(page):
+    async def _factory():
+        return page
+    return _factory
+
+
+class FakeExamPage:
+    """按 JS 内容分派的考试页替身，用于验证答题→延时→交卷的顺序。"""
+
+    def __init__(self, events, paper):
+        self.events = events
+        self.paper = paper
+        self.url = "https://example.test/exam/#/exampreview"
+        self.start_clicked = False
+        self.last_url = ""
+
+    async def goto(self, url, **kwargs):
+        self.last_url = url
+        self.url = url
+
+    async def wait_for_selector(self, *args, **kwargs):
+        return None
+
+    async def wait_for_function(self, *args, **kwargs):
+        return None
+
+    async def wait_for_timeout(self, milliseconds):
+        return None
+
+    def locator(self, selector):
+        page = self
+
+        class _Btn:
+            async def count(self_inner):
+                return 1
+
+            async def is_visible(self_inner):
+                return True
+
+            async def click(self_inner, timeout=None):
+                page.start_clicked = True
+
+        btn = _Btn()
+        btn.first = btn
+        return btn
+
+    async def evaluate(self, script, arg=None):
+        cls = AutoLearner
+        mark = time.monotonic()
+        if script is cls._EXAM_PREVIEW_JS:
+            return {"isShowBtn": True, "btnEnabled": True, "isAppExam": False,
+                    "btnText": "开始考试", "lblMsg": ""}
+        if script is cls._EXAM_PREVIEW_RESULT_JS:
+            if self.start_clicked:
+                return {"records": [{"status": "Done", "isPass": True, "score": 8,
+                                     "submitTime": "2026-01-01 00:00:00"}],
+                        "lastStatus": "Done", "isShowScore": 1}
+            return None
+        if script is cls._EXAM_QUESTIONS_JS:
+            self.events.append(("answers_ready", mark))
+            return self.paper
+        if script is cls._EXAM_SUBMIT_JS:
+            self.events.append(("submit", mark))
+            return {"submitStatus": 200}
+        return None
 
 
 class CourseQueueTests(unittest.TestCase):
