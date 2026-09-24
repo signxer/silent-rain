@@ -493,27 +493,28 @@ class ExamPacingTests(unittest.TestCase):
 
     def test_pacing_waits_and_logs(self):
         async def run():
-            started = asyncio.get_event_loop().time()
+            started = time.monotonic()
             waited = await self.learner._pace_exam_submission(0.2, "[线程1]", self._log)
-            return waited, asyncio.get_event_loop().time() - started
+            return waited, time.monotonic() - started
 
         waited, elapsed = asyncio.run(run())
+        # waited 由自身累计得到，是确定值；elapsed 走系统时钟，Windows 时钟粒度
+        # 可达 ~15ms，所以留出容差，避免构建机上的假失败。
         self.assertGreaterEqual(waited, 0.2)
-        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertGreaterEqual(elapsed, 0.15)
 
     def test_pacing_stops_early_when_learning_is_stopped(self):
         self.learner._stop_event.set()
 
         async def run():
-            started = asyncio.get_event_loop().time()
+            started = time.monotonic()
             waited = await self.learner._pace_exam_submission(600, "[线程1]", self._log)
-            return waited, asyncio.get_event_loop().time() - started
+            return waited, time.monotonic() - started
 
         waited, elapsed = asyncio.run(run())
         self.assertEqual(waited, 0.0)            # 不等待，直接交卷
         self.assertLess(elapsed, 1.0)
         self.assertTrue(any("跳过剩余交卷延时" in line for line in self.logs))
-
 
     def test_submission_happens_only_after_the_delay(self):
         """回归：交卷请求必须在延时之后才发出，否则延时形同虚设。"""
@@ -560,8 +561,10 @@ class ExamPacingTests(unittest.TestCase):
         self.assertIn("submit", marks)
         self.assertLess(marks.index("answers_ready"), marks.index("submit"))
 
+        # 2 题 × 0.15 秒 = 0.3 秒；允许 10% 余量，吸收 Windows 时钟粒度（~15ms）
+        # 带来的测量误差，但仍能识破「延时没生效」这类回归。
         gap = dict(events)["submit"] - dict(events)["answers_ready"]
-        self.assertGreaterEqual(gap, 0.3)        # 2 题 × 0.15 秒
+        self.assertGreaterEqual(gap, 0.3 * 0.9)
         self.assertTrue(any("模拟作答节奏" in line for line in self.logs))
 
 
