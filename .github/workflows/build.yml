@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Existing release version to rebuild (for example 2.3.7)"
+        required: true
+        type: string
 
 env:
   RELEASE_REPO: signxer/Moisten
@@ -37,8 +42,10 @@ jobs:
         id: version
         shell: bash
         run: |
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-          echo "${GITHUB_REF_NAME#v}" > VERSION
+          VERSION="${{ inputs.release_version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "${VERSION}" > VERSION
 
       - name: Build GUI EXE
         shell: bash
@@ -80,8 +87,10 @@ jobs:
       - name: Get version
         id: version
         run: |
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-          echo "${GITHUB_REF_NAME#v}" > VERSION
+          VERSION="${{ inputs.release_version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "${VERSION}" > VERSION
 
       - name: Create icon.icns
         run: |
@@ -103,9 +112,9 @@ jobs:
         # 保持单行命令（多行 \ 续行在 Git Bash 下解析失败）
         run: pyinstaller -F -w --icon=icon.icns --add-data="icon.png:." --add-data="VERSION:." --name=Moisten gui.py
 
-      - name: Create DMG
+      - name: Create installer package
         run: |
-          mkdir -p dmg-dist dist
+          mkdir -p pkgroot/Applications dist
           # 创建 .app 包装
           mkdir -p Moisten.app/Contents/MacOS
           mkdir -p Moisten.app/Contents/Resources
@@ -127,15 +136,20 @@ jobs:
           EOF
           # 校验 plist 合法性，非法直接失败（避免发布打不开的 .app）
           plutil -lint Moisten.app/Contents/Info.plist
-          cp -r Moisten.app dmg-dist/
-          ln -sf /Applications dmg-dist/Applications
-          hdiutil create -volname Moisten -srcfolder dmg-dist -ov -format UDZO dist/Moisten-${{ steps.version.outputs.VERSION }}-macOS.dmg
+          cp -R Moisten.app pkgroot/Applications/
+          pkgbuild \
+            --root pkgroot \
+            --identifier com.moisten.app \
+            --version "${{ steps.version.outputs.VERSION }}" \
+            --install-location / \
+            --scripts packaging/macos \
+            "dist/Moisten-${{ steps.version.outputs.VERSION }}-macOS.pkg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: dist/*.dmg
+          path: dist/*.pkg
           retention-days: 1
 
   # ── Release ──
@@ -161,7 +175,9 @@ jobs:
         id: release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_version && format('v{0}', inputs.release_version) || github.ref_name }}
           generate_release_notes: true
+          overwrite_files: true
           files: artifacts/**/*
 
       - name: Sync to release repo
@@ -169,7 +185,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_SYNC_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${{ github.ref_name }}"
+          TAG="${{ inputs.release_version && format('v{0}', inputs.release_version) || github.ref_name }}"
           # 只处理 tag 触发；手动触发（分支名）直接跳过，避免产生垃圾 release
           case "$TAG" in v*) ;; *) echo "跳过：非 tag 触发 ($TAG)"; exit 0 ;; esac
           VER="${TAG#v}"
@@ -197,17 +213,45 @@ jobs:
             fi
           fi
           # 创建release（发布仓库）
-          gh release create "${TAG}" \
-            --repo "$RELEASE_REPO" \
-            --title "润物 Moisten ${TAG}" \
-            --notes "$NOTES" \
-            artifacts/**/*
+          if gh release view "${TAG}" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            gh release upload "${TAG}" --repo "$RELEASE_REPO" --clobber artifacts/**/*
+            gh release edit "${TAG}" --repo "$RELEASE_REPO" \
+              --title "润物 Moisten ${TAG}" \
+              --notes "$NOTES"
+          else
+            gh release create "${TAG}" \
+              --repo "$RELEASE_REPO" \
+              --title "润物 Moisten ${TAG}" \
+              --notes "$NOTES" \
+              artifacts/**/*
+          fi
           # 更新releases.json（含更新日志）
           WIN_SIZE=$(stat -c%s artifacts/**/*Windows*.exe 2>/dev/null || echo "0")
-          MAC_SIZE=$(stat -c%s artifacts/**/*macOS*.dmg 2>/dev/null || echo "0")
+          MAC_SIZE=$(stat -c%s artifacts/**/*macOS*.pkg 2>/dev/null || echo "0")
           NOTES_JSON=$(echo "$NOTES" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")
+          # 更新下载页，在 macOS 产物为 PKG 时展示安装器说明。
+          INDEX_SHA=$(gh api repos/$RELEASE_REPO/contents/index.html --jq '.sha')
+          gh api repos/$RELEASE_REPO/contents/index.html --jq '.content' | base64 -d > /tmp/moisten-index.html
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("/tmp/moisten-index.html")
+          page = path.read_text(encoding="utf-8")
+          old = "                    const desc = a.name === 'Windows' ? 'Windows 10/11 (64-bit)' : 'macOS 12+ (Intel/Apple Silicon)';"
+          new = "                    const isMacPkg = a.name === 'macOS' && /\\.pkg$/i.test(a.file || '');\\n                    const desc = a.name === 'Windows'\\n                        ? 'Windows 10/11 (64-bit)'\\n                        : isMacPkg\\n                            ? 'macOS 安装器 · 双击安装'\\n                            : 'macOS 12+ (Intel/Apple Silicon)';"
+          if old in page:
+              page = page.replace(old, new.replace("\\n", "\n"))
+          elif new.replace("\\n", "\n") not in page:
+              raise SystemExit("下载页中的平台说明格式不符合预期，停止更新。")
+          path.write_text(page, encoding="utf-8")
+          PY
+          INDEX_CONTENT=$(base64 < /tmp/moisten-index.html | tr -d '\n')
+          gh api repos/$RELEASE_REPO/contents/index.html \
+            --method PUT \
+            --field message="docs: describe macOS pkg installer" \
+            --field content="$INDEX_CONTENT" \
+            --field sha="$INDEX_SHA"
           cat > /tmp/releases.json << EOF
-          {"tag":"${TAG}","assets":[{"name":"Windows","file":"Moisten-${VER}-Windows.exe","size":${WIN_SIZE}},{"name":"macOS","file":"Moisten-${VER}-macOS.dmg","size":${MAC_SIZE}}],"notes":${NOTES_JSON}}
+          {"tag":"${TAG}","assets":[{"name":"Windows","file":"Moisten-${VER}-Windows.exe","size":${WIN_SIZE}},{"name":"macOS","file":"Moisten-${VER}-macOS.pkg","size":${MAC_SIZE}}],"notes":${NOTES_JSON}}
           EOF
           gh api repos/$RELEASE_REPO/contents/releases.json \
             --method PUT \

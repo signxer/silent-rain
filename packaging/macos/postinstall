@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+
+APP_PATH="/Applications/Moisten.app"
+
+if [ -d "$APP_PATH" ]; then
+  /usr/bin/xattr -dr com.apple.quarantine "$APP_PATH" || true
+fi
+
+exit 0
