@@ -20,6 +20,8 @@ from main import (  # noqa: E402
     _STUDY_HOURS_DOM_JS,
     _STUDY_HOURS_DOM_JS_TEMPLATE,
     _hours_region_text,
+    _required_region_text,
+    parse_required_hours_text,
     parse_study_hours_dom,
     parse_study_hours_text,
     resolve_study_hours,
@@ -144,6 +146,54 @@ class StudyHoursTextParseTests(unittest.TestCase):
                          {"central": None, "online": None})
         self.assertEqual(parse_study_hours_text("学时指标：不少于50学时"),
                          {"central": None, "online": None})
+
+    def test_required_hours_from_real_page(self):
+        """应训时长行：集中培训每年 90、网络自学每年 50。"""
+        self.assertEqual(parse_required_hours_text(REAL_PAGE_TEXT),
+                         {"required_central": 90.0, "required_online": 50.0})
+
+    def test_required_hours_single_line_layout(self):
+        """「每年应完成 90 学时」挤在一行时也要能取到。"""
+        text = REAL_PAGE_TEXT.replace(
+            "应训时长\n每年应完成\n90学时\n每年应完成\n50学时",
+            "应训时长\n每年应完成 90 学时\n每年应完成 50 学时")
+        self.assertEqual(parse_required_hours_text(text),
+                         {"required_central": 90.0, "required_online": 50.0})
+
+    def test_required_hours_decimal(self):
+        """「5年550学时」这类折算值也要支持小数。"""
+        text = REAL_PAGE_TEXT.replace(
+            "应训时长\n每年应完成\n90学时\n每年应完成\n50学时",
+            "应训时长\n每年应完成\n137.5学时\n每年应完成\n62.5学时")
+        self.assertEqual(parse_required_hours_text(text),
+                         {"required_central": 137.5, "required_online": 62.5})
+
+    def test_required_hours_absent(self):
+        self.assertEqual(parse_required_hours_text(""),
+                         {"required_central": None, "required_online": None})
+        self.assertEqual(parse_required_hours_text(REAL_PAGE_TEXT.replace("应训时长", "")),
+                         {"required_central": None, "required_online": None})
+
+    def test_required_region_stops_at_actual_row(self):
+        region = _required_region_text(REAL_PAGE_TEXT)
+        self.assertIn("90学时", region)
+        self.assertIn("50学时", region)
+        self.assertNotIn("今年已训", region)
+        self.assertNotIn("242学时", region)
+
+    def test_resolve_carries_required_hours(self):
+        result = resolve_study_hours(None, REAL_PAGE_TEXT)
+        self.assertEqual((result["required_central"], result["required_online"]),
+                         (90.0, 50.0))
+        # 今年已训不受影响
+        self.assertEqual((result["central"], result["online"]), (242.0, 14.25))
+
+    def test_dom_required_wins_over_text(self):
+        result = resolve_study_hours(
+            {"central": 1.0, "online": 2.0, "required_central": 120.0,
+             "required_online": 60.0}, REAL_PAGE_TEXT)
+        self.assertEqual((result["required_central"], result["required_online"]),
+                         (120.0, 60.0))
 
     def test_region_stops_at_next_section_label(self):
         region = _hours_region_text(REAL_PAGE_TEXT)
@@ -393,42 +443,43 @@ th,td{padding:12px 8px;text-align:center}
 </table></body></html>"""
 
 
-# (用例名, HTML, 期望 (集中培训, 网络自学), 文本兜底层是否也应给出同样结果)
+# (用例名, HTML, 期望 (集中培训, 网络自学), 文本兜底层是否也应给出同样结果,
+#  期望应训时长 (集中培训, 网络自学)，None 表示该 fixture 没有应训时长行)
 DOM_CASES = (
     ("说明行与数值同号",
      _study_center_html("848.05", "2023年以来已学习848.05学时", "51"),
-     (848.05, 51.0), True),
+     (848.05, 51.0), True, (90.0, 50.0)),
     ("说明行数字不同且带空格",
      _study_center_html("848.05", "2023年以来已学习 300 学时", "51"),
-     (848.05, 51.0), True),
+     (848.05, 51.0), True, (90.0, 50.0)),
     ("说明行数字是独立节点",
      _study_center_html("848.05", None, "51", bare_note_number="300"),
-     (848.05, 51.0), True),
+     (848.05, 51.0), True, (90.0, 50.0)),
     ("说明行数字独占一行",
      _study_center_html("848.05", None, "51", note_own_line=True),
-     (848.05, 51.0), False),  # 只有 DOM 层能靠位置区分
+     (848.05, 51.0), False, (90.0, 50.0)),  # 只有 DOM 层能靠位置区分
     ("无独立单位节点",
      _study_center_html("848.05", None, "51",
                         value_unit_in_same_element=True),
-     (848.05, 51.0), True),
+     (848.05, 51.0), True, (90.0, 50.0)),
     ("缺少上一行标签",
      _study_center_html("848.05", "2023年以来已学习848.05学时", "51",
                         include_prev_row=False),
-     (848.05, 51.0), True),
+     (848.05, 51.0), True, None),  # 该 fixture 没有应训时长行
     ("无说明文字（回归）",
-     _study_center_html("242", None, "14.25"), (242.0, 14.25), True),
+     _study_center_html("242", None, "14.25"), (242.0, 14.25), True, (90.0, 50.0)),
     ("说明行在网络自学列",
      _study_center_html("242", None, "51",
                         online_note="2023年以来已学习51学时"),
-     (242.0, 51.0), True),
+     (242.0, 51.0), True, (90.0, 50.0)),
     ("小数",
      _study_center_html("1234.5", "2023年以来已学习1234.5学时", "0.75"),
-     (1234.5, 0.75), True),
+     (1234.5, 0.75), True, (90.0, 50.0)),
     ("行标签带小尾巴",
      _study_center_html("848.05", "2023年以来已学习848.05学时", "51",
                         row_label_suffix=" ›"),
-     (848.05, 51.0), True),
-    ("table 布局", TABLE_HTML, (848.05, 51.0), True),
+     (848.05, 51.0), True, (90.0, 50.0)),
+    ("table 布局", TABLE_HTML, (848.05, 51.0), True, (90.0, 50.0)),
 )
 
 
@@ -458,7 +509,7 @@ class StudyHoursDomParseTests(unittest.TestCase):
                     page = await browser.new_page(
                         viewport={"width": 1200, "height": 900})
                     for case in DOM_CASES:
-                        name, html, want, _text_agrees = case
+                        name, html, want, _text_agrees, _want_required = case
                         await page.set_content(html)
                         dom = await page.evaluate(_STUDY_HOURS_DOM_JS)
                         text = await page.locator("body").inner_text()
@@ -473,10 +524,15 @@ class StudyHoursDomParseTests(unittest.TestCase):
             self.skipTest(skip_reason)
         self.assertEqual(len(results), len(DOM_CASES), "浏览器用例未全部执行")
 
-        for (name, _html, want, text_agrees), dom, resolved, text in results:
+        for (name, _html, want, text_agrees, want_required), dom, resolved, text \
+                in results:
             with self.subTest(case=name):
                 self.assertEqual((resolved["central"], resolved["online"]), want)
                 self.assertEqual((dom["central"], dom["online"]), want)
+                if want_required is not None:
+                    self.assertEqual(
+                        (resolved["required_central"], resolved["required_online"]),
+                        want_required)
                 # 文本兜底层在多数场景也应一致；个别场景（说明行独占一行）
                 # 只有 DOM 层能靠位置区分，此时不要求文本层一致。
                 text_only = parse_study_hours_text(text)

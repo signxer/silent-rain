@@ -812,7 +812,9 @@ def _parse_exam_json(raw: str) -> Dict[int, Dict]:
 STUDY_HOURS_CENTRAL_LABEL = "集中培训"
 STUDY_HOURS_ONLINE_LABEL = "网络自学"
 STUDY_HOURS_ROW_LABELS = ("今年已训", "今年已培训", "本年已训")
-STUDY_HOURS_PREV_ROW_LABELS = ("应训时长", "应训学时", "集中培训学时")
+# 「应训时长」行：每年应完成的学时要求（集中培训 / 网络自学各一列）
+STUDY_HOURS_REQUIRED_ROW_LABELS = ("应训时长", "应训学时", "应训标准")
+STUDY_HOURS_PREV_ROW_LABELS = STUDY_HOURS_REQUIRED_ROW_LABELS + ("集中培训学时",)
 STUDY_HOURS_ROW_END_LABELS = ("完成进度", "其中：基本培训", "其中:基本培训")
 # 文本兜底扫描时，区域再往后的结束标记（防止把指标说明里的数字算进来）
 STUDY_HOURS_TEXT_END_LABELS = STUDY_HOURS_ROW_END_LABELS + (
@@ -829,6 +831,7 @@ _HOURS_VALUE_SELECTOR = r"text=/[0-9]+(?:\.[0-9]+)?\s*(?:学时|小时)/"
 _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
 () => {
   const ROW_LABELS = __ROW_LABELS__;
+  const REQUIRED_ROW_LABELS = __REQUIRED_ROW_LABELS__;
   const PREV_ROW_LABELS = __PREV_ROW_LABELS__;
   const ROW_END_LABELS = __ROW_END_LABELS__;
   const CENTRAL_LABEL = __CENTRAL_LABEL__;
@@ -864,77 +867,98 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
     }
     return best;
   };
-  const out = {central: null, online: null, debug: {}};
-  // 1) 行标签 今年已训
-  let rowLabel = null;
-  for (const name of ROW_LABELS) {
-    rowLabel = pickLabel(name, null);
-    if (rowLabel) { out.debug.row = name; break; }
-  }
-  if (!rowLabel) { out.debug.error = 'no-row-label'; return out; }
-  // 2) 列头：位于行标签上方、离得最近的一组
-  const centralHeader = pickLabel(CENTRAL_LABEL, rowLabel.y);
-  const onlineHeader = pickLabel(ONLINE_LABEL, rowLabel.y);
-  if (!centralHeader || !onlineHeader) { out.debug.error = 'no-column-header'; return out; }
-  // 3) 行范围：上边界取「上一行标签」与 今年已训 的中点（避免吃进上一行的数值），
-  //    下边界取下一行标签（完成进度…）的顶边。
-  let prevLabelY = null;
-  for (const name of PREV_ROW_LABELS) {
-    for (let i = 0; i < nodes.length; i++) {
-      if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
-      const c = rect(nodes[i]);
-      if (c.y >= rowLabel.y - 4) continue;
-      if (prevLabelY === null || c.y > prevLabelY) prevLabelY = c.y;
+  // 读取「某一行」在两个列上的数值。应训时长行与今年已训行共用同一套
+  // 行/列定位逻辑，避免两处各写一份、各自漂移。
+  const readRow = (labels, prevLabels, endLabels) => {
+    const info = {central: null, online: null, debug: {}};
+    // 1) 行标签
+    let rowLabel = null, rowName = null;
+    for (const name of labels) {
+      rowLabel = pickLabel(name, null);
+      if (rowLabel) { rowName = name; break; }
     }
-  }
-  const halfRow = rowLabel.h / 2;
-  let rowTop = prevLabelY === null
-      ? rowLabel.y - Math.max(halfRow, 8)
-      : Math.max((prevLabelY + rowLabel.y) / 2, rowLabel.y - halfRow - 4);
-  let rowBottom = rowLabel.bottom + 140;
-  for (const name of ROW_END_LABELS) {
-    let below = null;
-    for (let i = 0; i < nodes.length; i++) {
-      if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
-      const c = rect(nodes[i]);
-      if (c.y <= rowLabel.y + 4) continue;
-      if (!below || c.y < below.y) below = c;
+    if (!rowLabel) { info.debug.error = 'no-row-label'; return info; }
+    info.debug.row = rowName;
+    // 2) 列头：位于行标签上方、离得最近的那组
+    const centralHeader = pickLabel(CENTRAL_LABEL, rowLabel.y);
+    const onlineHeader = pickLabel(ONLINE_LABEL, rowLabel.y);
+    if (!centralHeader || !onlineHeader) { info.debug.error = 'no-column-header'; return info; }
+    // 3) 行范围：上边界取「上一行标签」与本行的中点（避免吃进上一行的数值）；
+    //    本行就是第一行数据（没有上一行标签）时，用列头底边当上边界。
+    let prevLabelY = null;
+    for (const name of prevLabels) {
+      for (let i = 0; i < nodes.length; i++) {
+        if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
+        const c = rect(nodes[i]);
+        if (c.y >= rowLabel.y - 4) continue;
+        if (prevLabelY === null || c.y > prevLabelY) prevLabelY = c.y;
+      }
     }
-    if (below) { rowBottom = Math.min(rowBottom, below.top); break; }
-  }
-  // 4) 行内数值节点（整段文本就是一个数字[+学时]）
-  const values = [];
-  for (let i = 0; i < nodes.length; i++) {
-    const t = texts[i];
-    if (!t) continue;
-    const m = VALUE_RE.exec(t);
-    if (!m) continue;
-    if (!visible(nodes[i])) continue;
-    const c = rect(nodes[i]);
-    if (c.y < rowTop || c.y > rowBottom) continue;
-    const num = parseFloat(m[1]);
-    if (!isFinite(num)) continue;
-    values.push({num: num, unit: !!m[2], x: c.x, y: c.y, text: t, area: c.w * c.h});
-  }
-  out.debug.rowTop = Math.round(rowTop);
-  out.debug.rowBottom = Math.round(rowBottom);
-  out.debug.candidates = values.map((v) => ({t: v.text, x: Math.round(v.x), y: Math.round(v.y)}));
-  out.debug.headers = {central: Math.round(centralHeader.x), online: Math.round(onlineHeader.x)};
-  // 5) 按列归属；同列优先「带学时单位」、其次离本行中线最近、再其次面积最小
-  const pickColumn = (header, other) => {
-    const pool = values.filter((v) => Math.abs(v.x - header.x) <= Math.abs(v.x - other.x));
-    if (!pool.length) return null;
-    pool.sort((a, b) => (b.unit - a.unit)
-        || (Math.abs(a.y - rowLabel.y) - Math.abs(b.y - rowLabel.y))
-        || (a.area - b.area));
-    return pool[0];
+    const halfRow = rowLabel.h / 2;
+    let rowTop;
+    if (prevLabels.length === 0) {
+      rowTop = Math.min(centralHeader.bottom, onlineHeader.bottom) + 2;
+    } else if (prevLabelY === null) {
+      rowTop = rowLabel.y - Math.max(halfRow, 8);
+    } else {
+      rowTop = Math.max((prevLabelY + rowLabel.y) / 2, rowLabel.y - halfRow - 4);
+    }
+    let rowBottom = rowLabel.bottom + 140;
+    for (const name of endLabels) {
+      let below = null;
+      for (let i = 0; i < nodes.length; i++) {
+        if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
+        const c = rect(nodes[i]);
+        if (c.y <= rowLabel.y + 4) continue;
+        if (!below || c.y < below.y) below = c;
+      }
+      if (below) { rowBottom = Math.min(rowBottom, below.top); break; }
+    }
+    // 4) 行内数值节点（整段文本就是一个数字[+学时]）
+    const values = [];
+    for (let i = 0; i < nodes.length; i++) {
+      const t = texts[i];
+      if (!t) continue;
+      const m = VALUE_RE.exec(t);
+      if (!m) continue;
+      if (!visible(nodes[i])) continue;
+      const c = rect(nodes[i]);
+      if (c.y < rowTop || c.y > rowBottom) continue;
+      const num = parseFloat(m[1]);
+      if (!isFinite(num)) continue;
+      values.push({num: num, unit: !!m[2], x: c.x, y: c.y, text: t, area: c.w * c.h});
+    }
+    info.debug.rowTop = Math.round(rowTop);
+    info.debug.rowBottom = Math.round(rowBottom);
+    info.debug.candidates = values.map((v) => ({t: v.text, x: Math.round(v.x), y: Math.round(v.y)}));
+    info.debug.headers = {central: Math.round(centralHeader.x), online: Math.round(onlineHeader.x)};
+    // 5) 按列归属；同列优先「带学时单位」、其次离本行中线最近、再其次面积最小
+    const pickColumn = (header, other) => {
+      const pool = values.filter((v) => Math.abs(v.x - header.x) <= Math.abs(v.x - other.x));
+      if (!pool.length) return null;
+      pool.sort((a, b) => (b.unit - a.unit)
+          || (Math.abs(a.y - rowLabel.y) - Math.abs(b.y - rowLabel.y))
+          || (a.area - b.area));
+      return pool[0];
+    };
+    const c = pickColumn(centralHeader, onlineHeader);
+    const o = pickColumn(onlineHeader, centralHeader);
+    if (c) info.central = c.num;
+    if (o) info.online = o.num;
+    info.debug.picked = {central: c ? c.text : null, online: o ? o.text : null};
+    return info;
   };
-  const c = pickColumn(centralHeader, onlineHeader);
-  const o = pickColumn(onlineHeader, centralHeader);
-  if (c) out.central = c.num;
-  if (o) out.online = o.num;
-  out.debug.picked = {central: c ? c.text : null, online: o ? o.text : null};
-  return out;
+
+  // 今年已训（上一行是应训时长）/ 应训时长（位于列头下方第一行）
+  const actual = readRow(ROW_LABELS, PREV_ROW_LABELS, ROW_END_LABELS);
+  const required = readRow(REQUIRED_ROW_LABELS, [], ROW_LABELS);
+  return {
+    central: actual.central,
+    online: actual.online,
+    required_central: required.central,
+    required_online: required.online,
+    debug: {actual: actual.debug, required: required.debug},
+  };
 }
 """
 
@@ -944,6 +968,7 @@ def _render_study_hours_dom_js() -> str:
     js = _STUDY_HOURS_DOM_JS_TEMPLATE
     replacements = {
         "__ROW_LABELS__": list(STUDY_HOURS_ROW_LABELS),
+        "__REQUIRED_ROW_LABELS__": list(STUDY_HOURS_REQUIRED_ROW_LABELS),
         "__PREV_ROW_LABELS__": list(STUDY_HOURS_PREV_ROW_LABELS),
         "__ROW_END_LABELS__": list(STUDY_HOURS_ROW_END_LABELS),
         "__CENTRAL_LABEL__": STUDY_HOURS_CENTRAL_LABEL,
@@ -981,41 +1006,108 @@ def _hours_candidates(region: str) -> list:
     """把区域文本拆成候选学时，按出现顺序返回 [(score, value)]。
 
     评分（越高越可信）：
-      3 = 整行只有「数字(+学时)(+箭头)」
-      2 = 整行不含中文（纯数值行）
-      1 = 数字出现在本行中文之前（如「848.05学时 2023年以来…」）
+      3 = 整格只有「数字(+学时)(+箭头)」
+      2 = 整格不含中文（纯数值格）
+      1 = 数字出现在本格中文之前（如「848.05学时 2023年以来…」）
       0 = 数字前面已经有中文（说明文字，如「2023年以来已学习848.05学时」）→ 丢弃
+
+    表格布局下 inner_text 会用 \\t 分隔同一行的单元格（「今年已训\\t848.05 学时」），
+    所以按「单元格」而不是「整行」评分，否则标签会把同一格的数值一起拖下水。
     """
     out = []
     for raw_line in region.splitlines():
         line = raw_line.replace('\u00a0', ' ')
-        if not line.strip():
-            continue
-        m = _HOURS_STRICT_LINE_RE.match(line)
-        if m:
-            try:
-                out.append((3, float(m.group(1))))
-            except ValueError:
-                pass
-            continue
-        has_cjk = bool(_HOURS_CJK_RE.search(line))
-        if not has_cjk:
-            for m in _HOURS_TOKEN_RE.finditer(line):
+        for raw_cell in line.split('\t'):
+            cell = raw_cell.strip()
+            if not cell:
+                continue
+            m = _HOURS_STRICT_LINE_RE.match(cell)
+            if m:
                 try:
-                    out.append((2, float(m.group(1))))
+                    out.append((3, float(m.group(1))))
                 except ValueError:
                     pass
-            continue
-        for m in _HOURS_TOKEN_RE.finditer(line):
-            prefix = line[:m.start()]
-            # 数字紧跟在中文/说明文字后面 → 说明句，不算学时
-            if _HOURS_CJK_RE.search(prefix):
                 continue
-            try:
-                out.append((1, float(m.group(1))))
-            except ValueError:
-                pass
+            has_cjk = bool(_HOURS_CJK_RE.search(cell))
+            if not has_cjk:
+                for m in _HOURS_TOKEN_RE.finditer(cell):
+                    try:
+                        out.append((2, float(m.group(1))))
+                    except ValueError:
+                        pass
+                continue
+            for m in _HOURS_TOKEN_RE.finditer(cell):
+                prefix = cell[:m.start()]
+                # 数字紧跟在中文/说明文字后面 → 说明句，不算学时
+                if _HOURS_CJK_RE.search(prefix):
+                    continue
+                try:
+                    out.append((1, float(m.group(1))))
+                except ValueError:
+                    pass
     return out
+
+
+def _required_region_text(text: str) -> str:
+    """截取「应训时长」所在行的文本区域（到今年已训/下一段为止）。"""
+    if not text:
+        return ""
+    start, start_len = -1, 0
+    for label in STUDY_HOURS_REQUIRED_ROW_LABELS:
+        idx = text.find(label)
+        if idx >= 0 and (start < 0 or idx < start):
+            start, start_len = idx, len(label)
+    if start < 0:
+        return ""
+    region = text[start + start_len:]
+    end = len(region)
+    for label in STUDY_HOURS_ROW_LABELS + STUDY_HOURS_TEXT_END_LABELS:
+        idx = region.find(label)
+        if idx >= 0:
+            end = min(end, idx)
+    return region[:end]
+
+
+def parse_required_hours_text(text: str) -> Dict[str, Optional[float]]:
+    """解析「应训时长」行的集中培训 / 网络自学应完成学时（文本兜底层）。
+
+    这一行是要求值，格式比「今年已训」规整：常见是
+    「每年应完成 / 90学时 / 每年应完成 / 50学时」，也可能挤成一行
+    「每年应完成 90 学时」或表格里的「应训时长\\t每年应完成\\n90 学时\\t…」。
+    所以先取「整格就是数值」的候选，凑不齐两个再按出现顺序放宽。
+    """
+    result: Dict[str, Optional[float]] = {"required_central": None, "required_online": None}
+    region = _required_region_text(text or "")
+    if not region:
+        return result
+    candidates = []          # 按出现顺序的 (是否整格纯数值, 数值)
+    for raw_line in region.splitlines():
+        line = raw_line.replace('\u00a0', ' ')
+        for raw_cell in line.split('\t'):
+            cell = raw_cell.strip()
+            if not cell:
+                continue
+            m = _HOURS_STRICT_LINE_RE.match(cell)
+            if m:
+                try:
+                    candidates.append((True, float(m.group(1))))
+                except ValueError:
+                    pass
+                continue
+            # 「每年应完成 90 学时」这类标签+数值同格也接受
+            for token in _HOURS_TOKEN_RE.finditer(cell):
+                try:
+                    candidates.append((False, float(token.group(1))))
+                except ValueError:
+                    pass
+    strict = [value for is_strict, value in candidates if is_strict]
+    values = strict if len(strict) >= 2 else [value for _is_strict, value in candidates]
+    debug(f"应训时长候选: {candidates} -> {values}")
+    if values:
+        result["required_central"] = values[0]
+    if len(values) >= 2:
+        result["required_online"] = values[1]
+    return result
 
 
 def parse_study_hours_text(text: str) -> Dict[str, Optional[float]]:
@@ -1047,12 +1139,14 @@ def parse_study_hours_text(text: str) -> Dict[str, Optional[float]]:
 
 
 def parse_study_hours_dom(dom: Optional[dict]) -> Dict[str, Optional[float]]:
-    """把页面 JS 的结构化解析结果规整成 {central, online}。"""
-    result: Dict[str, Optional[float]] = {"central": None, "online": None, "debug": None}
+    """把页面 JS 的结构化解析结果规整成 {central, online, required_central, required_online}。"""
+    result: Dict[str, Optional[float]] = {"central": None, "online": None,
+                                          "required_central": None, "required_online": None,
+                                          "debug": None}
     if not isinstance(dom, dict):
         return result
     result["debug"] = dom.get("debug")
-    for key in ("central", "online"):
+    for key in ("central", "online", "required_central", "required_online"):
         raw = dom.get(key)
         if raw is None:
             continue
@@ -1066,9 +1160,15 @@ def parse_study_hours_dom(dom: Optional[dict]) -> Dict[str, Optional[float]]:
 
 
 def resolve_study_hours(dom: Optional[dict], text: str) -> Dict[str, object]:
-    """合并 DOM 结构化解析与文本兜底解析，返回最终学时。"""
+    """合并 DOM 结构化解析与文本兜底解析，返回最终学时。
+
+    central/online 是今年已训，required_central/required_online 是应训时长
+    （自动识别目标模式用它当学习目标）。source 只描述今年已训的来源。
+    """
     structured = parse_study_hours_dom(dom)
     central, online = structured["central"], structured["online"]
+    required_central = structured["required_central"]
+    required_online = structured["required_online"]
     had_dom = central is not None or online is not None
     if central is not None and online is not None:
         source = "dom"
@@ -1079,9 +1179,18 @@ def resolve_study_hours(dom: Optional[dict], text: str) -> Dict[str, object]:
         if online is None:
             online = fallback["online"]
         source = "dom+text" if (had_dom and (central is not None or online is not None)) else "text"
+    if required_central is None or required_online is None:
+        required = parse_required_hours_text(text)
+        if required_central is None:
+            required_central = required["required_central"]
+        if required_online is None:
+            required_online = required["required_online"]
     central = 0.0 if central is None else float(central)
     online = 0.0 if online is None else float(online)
+    required_central = 0.0 if required_central is None else float(required_central)
+    required_online = 0.0 if required_online is None else float(required_online)
     return {"central": central, "online": online, "total": central + online,
+            "required_central": required_central, "required_online": required_online,
             "source": source, "debug": structured["debug"]}
 
 
@@ -4545,8 +4654,12 @@ class AutoLearner:
 
         central = float(result["central"])
         online = float(result["online"])
-        debug(f"学时解析({result['source']}): 集中培训={central}, 网络自学={online}")
-        return {"central": central, "online": online, "total": central + online}
+        required_central = float(result["required_central"])
+        required_online = float(result["required_online"])
+        debug(f"学时解析({result['source']}): 集中培训={central}, 网络自学={online}; "
+              f"应训时长: 集中培训={required_central}, 网络自学={required_online}")
+        return {"central": central, "online": online, "total": central + online,
+                "required_central": required_central, "required_online": required_online}
 
     async def _course_mode(self, page: Page):
         # 从 /course/#/list/1 选择课程学习

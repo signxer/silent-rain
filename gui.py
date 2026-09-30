@@ -560,6 +560,28 @@ _MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",   # 64 位
 _XAR_MAGIC = b"xar!"          # macOS .pkg 是 xar 归档
 
 
+def resolve_required_goal(required_value, last_recorded=0) -> tuple:
+    """把「应训时长」解析成学习目标，返回 (目标值, 来源)。
+
+    来源："page"=本次从学习中心读到；"cached"=页面没读到、沿用上次记录；
+    "missing"=都没有（目标 0，该阶段跳过）。页面偶尔读不到不该让整轮白跑，
+    所以保留上次记录做兜底。
+    """
+    try:
+        value = float(required_value or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value > 0:
+        return value, "page"
+    try:
+        fallback = float(last_recorded or 0)
+    except (TypeError, ValueError):
+        fallback = 0.0
+    if fallback > 0:
+        return fallback, "cached"
+    return 0.0, "missing"
+
+
 def _looks_like_installer(path) -> bool:
     """校验下载文件是否为当前平台的有效安装包（拦代理错误页/截断文件）。
 
@@ -1438,6 +1460,12 @@ class GoalScreen(QWidget):
             self.radio_central_target.setChecked(self._saved_central_mode != "remain")
             self.radio_online_remain.setChecked(self._saved_online_mode == "remain")
             self.radio_online_target.setChecked(self._saved_online_mode != "remain")
+            self.radio_central_required.setChecked(self._saved_central_source == "required")
+            self.radio_central_custom.setChecked(self._saved_central_source != "required")
+            self.radio_online_required.setChecked(self._saved_online_source == "required")
+            self.radio_online_custom.setChecked(self._saved_online_source != "required")
+            self._sync_central_source()
+            self._sync_online_source()
             self.central_goal_widget.setVisible(self._saved_central_on)
             self.online_goal_widget.setVisible(self._saved_online_on)
         except Exception:
@@ -1454,6 +1482,8 @@ class GoalScreen(QWidget):
         self._saved_online_on = False
         self._saved_central_mode = "target"  # target/remain
         self._saved_online_mode = "target"
+        self._saved_central_source = "custom"  # custom/required
+        self._saved_online_source = "custom"
         if os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -1462,8 +1492,11 @@ class GoalScreen(QWidget):
                 self._saved_online = cfg.get("online_goal", 0)
                 self._saved_central_mode = cfg.get("central_mode", "target")
                 self._saved_online_mode = cfg.get("online_mode", "target")
-                self._saved_central_on = self._saved_central > 0
-                self._saved_online_on = self._saved_online > 0
+                self._saved_central_source = cfg.get("central_source", "custom")
+                self._saved_online_source = cfg.get("online_source", "custom")
+                # 开关状态优先用显式字段：自动识别应训时长时，数值要等登录后才知道
+                self._saved_central_on = bool(cfg.get("central_enabled", self._saved_central > 0))
+                self._saved_online_on = bool(cfg.get("online_enabled", self._saved_online > 0))
                 # 向后兼容旧格式
                 if cfg.get("study_goal", 0) > 0:
                     old_goal = cfg["study_goal"]
@@ -1512,6 +1545,22 @@ class GoalScreen(QWidget):
         central_goal_layout.setContentsMargins(0, 0, 0, 0)
         central_goal_layout.setSpacing(8)
 
+        # 目标来源：自定义数值 / 自动识别学习中心的应训时长
+        c_src_row = QHBoxLayout()
+        c_src_row.addWidget(BodyLabel("目标来源:"))
+        self.radio_central_custom = RadioButton("自定义")
+        self.radio_central_required = RadioButton("自动识别应训时长")
+        if self._saved_central_source == "required":
+            self.radio_central_required.setChecked(True)
+        else:
+            self.radio_central_custom.setChecked(True)
+        self.radio_central_required.setToolTip(
+            "登录后读取学习中心「应训时长」，用它作为集中培训的学习目标")
+        c_src_row.addWidget(self.radio_central_custom)
+        c_src_row.addWidget(self.radio_central_required)
+        c_src_row.addStretch()
+        central_goal_layout.addLayout(c_src_row)
+
         # 模式选择
         c_mode_row = QHBoxLayout()
         self.radio_central_target = RadioButton("总学时")
@@ -1538,11 +1587,10 @@ class GoalScreen(QWidget):
         c_hours_row.addStretch()
         central_goal_layout.addLayout(c_hours_row)
 
-        # 切换模式时更新标签
-        self.radio_central_target.toggled.connect(
-            lambda checked: self.lbl_central_prefix.setText("目标总学时:" if checked else "差额学时:"))
-        self.radio_central_remain.toggled.connect(
-            lambda checked: self.lbl_central_prefix.setText("差额学时:" if checked else "目标总学时:"))
+        # 来源/模式切换时更新标签与输入框可用状态
+        for _radio in (self.radio_central_custom, self.radio_central_required,
+                       self.radio_central_target, self.radio_central_remain):
+            _radio.toggled.connect(self._sync_central_source)
 
         c_layout.addWidget(self.central_goal_widget)
 
@@ -1573,6 +1621,22 @@ class GoalScreen(QWidget):
         online_goal_layout.setContentsMargins(0, 0, 0, 0)
         online_goal_layout.setSpacing(8)
 
+        # 目标来源：自定义数值 / 自动识别学习中心的应训时长
+        o_src_row = QHBoxLayout()
+        o_src_row.addWidget(BodyLabel("目标来源:"))
+        self.radio_online_custom = RadioButton("自定义")
+        self.radio_online_required = RadioButton("自动识别应训时长")
+        if self._saved_online_source == "required":
+            self.radio_online_required.setChecked(True)
+        else:
+            self.radio_online_custom.setChecked(True)
+        self.radio_online_required.setToolTip(
+            "登录后读取学习中心「应训时长」，用它作为网络自学的学习目标")
+        o_src_row.addWidget(self.radio_online_custom)
+        o_src_row.addWidget(self.radio_online_required)
+        o_src_row.addStretch()
+        online_goal_layout.addLayout(o_src_row)
+
         # 模式选择
         o_mode_row = QHBoxLayout()
         self.radio_online_target = RadioButton("总学时")
@@ -1599,11 +1663,10 @@ class GoalScreen(QWidget):
         o_hours_row.addStretch()
         online_goal_layout.addLayout(o_hours_row)
 
-        # 切换模式时更新标签
-        self.radio_online_target.toggled.connect(
-            lambda checked: self.lbl_online_prefix.setText("目标总学时:" if checked else "差额学时:"))
-        self.radio_online_remain.toggled.connect(
-            lambda checked: self.lbl_online_prefix.setText("差额学时:" if checked else "目标总学时:"))
+        # 来源/模式切换时更新标签与输入框可用状态
+        for _radio in (self.radio_online_custom, self.radio_online_required,
+                       self.radio_online_target, self.radio_online_remain):
+            _radio.toggled.connect(self._sync_online_source)
 
         o_layout.addWidget(self.online_goal_widget)
 
@@ -1621,12 +1684,18 @@ class GoalScreen(QWidget):
         layout.addWidget(self.lbl_goal_summary)
         for control in (self.switch_central, self.switch_online,
                         self.spin_central, self.spin_online,
+                        self.radio_central_custom, self.radio_central_required,
+                        self.radio_online_custom, self.radio_online_required,
                         self.radio_central_target, self.radio_central_remain,
                         self.radio_online_target, self.radio_online_remain):
             if hasattr(control, "checkedChanged"):
                 control.checkedChanged.connect(lambda *_: self._update_goal_summary())
             elif hasattr(control, "valueChanged"):
                 control.valueChanged.connect(lambda *_: self._update_goal_summary())
+        # 构建完成后立刻同步一次：不能只依赖 showEvent，否则刚建好的界面
+        # 会出现「选了自动识别但输入框仍可编辑、前缀还是差额学时」的错位状态
+        self._sync_central_source()
+        self._sync_online_source()
         self._update_goal_summary()
 
         layout.addStretch()
@@ -1644,14 +1713,45 @@ class GoalScreen(QWidget):
 
         layout.addLayout(btn_layout)
 
+    def _sync_central_source(self, *_):
+        """自动识别应训时长时，学时输入框交由页面读取，禁用即可。"""
+        auto = self.radio_central_required.isChecked()
+        self.spin_central.setEnabled(not auto)
+        if auto:
+            self.lbl_central_prefix.setText("应训时长:")
+        else:
+            self.lbl_central_prefix.setText(
+                "目标总学时:" if self.radio_central_target.isChecked() else "差额学时:")
+        self._update_goal_summary()
+
+    def _sync_online_source(self, *_):
+        auto = self.radio_online_required.isChecked()
+        self.spin_online.setEnabled(not auto)
+        if auto:
+            self.lbl_online_prefix.setText("应训时长:")
+        else:
+            self.lbl_online_prefix.setText(
+                "目标总学时:" if self.radio_online_target.isChecked() else "差额学时:")
+        self._update_goal_summary()
+
+    def _source_of(self, central):
+        radio = self.radio_central_required if central else self.radio_online_required
+        return "required" if radio.isChecked() else "custom"
+
     def _update_goal_summary(self):
         parts = []
-        if self.switch_central.isChecked() and self.spin_central.value() > 0:
-            mode = "总学时" if self.radio_central_target.isChecked() else "差额补修"
-            parts.append(f"集中培训 · {mode} {self.spin_central.value()} 学时")
-        if self.switch_online.isChecked() and self.spin_online.value() > 0:
-            mode = "总学时" if self.radio_online_target.isChecked() else "差额补修"
-            parts.append(f"网络自学 · {mode} {self.spin_online.value()} 学时")
+        if self.switch_central.isChecked():
+            if self.radio_central_required.isChecked():
+                parts.append("集中培训 · 应训时长（自动识别）")
+            elif self.spin_central.value() > 0:
+                mode = "总学时" if self.radio_central_target.isChecked() else "差额补修"
+                parts.append(f"集中培训 · {mode} {self.spin_central.value()} 学时")
+        if self.switch_online.isChecked():
+            if self.radio_online_required.isChecked():
+                parts.append("网络自学 · 应训时长（自动识别）")
+            elif self.spin_online.value() > 0:
+                mode = "总学时" if self.radio_online_target.isChecked() else "差额补修"
+                parts.append(f"网络自学 · {mode} {self.spin_online.value()} 学时")
         self.lbl_goal_summary.setText("当前选择：" + ("；".join(parts) if parts else "未设置学习目标"))
 
     def _on_next(self):
@@ -1661,9 +1761,11 @@ class GoalScreen(QWidget):
         online = self.spin_online.value() if online_on else 0
         central_mode = "remain" if self.radio_central_remain.isChecked() else "target"
         online_mode = "remain" if self.radio_online_remain.isChecked() else "target"
-        self._on_done(central_on, central, central_mode, online_on, online, online_mode)
+        self._on_done(central_on, central, central_mode, online_on, online, online_mode,
+                      self._source_of(True), self._source_of(False))
 
-    def _on_done(self, central_on, central_goal, central_mode, online_on, online_goal, online_mode):
+    def _on_done(self, central_on, central_goal, central_mode, online_on, online_goal,
+                 online_mode, central_source="custom", online_source="custom"):
         # 直接保存原始值，差额模式在仪表盘登录后获取学时时再算绝对目标
         try:
             cfg = {}
@@ -1674,6 +1776,11 @@ class GoalScreen(QWidget):
             cfg["online_goal"] = online_goal if online_on else 0
             cfg["central_mode"] = central_mode if central_on else "target"
             cfg["online_mode"] = online_mode if online_on else "target"
+            # 开关状态显式保存：自动识别应训时长时数值要等登录后才确定
+            cfg["central_enabled"] = bool(central_on)
+            cfg["online_enabled"] = bool(online_on)
+            cfg["central_source"] = central_source if central_on else "custom"
+            cfg["online_source"] = online_source if online_on else "custom"
             # 清理旧字段
             cfg.pop("study_goal", None)
             cfg.pop("goal_type", None)
@@ -1687,6 +1794,8 @@ class GoalScreen(QWidget):
         win.cfg_online_goal = online_goal if online_on else 0
         win.cfg_central_mode = central_mode if central_on else "target"
         win.cfg_online_mode = online_mode if online_on else "target"
+        win.cfg_central_source = central_source if central_on else "custom"
+        win.cfg_online_source = online_source if online_on else "custom"
         if getattr(win, "_settings_mode", False):
             win.return_to_dashboard(restart=True)
         else:
@@ -1831,10 +1940,17 @@ class ModeScreen(QWidget):
             else:
                 win.cfg_central_goal = 0
                 win.cfg_online_goal = 0
+                win.cfg_central_source = "custom"
+                win.cfg_online_source = "custom"
                 cfg.pop("central_goal", None)
                 cfg.pop("online_goal", None)
                 cfg.pop("central_mode", None)
                 cfg.pop("online_mode", None)
+                cfg.pop("central_source", None)
+                cfg.pop("online_source", None)
+                # 目标清空时开关状态也要一起清，否则切回自动模式会显示"已启用但 0 学时"
+                cfg["central_enabled"] = False
+                cfg["online_enabled"] = False
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
@@ -2784,6 +2900,16 @@ class DashboardScreen(QWidget):
         n = len(getattr(win, "cfg_manual_urls", []))
         return f"手动模式 · {n} 个URL" if n else "手动模式（未设置URL）"
 
+    def _auto_goal_pending(self, win):
+        """目标来自「应训时长」但还没识别出来（登录前/页面没读到）。"""
+        c_goal = getattr(win, "cfg_central_goal", 0)
+        o_goal = getattr(win, "cfg_online_goal", 0)
+        return ((getattr(win, "cfg_central_source", "custom") == "required" and c_goal <= 0)
+                or (getattr(win, "cfg_online_source", "custom") == "required" and o_goal <= 0))
+
+    def _goal_pending_text(self):
+        return "应训时长识别中…"
+
     def _set_goal_info(self, win):
         # 手动模式：无学时目标，显示手动信息而不是"不学习"
         mode = getattr(win, "cfg_mode", "auto")
@@ -2794,18 +2920,27 @@ class DashboardScreen(QWidget):
         o_goal = getattr(win, "cfg_online_goal", 0)
         c_mode = getattr(win, "cfg_central_mode", "target")
         o_mode = getattr(win, "cfg_online_mode", "target")
+        c_src = getattr(win, "cfg_central_source", "custom")
+        o_src = getattr(win, "cfg_online_source", "custom")
 
         if c_goal <= 0 and o_goal <= 0:
-            self.lbl_goal_info.setText("不学习")
+            self.lbl_goal_info.setText(
+                self._goal_pending_text() if self._auto_goal_pending(win) else "不学习")
             return
 
         parts = []
         if c_goal > 0:
-            mode_str = "总" if c_mode == "target" else "差额"
-            parts.append(f"集中{mode_str}{c_goal:.0f}")
+            if c_src == "required":
+                parts.append(f"集中应训{c_goal:.0f}")
+            else:
+                mode_str = "总" if c_mode == "target" else "差额"
+                parts.append(f"集中{mode_str}{c_goal:.0f}")
         if o_goal > 0:
-            mode_str = "总" if o_mode == "target" else "差额"
-            parts.append(f"网络{mode_str}{o_goal:.0f}")
+            if o_src == "required":
+                parts.append(f"网络应训{o_goal:.0f}")
+            else:
+                mode_str = "总" if o_mode == "target" else "差额"
+                parts.append(f"网络{mode_str}{o_goal:.0f}")
         self.lbl_goal_info.setText(" + ".join(parts) + "学时")
 
     async def _run_learning(self, thread: AsyncThread):
@@ -2905,15 +3040,20 @@ class DashboardScreen(QWidget):
             cfg_online_goal = getattr(win, "cfg_online_goal", 0)
             cfg_central_mode = getattr(win, "cfg_central_mode", "target")
             cfg_online_mode = getattr(win, "cfg_online_mode", "target")
+            # 目标来源：custom=用配置里的数值；required=登录后读取应训时长
+            auto_central = getattr(win, "cfg_central_source", "custom") == "required"
+            auto_online = getattr(win, "cfg_online_source", "custom") == "required"
 
-            if cfg_central_goal <= 0 and cfg_online_goal <= 0:
+            # 自动识别模式下目标数值要等登录后才能确定，这里不能提前判定"没目标"
+            if (not auto_central and not auto_online
+                    and cfg_central_goal <= 0 and cfg_online_goal <= 0):
                 log("未设定学习目标，退出", "yellow")
                 thread.done_signal.emit(0, 0)
                 return
 
             # 登录后立即检查学时
             cur_hours = {"central": 0, "online": 0}
-            if cfg_central_goal > 0 or cfg_online_goal > 0:
+            if cfg_central_goal > 0 or cfg_online_goal > 0 or auto_central or auto_online:
                 log("正在检查当前学时...", "blue")
                 try:
                     _h = await learner._get_study_hours()
@@ -2935,6 +3075,43 @@ class DashboardScreen(QWidget):
                         "updated": datetime.now().strftime("%H:%M:%S"),
                     })
 
+                    # 自动识别应训时长：目标来自学习中心「应训时长」行
+                    required = {
+                        "central": _h.get("required_central", 0) or 0,
+                        "online": _h.get("required_online", 0) or 0,
+                    }
+                    if auto_central or auto_online:
+                        # 页面偶发读不到时沿用上次记录，避免整轮不学
+                        cfg_prev = {}
+                        if os.path.exists(CONFIG_PATH):
+                            try:
+                                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                                    cfg_prev = json.load(f)
+                            except Exception:
+                                cfg_prev = {}
+                        for _type, _is_auto in (("central", auto_central), ("online", auto_online)):
+                            if not _is_auto:
+                                continue
+                            _name = "集中培训" if _type == "central" else "网络自学"
+                            _mode = cfg_central_mode if _type == "central" else cfg_online_mode
+                            _goal, _origin = resolve_required_goal(
+                                required[_type],
+                                cfg_prev.get(f"_last_required_{_type}_hours", 0))
+                            if _goal > 0:
+                                _via = "沿用上次记录" if _origin == "cached" else "学习中心"
+                                _how = "总学时" if _mode == "target" else "差额补修"
+                                log(f"自动识别{_name}应训时长: {_goal:.0f} 学时"
+                                    f"（{_via} · {_how}）", "green")
+                            else:
+                                log(f"未能识别{_name}应训时长，跳过该阶段", "yellow")
+                            if _type == "central":
+                                cfg_central_goal = _goal
+                            else:
+                                cfg_online_goal = _goal
+                        # 回写到窗口：进度环/目标文案按识别出来的值显示
+                        win.cfg_central_goal = cfg_central_goal
+                        win.cfg_online_goal = cfg_online_goal
+
                     # 保存当前学时到配置（供差额模式计算绝对目标用）
                     try:
                         cfg_save = {}
@@ -2943,6 +3120,10 @@ class DashboardScreen(QWidget):
                                 cfg_save = json.load(f)
                         cfg_save["_last_central_hours"] = cur_hours["central"]
                         cfg_save["_last_online_hours"] = cur_hours["online"]
+                        if required["central"] > 0:
+                            cfg_save["_last_required_central_hours"] = required["central"]
+                        if required["online"] > 0:
+                            cfg_save["_last_required_online_hours"] = required["online"]
                         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                             json.dump(cfg_save, f, ensure_ascii=False, indent=2)
                     except:
@@ -3636,7 +3817,8 @@ class DashboardScreen(QWidget):
         if c_target <= 0 and o_target <= 0:
             self.progress_ring.setValue(0)
             self._animate_progress_bar(self.goal_progress, 0)
-            self.lbl_goal_info.setText("不学习")
+            self.lbl_goal_info.setText(
+                self._goal_pending_text() if self._auto_goal_pending(win) else "不学习")
             return
 
         # 确定当前阶段和目标
@@ -4397,6 +4579,8 @@ class MainWindow(_BaseWindow):
         self.cfg_auto_login = True
         self.cfg_central_goal = 0.0
         self.cfg_online_goal = 0.0
+        self.cfg_central_source = "custom"   # custom/required（自动识别应训时长）
+        self.cfg_online_source = "custom"
         self.cfg_tags = []
         self.cfg_mode = "auto"
         self.cfg_manual_urls = []
@@ -4938,6 +5122,8 @@ del "%~f0"
             self.cfg_online_goal = cfg.get("online_goal", 0)
             self.cfg_central_mode = cfg.get("central_mode", "target")
             self.cfg_online_mode = cfg.get("online_mode", "target")
+            self.cfg_central_source = cfg.get("central_source", "custom")
+            self.cfg_online_source = cfg.get("online_source", "custom")
             # 向后兼容旧格式：仅当新格式字段未设置时才回退旧 study_goal
             if cfg.get("study_goal", 0) > 0 and not (self.cfg_central_goal or self.cfg_online_goal):
                 if cfg.get("goal_type") == "central":
