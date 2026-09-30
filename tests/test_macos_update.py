@@ -51,7 +51,8 @@ class LooksLikeInstallerTests(unittest.TestCase):
 
     def test_accepts_macho_on_macos(self):
         binary = self._path("Moisten", b"\xcf\xfa\xed\xfe")
-        self.assertTrue(gui._looks_like_installer(binary))
+        with patch("gui.sys.platform", "darwin"):
+            self.assertTrue(gui._looks_like_installer(binary))
 
     def test_accepts_pe_on_windows(self):
         exe = self._path("Moisten-2.3.9-Windows.exe", b"MZ\x90\x00")
@@ -171,7 +172,8 @@ class MacOSUpdateHelperTests(unittest.TestCase):
     def test_app_bundle_from_frozen_executable(self):
         with patch("gui.sys.frozen", True, create=True), \
              patch("gui.sys.executable",
-                   "/Applications/Moisten.app/Contents/MacOS/Moisten"):
+                   "/Applications/Moisten.app/Contents/MacOS/Moisten"), \
+             patch("gui.os.path.abspath", side_effect=lambda p: p):
             self.assertEqual(gui._macos_app_bundle(), "/Applications/Moisten.app")
 
     def test_app_bundle_is_none_for_source_run(self):
@@ -248,6 +250,7 @@ class MacOSUpdateLaunchTests(unittest.TestCase):
                    executable or "/Applications/Moisten.app/Contents/MacOS/Moisten"), \
              patch("gui.os.path.isfile", return_value=True), \
              patch("gui.os.path.isdir", return_value=installed_app_exists), \
+             patch("gui.os.path.abspath", side_effect=lambda p: p), \
              patch("gui._install_macos_pkg", return_value=install_ok) as install, \
              patch("gui._schedule_macos_relaunch") as relaunch, \
              patch("gui.subprocess.Popen") as popen, \
