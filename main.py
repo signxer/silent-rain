@@ -126,6 +126,50 @@ class OnlineCourseListUnavailable(RuntimeError):
 
 ONLINE_COURSE_LIST_CARD_SELECTOR = "a.p-cursor[title]"
 
+# 翻页校验的等待预算（毫秒）。抽成常量便于测试压到毫秒级。
+ONLINE_PAGE_CHANGE_TIMEOUT_MS = 4500      # 点击下一页后等渲染真正生效
+ONLINE_PAGE_ROUTE_TIMEOUT_MS = 5000       # 路由跳转后等卡片真正换掉
+ONLINE_PAGE_SETTLE_DELAY_MS = 400         # 落地路由确认间隔
+ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS = 8000   # 深链跳页后等卡片渲染
+
+# 列表页可观测状态：卡片指纹 + 分页器高亮页码 + 路由页码。
+# 翻页点击后用它校验「页面真的换了」，避免 SPA 没渲染完就采集到上一页。
+# 页码只作为旁证：取不到或取值异常时一律忽略，不影响主流程。
+ONLINE_COURSE_PAGE_STATE_JS = r"""
+(selector) => {
+  const ACTIVE = ['active', 'on', 'current', 'selected', 'checked', 'now'];
+  const tokens = (el) => ((el.getAttribute('class') || '').toLowerCase()).split(/[\s_\-]+/);
+  const readIndex = (el) => {
+    if (!el) return null;
+    const n = parseInt((el.textContent || '').trim(), 10);
+    return (Number.isFinite(n) && n > 0 && n < 10000) ? n : null;
+  };
+  const nodes = Array.from(document.querySelectorAll(selector));
+  const parts = nodes.map((el) => (el.getAttribute('title') || '')
+      + '\u0001' + (el.getAttribute('href') || ''));
+  let pager = null;
+  for (const el of Array.from(document.querySelectorAll('[class*=page_num], [class*=page-num]'))) {
+    if (!ACTIVE.some((name) => tokens(el).includes(name))) continue;
+    pager = readIndex(el);
+    if (pager !== null) break;
+  }
+  if (pager === null) {
+    for (const sel of ['.el-pager li.is-active', '.ant-pagination-item-active',
+                       '[class*=pager] [class*=active]']) {
+      pager = readIndex(document.querySelector(sel));
+      if (pager !== null) break;
+    }
+  }
+  const match = (location.hash || '').match(/\/list\/(\d+)/);
+  return {
+    raw: parts.join('\u0002'),
+    set: parts.slice().sort().join('\u0002'),
+    pager: pager,
+    route: match ? parseInt(match[1], 10) : null,
+  };
+}
+"""
+
 
 def _same_document_url(current_url: str, target_url: str) -> bool:
     """判断 goto(target_url) 是否只会做同文档导航（scheme/host/path 相同）。
@@ -750,6 +794,295 @@ def _parse_exam_json(raw: str) -> Dict[int, Dict]:
             text = " ".join(str(t) for t in text)
         result[index] = {"choices": choices, "blanks": blanks, "text": str(text).strip()}
     return result
+
+
+# ───────────────────────── 学习中心学时解析 ─────────────────────────
+# 学习中心「总体培训情况」是一张两列表格：列为 集中培训 / 网络自学，
+# 行为 应训时长 / 今年已训 / 完成进度。部分用户的「今年已训」单元格里
+# 会多出一行说明文字（如「2023年以来已学习xxxx学时」），旧实现直接取
+# 第 1、2 个「数字+学时」，于是把说明里的数字当成了网络自学学时。
+#
+# 现在的解析分两层：
+#   1) DOM 结构化解析（_STUDY_HOURS_DOM_JS）：按 今年已训 行的 y 范围取
+#      两列的真实数值节点，再用列头 x 坐标归属到 集中培训 / 网络自学。
+#   2) 文本兜底解析（parse_study_hours_text）：按行打分，只有「整行就是
+#      数值」「数值在中文之前」才算候选，从而剔除说明句里的数字。
+# 任一层拿到两个值即可；另一层用于补齐缺失的一列。
+
+STUDY_HOURS_CENTRAL_LABEL = "集中培训"
+STUDY_HOURS_ONLINE_LABEL = "网络自学"
+STUDY_HOURS_ROW_LABELS = ("今年已训", "今年已培训", "本年已训")
+STUDY_HOURS_PREV_ROW_LABELS = ("应训时长", "应训学时", "集中培训学时")
+STUDY_HOURS_ROW_END_LABELS = ("完成进度", "其中：基本培训", "其中:基本培训")
+# 文本兜底扫描时，区域再往后的结束标记（防止把指标说明里的数字算进来）
+STUDY_HOURS_TEXT_END_LABELS = STUDY_HOURS_ROW_END_LABELS + (
+    "学时指标", "培训项目", "我的必学")
+
+_HOURS_STRICT_LINE_RE = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s*(?:学时|小时)?\s*[>›»→]?\s*$')
+_HOURS_TOKEN_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?)\s*(?:学时|小时)')
+_HOURS_CJK_RE = re.compile(r'[\u4e00-\u9fff]')
+# Playwright 选择器：页面上出现「数字+学时/小时」即认为学时数据已绑定
+_HOURS_VALUE_SELECTOR = r"text=/[0-9]+(?:\.[0-9]+)?\s*(?:学时|小时)/"
+
+# 页面内取数：返回 {"central": float|None, "online": float|None, "debug": {...}}
+# __XXX__ 占位符由下方 json.dumps 注入，保证 JS 与 Python 用同一份标签常量。
+_STUDY_HOURS_DOM_JS_TEMPLATE = r"""
+() => {
+  const ROW_LABELS = __ROW_LABELS__;
+  const PREV_ROW_LABELS = __PREV_ROW_LABELS__;
+  const ROW_END_LABELS = __ROW_END_LABELS__;
+  const CENTRAL_LABEL = __CENTRAL_LABEL__;
+  const ONLINE_LABEL = __ONLINE_LABEL__;
+  const norm = (s) => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const VALUE_RE = /^([0-9]{1,7}(?:\.[0-9]{1,3})?)\s*(学时|小时)?\s*[>›»→]?$/;
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return {x: r.left + r.width / 2, y: r.top + r.height / 2, top: r.top, bottom: r.bottom,
+            left: r.left, right: r.right, w: r.width, h: r.height};
+  };
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const st = window.getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none' && parseFloat(st.opacity || '1') > 0.05;
+  };
+  const nodes = Array.from(document.querySelectorAll('body *'));
+  const texts = nodes.map((el) => norm(el.textContent));
+  // 标签允许带极短后缀（如「今年已训 ›」），但不能是整行拼接文本
+  const isLabel = (text, label) => text === label
+      || (text.length > label.length && text.length <= label.length + 2
+          && text.indexOf(label) === 0);
+  const pickLabel = (label, aboveY) => {
+    let best = null;
+    for (let i = 0; i < nodes.length; i++) {
+      if (!isLabel(texts[i], label)) continue;
+      if (!visible(nodes[i])) continue;
+      const c = rect(nodes[i]);
+      if (aboveY !== undefined && aboveY !== null && c.y >= aboveY) continue;
+      // 同名嵌套节点取最靠下的那个（离目标行最近）
+      if (!best || c.y > best.y) best = c;
+    }
+    return best;
+  };
+  const out = {central: null, online: null, debug: {}};
+  // 1) 行标签 今年已训
+  let rowLabel = null;
+  for (const name of ROW_LABELS) {
+    rowLabel = pickLabel(name, null);
+    if (rowLabel) { out.debug.row = name; break; }
+  }
+  if (!rowLabel) { out.debug.error = 'no-row-label'; return out; }
+  // 2) 列头：位于行标签上方、离得最近的一组
+  const centralHeader = pickLabel(CENTRAL_LABEL, rowLabel.y);
+  const onlineHeader = pickLabel(ONLINE_LABEL, rowLabel.y);
+  if (!centralHeader || !onlineHeader) { out.debug.error = 'no-column-header'; return out; }
+  // 3) 行范围：上边界取「上一行标签」与 今年已训 的中点（避免吃进上一行的数值），
+  //    下边界取下一行标签（完成进度…）的顶边。
+  let prevLabelY = null;
+  for (const name of PREV_ROW_LABELS) {
+    for (let i = 0; i < nodes.length; i++) {
+      if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
+      const c = rect(nodes[i]);
+      if (c.y >= rowLabel.y - 4) continue;
+      if (prevLabelY === null || c.y > prevLabelY) prevLabelY = c.y;
+    }
+  }
+  const halfRow = rowLabel.h / 2;
+  let rowTop = prevLabelY === null
+      ? rowLabel.y - Math.max(halfRow, 8)
+      : Math.max((prevLabelY + rowLabel.y) / 2, rowLabel.y - halfRow - 4);
+  let rowBottom = rowLabel.bottom + 140;
+  for (const name of ROW_END_LABELS) {
+    let below = null;
+    for (let i = 0; i < nodes.length; i++) {
+      if (!isLabel(texts[i], name) || !visible(nodes[i])) continue;
+      const c = rect(nodes[i]);
+      if (c.y <= rowLabel.y + 4) continue;
+      if (!below || c.y < below.y) below = c;
+    }
+    if (below) { rowBottom = Math.min(rowBottom, below.top); break; }
+  }
+  // 4) 行内数值节点（整段文本就是一个数字[+学时]）
+  const values = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const t = texts[i];
+    if (!t) continue;
+    const m = VALUE_RE.exec(t);
+    if (!m) continue;
+    if (!visible(nodes[i])) continue;
+    const c = rect(nodes[i]);
+    if (c.y < rowTop || c.y > rowBottom) continue;
+    const num = parseFloat(m[1]);
+    if (!isFinite(num)) continue;
+    values.push({num: num, unit: !!m[2], x: c.x, y: c.y, text: t, area: c.w * c.h});
+  }
+  out.debug.rowTop = Math.round(rowTop);
+  out.debug.rowBottom = Math.round(rowBottom);
+  out.debug.candidates = values.map((v) => ({t: v.text, x: Math.round(v.x), y: Math.round(v.y)}));
+  out.debug.headers = {central: Math.round(centralHeader.x), online: Math.round(onlineHeader.x)};
+  // 5) 按列归属；同列优先「带学时单位」、其次离本行中线最近、再其次面积最小
+  const pickColumn = (header, other) => {
+    const pool = values.filter((v) => Math.abs(v.x - header.x) <= Math.abs(v.x - other.x));
+    if (!pool.length) return null;
+    pool.sort((a, b) => (b.unit - a.unit)
+        || (Math.abs(a.y - rowLabel.y) - Math.abs(b.y - rowLabel.y))
+        || (a.area - b.area));
+    return pool[0];
+  };
+  const c = pickColumn(centralHeader, onlineHeader);
+  const o = pickColumn(onlineHeader, centralHeader);
+  if (c) out.central = c.num;
+  if (o) out.online = o.num;
+  out.debug.picked = {central: c ? c.text : null, online: o ? o.text : null};
+  return out;
+}
+"""
+
+
+def _render_study_hours_dom_js() -> str:
+    """把 Python 侧的标签常量注入 JS 模板（json.dumps 保证转义安全）。"""
+    js = _STUDY_HOURS_DOM_JS_TEMPLATE
+    replacements = {
+        "__ROW_LABELS__": list(STUDY_HOURS_ROW_LABELS),
+        "__PREV_ROW_LABELS__": list(STUDY_HOURS_PREV_ROW_LABELS),
+        "__ROW_END_LABELS__": list(STUDY_HOURS_ROW_END_LABELS),
+        "__CENTRAL_LABEL__": STUDY_HOURS_CENTRAL_LABEL,
+        "__ONLINE_LABEL__": STUDY_HOURS_ONLINE_LABEL,
+    }
+    for placeholder, value in replacements.items():
+        js = js.replace(placeholder, json.dumps(value, ensure_ascii=False))
+    return js
+
+
+_STUDY_HOURS_DOM_JS = _render_study_hours_dom_js()
+
+
+def _hours_region_text(text: str) -> str:
+    """截取「今年已训」所在行的文本区域（到下一行标签为止）。"""
+    if not text:
+        return ""
+    start, start_len = -1, 0
+    for label in STUDY_HOURS_ROW_LABELS:
+        idx = text.find(label)
+        if idx >= 0 and (start < 0 or idx < start):
+            start, start_len = idx, len(label)
+    if start < 0:
+        return ""
+    region = text[start + start_len:]
+    end = len(region)
+    for label in STUDY_HOURS_TEXT_END_LABELS:
+        idx = region.find(label)
+        if idx >= 0:
+            end = min(end, idx)
+    return region[:end]
+
+
+def _hours_candidates(region: str) -> list:
+    """把区域文本拆成候选学时，按出现顺序返回 [(score, value)]。
+
+    评分（越高越可信）：
+      3 = 整行只有「数字(+学时)(+箭头)」
+      2 = 整行不含中文（纯数值行）
+      1 = 数字出现在本行中文之前（如「848.05学时 2023年以来…」）
+      0 = 数字前面已经有中文（说明文字，如「2023年以来已学习848.05学时」）→ 丢弃
+    """
+    out = []
+    for raw_line in region.splitlines():
+        line = raw_line.replace('\u00a0', ' ')
+        if not line.strip():
+            continue
+        m = _HOURS_STRICT_LINE_RE.match(line)
+        if m:
+            try:
+                out.append((3, float(m.group(1))))
+            except ValueError:
+                pass
+            continue
+        has_cjk = bool(_HOURS_CJK_RE.search(line))
+        if not has_cjk:
+            for m in _HOURS_TOKEN_RE.finditer(line):
+                try:
+                    out.append((2, float(m.group(1))))
+                except ValueError:
+                    pass
+            continue
+        for m in _HOURS_TOKEN_RE.finditer(line):
+            prefix = line[:m.start()]
+            # 数字紧跟在中文/说明文字后面 → 说明句，不算学时
+            if _HOURS_CJK_RE.search(prefix):
+                continue
+            try:
+                out.append((1, float(m.group(1))))
+            except ValueError:
+                pass
+    return out
+
+
+def parse_study_hours_text(text: str) -> Dict[str, Optional[float]]:
+    """从学习中心页面文本解析 集中培训 / 网络自学 学时（文本兜底层）。"""
+    result: Dict[str, Optional[float]] = {"central": None, "online": None}
+    if not text:
+        return result
+    region = _hours_region_text(text)
+    if region:
+        candidates = _hours_candidates(region)
+        debug(f"[今年已训]行候选: {candidates}")
+        values = [value for _score, value in candidates]
+        if values:
+            result["central"] = values[0]
+            if len(values) >= 2:
+                result["online"] = values[1]
+            return result
+        debug("学习中心[今年已训]行未解析出学时，退化为全文扫描")
+    # 兜底：没有行标签时按「应完成X, 应完成Y, 已训A, 已训B」的字段顺序取
+    full = [value for _score, value in _hours_candidates(text)]
+    debug(f"学时全文字段: {full}")
+    if len(full) >= 4:
+        result["central"], result["online"] = full[2], full[3]
+    elif len(full) >= 2:
+        result["central"], result["online"] = full[0], full[1]
+    elif len(full) == 1:
+        result["central"] = full[0]
+    return result
+
+
+def parse_study_hours_dom(dom: Optional[dict]) -> Dict[str, Optional[float]]:
+    """把页面 JS 的结构化解析结果规整成 {central, online}。"""
+    result: Dict[str, Optional[float]] = {"central": None, "online": None, "debug": None}
+    if not isinstance(dom, dict):
+        return result
+    result["debug"] = dom.get("debug")
+    for key in ("central", "online"):
+        raw = dom.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            result[key] = value
+    return result
+
+
+def resolve_study_hours(dom: Optional[dict], text: str) -> Dict[str, object]:
+    """合并 DOM 结构化解析与文本兜底解析，返回最终学时。"""
+    structured = parse_study_hours_dom(dom)
+    central, online = structured["central"], structured["online"]
+    had_dom = central is not None or online is not None
+    if central is not None and online is not None:
+        source = "dom"
+    else:
+        fallback = parse_study_hours_text(text)
+        if central is None:
+            central = fallback["central"]
+        if online is None:
+            online = fallback["online"]
+        source = "dom+text" if (had_dom and (central is not None or online is not None)) else "text"
+    central = 0.0 if central is None else float(central)
+    online = 0.0 if online is None else float(online)
+    return {"central": central, "online": online, "total": central + online,
+            "source": source, "debug": structured["debug"]}
 
 
 class AutoLearner:
@@ -4163,11 +4496,28 @@ class AutoLearner:
                 _close_after = True
             except Exception:
                 return {"central": 0, "online": 0, "total": 0}
+        dom_result = None
         try:
             await _page.goto("https://u.ccb.com/portal/#/studyCenter",
                            wait_until="domcontentloaded", timeout=20000)
-            await _page.wait_for_timeout(8000)
+            # 先等「今年已训」行标签出现，再等学时数值绑定完成，最后留一点稳定时间；
+            # 比固定 sleep 8s 更快，也避免数据未到位时把学时解析成 0。
+            try:
+                await _page.wait_for_selector(
+                    f"text={STUDY_HOURS_ROW_LABELS[0]}", timeout=6000)
+            except Exception:
+                pass
+            try:
+                await _page.wait_for_selector(_HOURS_VALUE_SELECTOR, timeout=6000)
+            except Exception:
+                pass
+            await _page.wait_for_timeout(700)
             text = await _page.locator("body").inner_text(timeout=5000)
+            # DOM 结构化解析必须在页面关闭前完成
+            try:
+                dom_result = await _page.evaluate(_STUDY_HOURS_DOM_JS)
+            except Exception as _dex:
+                debug(f"学习中心结构化解析失败: {_dex}")
         except Exception as _ex:
             debug(f"学习中心加载失败: {_ex}")
             if _close_after:
@@ -4182,33 +4532,20 @@ class AutoLearner:
                     await _page.close()
                 except:
                     pass
-        
-        import re as _re
-        central = 0.0
-        online = 0.0
+
         debug(f"学习中心页面内容:\n{text[:600]}")
-        
-        # 方法1: 找"今年已训"文本并解析
-        if "今年已训" in text:
-            after = text.split("今年已训")[1]
-            if "完成进度" in after:
-                after = after.split("完成进度")[0]
-            nums = _re.findall(r'([\d.]+)\s*学时', after)
-            if len(nums) >= 1:
-                central = float(nums[0])
-            if len(nums) >= 2:
-                online = float(nums[1])
-        else:
-            # 方法2: 查找页面中的所有数字+学时
-            debug(f"学习中心未找到[今年已训]，检查页面文本")
-            nums = _re.findall(r'([\d.]+)\s*学时', text)
-            debug(f"找到学时数字: {nums}")
-            if len(nums) >= 4:
-                # 格式: 应完成X学时, 应完成Y学时, 已训A学时, 已训B学时
-                central = float(nums[2]) if len(nums) > 2 else 0
-                online = float(nums[3]) if len(nums) > 3 else 0
-        
-        debug(f"学时解析: 集中培训={central}, 网络自学={online}")
+
+        # 优先 DOM 结构化解析（按行/列归属，能区分单元格里的说明文字），
+        # 缺失的列再用文本兜底解析补齐。
+        result = resolve_study_hours(dom_result, text)
+        if isinstance(dom_result, dict):
+            _dbg = dom_result.get("debug")
+            if _dbg:
+                debug(f"学时DOM解析: {_dbg}")
+
+        central = float(result["central"])
+        online = float(result["online"])
+        debug(f"学时解析({result['source']}): 集中培训={central}, 网络自学={online}")
         return {"central": central, "online": online, "total": central + online}
 
     async def _course_mode(self, page: Page):
@@ -4471,14 +4808,92 @@ class AutoLearner:
         debug(f"{tag}phase=list_unavailable; {_page_debug_state(page)}")
         return False
 
-    async def _advance_online_course_page(self, page: Page, list_url: str,
-                                          current_page: int) -> Optional[bool]:
-        """Advance the online-course list using visible controls or its SPA route.
+    @staticmethod
+    def _route_page_index(url: str) -> Optional[int]:
+        """从 /course/#/list/N 这类 hash 路由里取当前页码。"""
+        try:
+            match = re.search(r"/list/(\d+)", urlsplit(url or "").fragment)
+        except Exception:
+            return None
+        return int(match.group(1)) if match else None
 
-        Returns True when navigation was initiated, False only when the next
-        page is explicitly disabled/absent on a recognized list route, and
-        None when pagination is temporarily unavailable or unrecognized.
+    async def _online_course_page_signature(self, page: Page) -> dict:
+        """读取列表页签名：{route, indicator, cards, cards_set}。
+
+        卡片指纹优先用页面内一次性 evaluate 取，省掉逐卡片往返；页面对象不支持
+        evaluate（或读取失败）时退化为只看路由页码。
         """
+        signature = {"route": None, "indicator": None, "cards": None, "cards_set": None}
+        evaluate = getattr(page, "evaluate", None)
+        if callable(evaluate):
+            try:
+                state = await evaluate(ONLINE_COURSE_PAGE_STATE_JS,
+                                       ONLINE_COURSE_LIST_CARD_SELECTOR)
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                signature["indicator"] = state.get("pager")
+                signature["cards"] = state.get("raw")
+                signature["cards_set"] = state.get("set")
+                signature["route"] = state.get("route")
+        if not isinstance(signature["route"], int):
+            signature["route"] = self._route_page_index(_page_url(page))
+        return signature
+
+    async def _wait_online_course_page_change(self, page: Page, before: dict, *,
+                                              timeout_ms: Optional[int] = None,
+                                              keys: tuple = ("cards_set", "indicator")) -> Optional[dict]:
+        """轮询等待换页生效；超时未变化返回 None。
+
+        默认不看路由：点击「下一页」时 hash 往往立刻变，但卡片是之后才渲染的，
+        拿路由当成功依据会采到上一页的旧 DOM（这正是翻页不稳定的来源）。
+        """
+        budget_ms = ONLINE_PAGE_CHANGE_TIMEOUT_MS if timeout_ms is None else timeout_ms
+        deadline = time.monotonic() + max(0.05, budget_ms / 1000.0)
+        delay_ms = 350
+        while True:
+            after = await self._online_course_page_signature(page)
+            for key in keys:
+                old, new = before.get(key), after.get(key)
+                if old is not None and new is not None and old != new:
+                    return after
+            if time.monotonic() >= deadline:
+                return None
+            try:
+                await page.wait_for_timeout(delay_ms)
+            except Exception:
+                return None
+            delay_ms = min(int(delay_ms * 1.6), 1500)
+
+    async def _settled_route_page(self, page: Page, expected: Optional[int],
+                                  attempts: int = 3,
+                                  delay_ms: int = ONLINE_PAGE_SETTLE_DELAY_MS) -> Optional[int]:
+        """读取落地路由页码；命中 expected 时再多确认几次，防止越界被夹回。"""
+        landed = None
+        for index in range(max(1, attempts)):
+            if index:
+                try:
+                    await page.wait_for_timeout(delay_ms)
+                except Exception:
+                    break
+            landed = self._route_page_index(_page_url(page))
+            if expected is not None and landed == expected:
+                continue
+            break
+        return landed
+
+    @staticmethod
+    def _observed_advanced_page(signature: dict, current_page: int) -> Optional[int]:
+        """只接受 current+1 这个观测值，避免异常页码把逻辑页码带偏。"""
+        for key in ("indicator", "route"):
+            value = signature.get(key)
+            if isinstance(value, int) and value == current_page + 1:
+                return value
+        return None
+
+    async def _online_course_next_controls(self, page: Page) -> tuple:
+        """收集可点击的「下一页」控件（按优先级），并标记是否见过明确禁用态。"""
+        found = []
         disabled_seen = False
         candidates = [
             (page.locator("[class*=page-next]"), False),
@@ -4505,43 +4920,131 @@ class AutoLearner:
                             or any(token in classes for token in ("page_disabled", "is-disabled", "disabled"))):
                         disabled_seen = True
                         continue
-                    await item.click(timeout=5000)
-                    try:
-                        await page.wait_for_timeout(3500)
-                    except Exception:
-                        pass
-                    debug(f"网络课程分页: 通过控件翻页 current={current_page}; label={label!r}; class={classes!r}")
-                    return True
+                    found.append((item, label, classes))
                 except Exception as exc:
-                    debug(f"网络课程分页控件不可用 current={current_page}; error={type(exc).__name__}: {_safe_debug_error(exc)}")
+                    debug(f"网络课程分页控件不可用; error={type(exc).__name__}: {_safe_debug_error(exc)}")
+        return found, disabled_seen
+
+    async def _advance_online_course_page_by_route(self, page: Page, list_url: str,
+                                                   current_page: int, before: dict) -> Optional[dict]:
+        """路由兜底：直接 goto /list/<N+1>，并用落地路由 + 卡片指纹双重校验。
+
+        先看落地路由（快，且能立刻识别「越界被夹回当前页」= 末页），
+        再在卡片可读时确认卡片真的换了 —— 路由前进不等于 SPA 渲染完了。
+        """
+        try:
+            parts = urlsplit(_page_url(page) or list_url)
+            match = re.match(r"^(.*?/list/)\d+$", parts.fragment.rstrip("/"))
+            if not match:
+                return None
+            next_page = current_page + 1
+            target = parts._replace(fragment=f"{match.group(1)}{next_page}").geturl()
+            await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+        except Exception as exc:
+            debug(f"网络课程分页路由兜底失败 current={current_page}; "
+                  f"error={type(exc).__name__}: {_safe_debug_error(exc)}")
+            return None
+
+        landed = await self._settled_route_page(page, expected=next_page)
+        if landed == current_page:
+            debug(f"网络课程分页: SPA 路由未前进，判定末页 current={current_page}")
+            return {"moved": False, "page": None, "reason": "route-last"}
+        if landed != next_page:
+            return None
+        if before.get("cards_set") is not None:
+            after = await self._wait_online_course_page_change(
+                page, before, timeout_ms=ONLINE_PAGE_ROUTE_TIMEOUT_MS,
+                keys=("cards_set",))
+            if after is None:
+                debug(f"网络课程分页: 路由已前进但卡片未变化，判定深链未生效 current={current_page}")
+                return None
+        debug(f"网络课程分页: 通过 SPA 路由翻页 current={current_page}; "
+              f"target={_safe_debug_url(target)}")
+        return {"moved": True, "page": next_page, "reason": "route"}
+
+    async def _advance_online_course_page_state(self, page: Page, list_url: str,
+                                                current_page: int) -> dict:
+        """翻到下一页并校验翻页真的生效。
+
+        moved=True  已确认换页（page 为观测到的页码，未知时为 None）
+        moved=False 确认没有下一页（控件禁用，或路由跳转被夹回当前页）
+        moved=None  暂时无法翻页（未识别入口/网络问题），稍后重试
+        """
+        before = await self._online_course_page_signature(page)
+        controls, disabled_seen = await self._online_course_next_controls(page)
+        clicked = 0
+        # 最多试 2 个候选控件：每个失败都要等一个校验窗口，避免卡太久
+        for item, label, classes in controls[:2]:
+            try:
+                await item.click(timeout=5000)
+            except Exception as exc:
+                debug(f"网络课程分页控件点击失败 current={current_page}; "
+                      f"error={type(exc).__name__}: {_safe_debug_error(exc)}")
+                continue
+            clicked += 1
+            after = await self._wait_online_course_page_change(page, before)
+            if after is not None:
+                debug(f"网络课程分页: 控件翻页已确认 current={current_page}; "
+                      f"label={label!r}; class={classes!r}")
+                return {"moved": True,
+                        "page": self._observed_advanced_page(after, current_page),
+                        "reason": "control"}
+            debug(f"网络课程分页: 控件点击后页面未变化 current={current_page}; label={label!r}")
+
+        if disabled_seen and not clicked:
+            # 「下一页」明确禁用就是末页，不必再白发一次路由跳转。
+            debug(f"网络课程分页: 下一页控件明确禁用 current={current_page}")
+            return {"moved": False, "page": None, "reason": "disabled"}
+
+        route_result = await self._advance_online_course_page_by_route(
+            page, list_url, current_page, before)
+        if route_result is not None:
+            return route_result
 
         if disabled_seen:
             debug(f"网络课程分页: 下一页控件明确禁用 current={current_page}")
-            return False
-
-        # The site route is usually /course/#/list/<page>. Use it as a fallback
-        # if its pagination markup changes or the next control is not exposed.
-        try:
-            parts = urlsplit(page.url or list_url)
-            route = parts.fragment.rstrip("/")
-            match = re.match(r"^(.*?/list/)\d+$", route)
-            if match:
-                next_page = current_page + 1
-                target = parts._replace(fragment=f"{match.group(1)}{next_page}").geturl()
-                await page.goto(target, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(3500)
-                landed_route = urlsplit(page.url).fragment.rstrip("/")
-                if re.search(rf"/list/{next_page}$", landed_route):
-                    debug(f"网络课程分页: 通过 SPA 路由翻页 current={current_page}; target={_safe_debug_url(target)}")
-                    return True
-                if re.search(rf"/list/{current_page}$", landed_route):
-                    debug(f"网络课程分页: SPA 路由未前进，判定末页 current={current_page}")
-                    return False
-        except Exception as exc:
-            debug(f"网络课程分页路由兜底失败 current={current_page}; error={type(exc).__name__}: {_safe_debug_error(exc)}")
-
+            return {"moved": False, "page": None, "reason": "disabled"}
+        if clicked:
+            # 控件点了没反应、路由也没能给出结论：不轻易判定末页，留给下一轮重试。
+            debug(f"网络课程分页: 控件点击未生效且路由无法判定 current={current_page}")
+            return {"moved": None, "page": None, "reason": "no-effect"}
         debug(f"网络课程分页: 未识别下一页控件 current={current_page}; url={_page_debug_state(page)}")
-        return None
+        return {"moved": None, "page": None, "reason": "no-control"}
+
+    async def _advance_online_course_page(self, page: Page, list_url: str,
+                                          current_page: int) -> Optional[bool]:
+        """兼容旧签名：只返回是否翻页成功（True/False/None）。"""
+        result = await self._advance_online_course_page_state(page, list_url, current_page)
+        return result.get("moved")
+
+    async def _goto_online_course_page(self, page: Page, list_url: str,
+                                       target_page: int, *,
+                                       timeout_ms: int = ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS) -> bool:
+        """直接用 /list/N 深链跳到目标页；落地路由与卡片都校验通过才返回 True。"""
+        if target_page <= 1:
+            return False
+        try:
+            parts = urlsplit(_page_url(page) or list_url)
+            match = re.match(r"^(.*?/list/)\d+$", parts.fragment.rstrip("/"))
+            if not match:
+                return False
+            if self._route_page_index(_page_url(page)) == target_page:
+                return await self._wait_online_course_cards(page, 3000)
+            target = parts._replace(fragment=f"{match.group(1)}{target_page}").geturl()
+            await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+        except Exception as exc:
+            debug(f"网络课程列表深链跳转失败 page={target_page}; "
+                  f"error={type(exc).__name__}: {_safe_debug_error(exc)}")
+            return False
+        landed = await self._settled_route_page(page, expected=target_page)
+        if landed != target_page:
+            debug(f"网络课程列表深链未落在目标页 page={target_page}; landed={landed}")
+            return False
+        if not await self._wait_online_course_cards(page, timeout_ms):
+            debug(f"网络课程列表深链后卡片未渲染 page={target_page}")
+            return False
+        debug(f"网络课程列表深链直达第 {target_page} 页")
+        return True
 
     async def _open_online_course_from_list(self, worker_page: Page, list_url: str,
                                             task: dict, worker_id: int = -1) -> Page:
@@ -4551,17 +5054,26 @@ class AutoLearner:
                   f"{_page_debug_state(worker_page)}")
             raise OnlineCourseListUnavailable("课程列表未加载")
 
-        for _ in range(task["page"] - 1):
-            try:
-                moved = await self._advance_online_course_page(worker_page, list_url, _ + 1)
-                if moved is not True:
-                    raise OnlineCourseListUnavailable("课程列表翻页入口不可用")
-                if not await self._wait_online_course_cards(worker_page, 12000):
-                    raise OnlineCourseListUnavailable("课程列表翻页后未加载")
-            except OnlineCourseListUnavailable:
-                raise
-            except Exception as exc:
-                raise OnlineCourseListUnavailable("课程列表翻页失败") from exc
+        target_page = int(task.get("page", 1) or 1)
+        if target_page > 1:
+            # 优先一次深链直达：顺序点击要翻 N-1 次，任何一次被 SPA 吞掉都会失败。
+            if not await self._goto_online_course_page(worker_page, list_url, target_page):
+                # 深链不可用：回到第 1 页再顺序翻页（列表地址可能与当前路由不同）。
+                if not await self._load_online_course_list(worker_page, list_url,
+                                                           worker_id=worker_id):
+                    raise OnlineCourseListUnavailable("课程列表未加载")
+                for _ in range(target_page - 1):
+                    try:
+                        result = await self._advance_online_course_page_state(
+                            worker_page, list_url, _ + 1)
+                        if result.get("moved") is not True:
+                            raise OnlineCourseListUnavailable("课程列表翻页入口不可用")
+                        if not await self._wait_online_course_cards(worker_page, 12000):
+                            raise OnlineCourseListUnavailable("课程列表翻页后未加载")
+                    except OnlineCourseListUnavailable:
+                        raise
+                    except Exception as exc:
+                        raise OnlineCourseListUnavailable("课程列表翻页失败") from exc
 
         links = worker_page.locator(ONLINE_COURSE_LIST_CARD_SELECTOR)
         count = await links.count()
@@ -4868,7 +5380,7 @@ class AutoLearner:
         if done_titles:
             _log(f"已有 {len(done_titles)} 门课程学过，将跳过", "blue")
         seen_titles = set()
-        seen_pages = set()
+        seen_pages = {}  # 逻辑页码 -> 该页已采集的卡片指纹
         page_num = 1
         no_more_pages = False
         retry_current_page = False
@@ -4915,13 +5427,14 @@ class AutoLearner:
                 if title:
                     cards_data.append({"title": title, "href": href, "index": i})
 
-            # 防止翻页点击未生效时重复扫描当前页。
+            # 同一逻辑页码的同一批卡片只算一次：先记下该页码采到的指纹。
+            # 翻页本身已由 _advance_online_course_page_state 校验，这里不再
+            # 用「内容没变」去判定翻页失败（那会把页码和实际页面搞散）。
             fingerprint = tuple((item["title"], item["href"]) for item in cards_data)
-            if fingerprint in seen_pages:
-                _log("课程列表翻页后内容未变化，稍后重试当前页", "yellow")
-                retry_current_page = True
+            if seen_pages.get(page_num) == fingerprint:
+                _log(f"课程列表第 {page_num} 页已采集过，跳过重复扫描", "blue")
                 return 0
-            seen_pages.add(fingerprint)
+            seen_pages[page_num] = fingerprint
 
             added = 0
             for item in cards_data:
@@ -4967,19 +5480,27 @@ class AutoLearner:
 
                 while not no_more_pages and not self._stop_event.is_set():
                     try:
-                        moved = await self._advance_online_course_page(page, list_url, page_num)
-                        if moved is False:
-                            no_more_pages = True
-                            _log(f"课程列表已到最后一页（第 {page_num} 页）", "blue")
-                            return 0
-                        if moved is None:
-                            _log(f"暂未识别第 {page_num} 页的下一页入口，稍后重试补课", "yellow")
-                            return 0
-                        page_num += 1
+                        result = await self._advance_online_course_page_state(
+                            page, list_url, page_num)
                     except Exception as e:
                         _log(f"翻到下一页失败，稍后重试: {e}", "yellow")
                         retry_current_page = True
                         return 0
+                    moved = result.get("moved")
+                    if moved is False:
+                        no_more_pages = True
+                        _log(f"课程列表已到最后一页（第 {page_num} 页）", "blue")
+                        return 0
+                    if moved is None:
+                        _log(f"暂未识别第 {page_num} 页的下一页入口，稍后重试补课", "yellow")
+                        return 0
+                    # 逻辑页码跟着观测结果走：只有确认翻页了才前进，
+                    # 观测到具体页码时以观测值为准，避免页码与实际页面错位。
+                    observed = result.get("page")
+                    if isinstance(observed, int) and observed > page_num:
+                        page_num = observed
+                    else:
+                        page_num += 1
 
                     added = await collect_current_page()
                     if added > 0:
