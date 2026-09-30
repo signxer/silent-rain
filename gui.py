@@ -4,6 +4,9 @@ import asyncio
 import json
 import os
 import re
+import shlex
+import subprocess
+import time
 import urllib.request
 import urllib.error
 import platform
@@ -550,37 +553,78 @@ def _ver_tuple(v):
     return tuple(parts)
 
 
-def _looks_like_executable(path) -> bool:
-    """粗略校验下载文件是否为可执行文件（PE/Mach-O 魔数）。
+_PE_MAGIC = b"MZ"
+_MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",   # 64 位
+                 b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",   # 32 位
+                 b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")   # universal
+_XAR_MAGIC = b"xar!"          # macOS .pkg 是 xar 归档
 
-    用于拦截 gh-proxy 等代理返回的错误页/截断文件被当作安装包
-    替换掉正在运行的程序（否则重启时报 PyInstaller
-    "Failed to start python interpreter"）。"""
+
+def _looks_like_installer(path) -> bool:
+    """校验下载文件是否为当前平台的有效安装包（拦代理错误页/截断文件）。
+
+    macOS 发布物现在是 .pkg —— 它是 xar 归档，魔数 `xar!`，既不是 PE 也不是
+    Mach-O。早期实现只认可执行文件魔数，于是 macOS 更新下载 100% 被判为
+    「非有效安装包」，这就是 macOS 无法自动更新的直接原因。
+    """
+    lowered = str(path).lower()
+    if lowered.endswith(".pkg"):
+        try:
+            with open(path, "rb") as f:
+                return f.read(4) == _XAR_MAGIC
+        except Exception:
+            return False
     try:
         with open(path, "rb") as f:
             head = f.read(4)
-        if sys.platform == "win32":
-            return head[:2] == b"MZ"  # PE 可执行文件
-        # macOS：Mach-O / universal binary 魔数
-        return head[:2] == b"MZ" or head in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
     except Exception:
         return False
+    if sys.platform == "win32":
+        return head[:2] == _PE_MAGIC
+    # macOS：Mach-O / universal binary；也允许 PE（历史上发布过 .exe 风格产物）
+    return head[:2] == _PE_MAGIC or head in _MACHO_MAGICS
+
+
+def _releases_json_candidates():
+    """更新清单的候选地址：加速节点优先、直连兜底，并带时间戳绕过缓存。
+
+    raw CDN 与 gh-proxy 都会缓存：刚发布新版本时，先到的可能还是旧副本。
+    带时间戳可以把缓存键打散，尽量拿到最新清单。
+    """
+    stamp = int(time.time())
+    ordered = with_gh_proxies(RELEASES_JSON_URL)
+    return [f"{u}{'&' if '?' in u else '?'}t={stamp}" for u in ordered]
+
+
+def fetch_releases_json(candidates=None, opener=None):
+    """拉取更新清单：遍历所有候选源，取版本号最高的那一份。
+
+    只取「第一个成功响应」是不够的——加速节点/raw CDN 可能返回旧缓存，
+    于是刚发布的版本反而被判成「已是最新」。这里所有源都问一遍再比版本。
+    """
+    candidates = _releases_json_candidates() if candidates is None else candidates
+    opener = opener or (lambda url: urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "Moisten"}), timeout=8))
+    best, best_ver = None, ()
+    for url in candidates:
+        try:
+            with opener(url) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        version = _ver_tuple(str(data.get("tag", "")).lstrip("v"))
+        if best is None or version > best_ver:
+            best, best_ver = data, version
+    return best
 
 
 def check_for_update():
     """检查是否有新版本，返回 (最新版本号, 是否需要更新, 更新日志, 下载URL)"""
-    data = None
-    # 加速节点优先，不通再退回 GitHub 直连
-    for url in with_gh_proxies(RELEASES_JSON_URL):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Moisten"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-                break
-        except:
-            continue
+    data = fetch_releases_json()
     if data:
-        latest = data.get("tag", "").lstrip("v")
+        latest = str(data.get("tag", "")).lstrip("v")
         notes = data.get("notes", "")
         download_urls = {}
         for asset in data.get("assets", []):
@@ -592,6 +636,66 @@ def check_for_update():
         if latest and _ver_tuple(latest) > _ver_tuple(CURRENT_VERSION):
             return latest, True, notes, download_urls
     return CURRENT_VERSION, False, "", {}
+
+
+# ─── macOS .pkg 自动更新 ───────────────────────────────────────────
+# macOS 发布物是 .pkg（pkgbuild 打的 xar 归档），安装到 /Applications 需要 root。
+# 所以更新流程是：下载 .pkg → 用 installer(8) 通过系统授权对话框安装 →
+# 等本进程退出后 open 新装的 .app。用户只点一次「立即更新」+ 输一次密码。
+
+MACOS_APP_INSTALL_PATH = "/Applications/Moisten.app"
+MACOS_INSTALLER = "/usr/sbin/installer"
+MACOS_OSASCRIPT = "/usr/bin/osascript"
+
+
+def _applescript_string(text: str) -> str:
+    """转义成 AppleScript 字符串字面量（AppleScript 不支持 \\uXXXX）。"""
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _macos_app_bundle():
+    """当前运行的 .app 路径；非打包运行（python gui.py）返回 None。"""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = os.path.abspath(sys.executable)
+    # <X>.app/Contents/MacOS/Moisten → <X>.app
+    bundle = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
+    return bundle if bundle.endswith(".app") else None
+
+
+def _install_macos_pkg(pkg_path, runner=None) -> bool:
+    """用 installer(8) 安装 .pkg，经 osascript 申请管理员权限。
+
+    `with administrator privileges` 会弹出系统原生授权框；安装完成才返回，
+    因此可以据此判断成功与否并在失败时退回手动安装。
+    """
+    runner = runner or subprocess.run
+    command = f"{MACOS_INSTALLER} -pkg {shlex.quote(str(pkg_path))} -target /"
+    script = f"do shell script {_applescript_string(command)} with administrator privileges"
+    try:
+        proc = runner([MACOS_OSASCRIPT, "-e", script],
+                      capture_output=True, text=True, timeout=900)
+    except Exception:
+        return False
+    return getattr(proc, "returncode", 1) == 0
+
+
+def _schedule_macos_relaunch(app_path, pid=None, popen=None) -> None:
+    """等当前进程退出后再打开新版 .app。
+
+    直接 open 会让新旧两个实例同时运行（抢同一份会话/浏览器），所以交给一个
+    脱离的 shell 等 PID 消失后再启动；最多等 60 秒，避免脚本永久驻留。
+    """
+    popen = popen or subprocess.Popen
+    pid = os.getpid() if pid is None else pid
+    script = (
+        f"for _ in $(seq 1 60); do kill -0 {int(pid)} 2>/dev/null || break; sleep 0.5; done; "
+        f"/usr/bin/open -n {shlex.quote(str(app_path))}"
+    )
+    try:
+        popen(["/bin/sh", "-c", script], start_new_session=True)
+    except Exception:
+        pass
 
 
 # ─── Welcome Screen（首启体验）────────────────────────────────────
@@ -4593,7 +4697,7 @@ class MainWindow(_BaseWindow):
                             # 完整性校验：拦截代理错误页/截断文件
                             if total > 0 and downloaded != total:
                                 raise RuntimeError(f"下载不完整（{downloaded}/{total} 字节），已中止")
-                            if not _looks_like_executable(download_path):
+                            if not _looks_like_installer(download_path):
                                 raise RuntimeError("下载文件校验失败（非有效安装包，下载源可能返回了错误页）")
                             ok = True
                             break
@@ -4755,12 +4859,7 @@ del "%~f0"
             QTimer.singleShot(500, QApplication.instance().quit)
 
         elif _plat.system() == "Darwin":
-            # macOS 发布物是 .dmg，不能直接覆盖二进制（会导致应用损坏），
-            # 打开下载页由用户手动替换 .app
-            import webbrowser
-            webbrowser.open(DOWNLOAD_URL)
-            InfoBar.info("更新", "请下载新版本 DMG 并手动替换应用", parent=self, position=InfoBarPosition.TOP)
-            self._update_in_progress = False
+            self._launch_macos_update(download_path)
         else:
             # 源码运行，打开下载目录
             try:
@@ -4768,6 +4867,51 @@ del "%~f0"
             except Exception:
                 pass
             self._update_in_progress = False
+
+    def _launch_macos_update(self, download_path):
+        """macOS 自动更新：安装 .pkg → 等退出后打开新装的 .app。
+
+        .pkg 是 xar 归档，不能像 Windows 那样直接覆盖二进制；由 installer(8)
+        安装到 /Applications 才是正路。源码运行或产物不是 .pkg 时退回手动安装。
+        """
+        if not str(download_path).lower().endswith(".pkg"):
+            InfoBar.warning("需要手动安装", "当前产物不是 .pkg 安装包，请到下载页获取最新版本",
+                            parent=self, position=InfoBarPosition.TOP)
+            self._update_in_progress = False
+            return
+        if _macos_app_bundle() is None:
+            # 源码/非打包运行：没有可替换的 .app，交给用户自己装
+            try:
+                subprocess.Popen(["/usr/bin/open", download_path])
+            except Exception:
+                pass
+            InfoBar.info("更新", "已打开安装包，请按提示完成安装",
+                         parent=self, position=InfoBarPosition.TOP)
+            self._update_in_progress = False
+            return
+
+        self._set_update_status("正在安装新版本（需要管理员授权）…")
+        if _install_macos_pkg(download_path):
+            InfoBar.success("更新完成", "正在重启新版本…", parent=self,
+                            position=InfoBarPosition.TOP)
+            # .pkg 固定装到 /Applications；用户若从别处（下载目录/AppTranslocation）
+            # 启动，也要重启新装的那份，否则重启后还是旧版本。
+            installed = MACOS_APP_INSTALL_PATH
+            target_app = installed if os.path.isdir(installed) else (
+                _macos_app_bundle() or installed)
+            # 安装已落盘：等本进程退出后再启动，避免新旧两个实例同时运行
+            _schedule_macos_relaunch(target_app)
+            QTimer.singleShot(500, QApplication.instance().quit)
+            return
+
+        # 授权被取消或安装失败：用系统安装器打开，让用户手动完成
+        InfoBar.warning("需要手动完成安装", "已打开安装包，请按提示完成安装",
+                        parent=self, position=InfoBarPosition.TOP)
+        try:
+            subprocess.Popen(["/usr/bin/open", download_path])
+        except Exception:
+            pass
+        self._update_in_progress = False
 
     def _load_saved_config(self):
         """加载保存的配置，返回是否有完整配置"""
