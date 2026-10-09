@@ -59,7 +59,10 @@ class FakeAnchor:
     async def click(self, timeout=None):
         self.page.clicks += 1
         if self.spec.get("popup"):
-            self.page.pending_popup = PopupPage(self.spec["popup"])
+            self.page.pending_popup = PopupPage(
+                self.spec["popup"],
+                nav_ticks=int(self.spec.get("popup_nav_ticks") or 0),
+                requests=self.spec.get("popup_requests") or ())
         elif self.spec.get("same_tab"):
             self.page.schedule_route(self.spec["same_tab"])
 
@@ -106,12 +109,35 @@ class _GateLocator:
 
 
 class PopupPage:
-    def __init__(self, url):
-        self.url = url
+    """频道卡片 window.open 出来的弹窗：先 about:blank，随后才落到真地址。"""
+
+    def __init__(self, url, nav_ticks=0, requests=()):
+        self.target = url
+        self.url = "about:blank" if nav_ticks > 0 else url
+        self.nav_ticks = nav_ticks
+        self.pending_requests = list(requests)
+        self.listeners = []
         self.closed = False
 
     async def wait_for_load_state(self, state=None, timeout=None):
         return None
+
+    async def wait_for_timeout(self, ms):
+        if self.pending_requests and self.listeners:
+            url = self.pending_requests.pop(0)
+            for handler in list(self.listeners):
+                handler(SimpleNamespace(url=url))
+        if self.nav_ticks > 0:
+            self.nav_ticks -= 1
+            if self.nav_ticks == 0:
+                self.url = self.target
+
+    def on(self, event, handler):
+        self.listeners.append(handler)
+
+    def remove_listener(self, event, handler):
+        if handler in self.listeners:
+            self.listeners.remove(handler)
 
     async def close(self):
         self.closed = True
@@ -838,6 +864,54 @@ class ChannelReadinessTests(unittest.TestCase):
             self._collect(page)
         from main import AutoLearner as _AL
         self.assertTrue(any("频道页采集到 1 个专题班" in m for m in self.logs), self.logs)
+
+
+class PopupNavigationTests(unittest.TestCase):
+    """频道卡片的弹窗先开成 about:blank：必须等它落到真地址，否则一律判空。"""
+
+    def setUp(self):
+        patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.CHANNEL_POPUP_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.CHANNEL_POPUP_NAV_MS", 600)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        return asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": None))
+
+    def test_popup_url_is_waited_until_navigated(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "《习近平关于中国式现代化论述》",
+             "href": "javascript:void(0)", "popup": DETAIL_A, "popup_nav_ticks": 2},
+        ])
+        self.assertEqual(self._collect(page), [WS_A])
+
+    def test_blank_popup_without_navigation_is_a_miss(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "《习近平关于中国式现代化论述》",
+             "href": "javascript:void(0)", "popup": "about:blank", "popup_nav_ticks": 999},
+        ])
+        self.assertEqual(self._collect(page), [])
+
+    def test_popup_requests_can_supply_the_id(self):
+        """弹窗地址始终是空的，但它请求了详情接口——从请求里取 ID。"""
+        page = FakeChannelPage(anchors=[
+            {"label": "《习近平关于中国式现代化论述》",
+             "href": "javascript:void(0)", "popup": "about:blank", "popup_nav_ticks": 999,
+             "popup_requests": [f"https://api.u.ccb.com/v1/workshop/detail?id={WS_D}"]},
+        ])
+        self.assertEqual(self._collect(page), [WS_D])
 
 
 if __name__ == "__main__":

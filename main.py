@@ -235,16 +235,23 @@ ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS = 8000   # 深链跳页后等卡片渲染
 # 频道页点击后的等待预算（毫秒）。弹窗要短：卡片多数是同标签页跳转，
 # 等满超时会让每次落空都很贵（实测 6 次落空耗了 87 秒）。
 CHANNEL_POPUP_WAIT_MS = 2500
+# 频道卡片点开后，弹窗先落在 about:blank，真正地址是随后跳转过去的；
+# 立刻读只会拿到空地址（实测 id=- → "#"），所以还要等它落到真地址。
+CHANNEL_POPUP_NAV_MS = 8000
 
 # 频道页常见的"遮挡层"：文明公约/须知需要先点同意才会显示内容
 CHANNEL_GATE_TEXTS = ("同意", "我同意", "接受", "我知道了", "继续访问")
 # 判定"还停在登录/公约页"的特征词
 CHANNEL_LOGIN_HINTS = ("密码登录", "短信登录", "获取验证码", "验证码登录",
                        "账号登录", "立即登录", "文明公约")
-# 点击兜底时跳过这些明显不是课程入口的链接（协议/隐私/导航/工具）
-CHANNEL_NON_CONTENT_LABEL = re.compile(
-    r"协议|隐私|免责|公约|声明|版权|取消|同意|登录|注册|验证码|下载|浏览器|"
-    r"首页|返回|退出|更多|全部|帮助|客服|关于|设置|收藏|分享|刷新")
+# 点击兜底时跳过明显不是内容入口的链接。
+# 注意：工具类链接都是短文案，而内容标题可能很长且天然带「关于」这类词
+# （实测「《习近平关于中国式现代化论述》」差点被当成"关于我们"跳过），
+# 所以这里只对「短文案」做工具词匹配，长标题一律不当成工具链接。
+CHANNEL_SHORT_UTILITY_LABEL = re.compile(
+    r"首页|返回|退出|更多|全部|帮助|客服|设置|收藏|分享|刷新|登录|注册|"
+    r"验证码|下载|浏览器|导航|取消|同意")
+CHANNEL_DOC_LABEL = re.compile(r"《(?:用户服务协议|隐私政策|免责声明|版权声明)》")
 CHANNEL_DETAIL_WAIT_MS = 4000
 
 # 列表页可观测状态：卡片指纹 + 分页器高亮页码 + 路由页码。
@@ -7240,6 +7247,19 @@ class AutoLearner:
         return found
 
     @staticmethod
+    def _is_non_content_label(label: str) -> bool:
+        """协议/导航/工具类链接：点了也不是内容入口。"""
+        label = (label or "").strip()
+        if not label:
+            return False
+        if CHANNEL_DOC_LABEL.search(label):
+            return True
+        if label == "查看全部":
+            return True
+        # 长标题里出现「关于/全部」这类词是正常的，不按工具链接处理
+        return len(label) <= 8 and bool(CHANNEL_SHORT_UTILITY_LABEL.search(label))
+
+    @staticmethod
     def _looks_like_channel_card(href: str) -> bool:
         """频道页卡片入口的粗略特征：无 href、javascript:void(0) 或指向详情。"""
         href = (href or "").strip().lower()
@@ -7265,25 +7285,50 @@ class AutoLearner:
                 return url
             delay_ms = min(int(delay_ms * 1.5), 1000)
 
+    async def _wait_popup_url(self, popup, timeout_ms: Optional[int] = None) -> str:
+        """等弹窗落到真实地址（about:blank 不算）。
+
+        频道卡片是 window.open 出来的，刚拿到时还是 about:blank，
+        立刻读会得到空地址——这正是"点了却拿不到详情"的直接原因。
+        """
+        budget_ms = CHANNEL_POPUP_NAV_MS if timeout_ms is None else timeout_ms
+        deadline = time.monotonic() + max(0.2, budget_ms / 1000.0)
+        last = ""
+        while True:
+            url = _page_url(popup)
+            if url and not url.startswith("about:"):
+                return url
+            if url:
+                last = url
+            if time.monotonic() >= deadline:
+                return last
+            try:
+                await popup.wait_for_timeout(300)
+            except Exception:
+                return last
+
     async def _channel_open_detail(self, page: Page, clicker,
                                    captured: Optional[list] = None) -> str:
         """点击一个频道入口并返回落地地址；弹窗与同标签页跳转都支持。
 
-        captured 传入列表时，顺带记录点击期间发出的请求 URL —— 页面把 ID 藏在
-        组件状态里时，往往只有"点一下看它请求了什么"才能拿到。
+        captured 传入列表时，顺带记录点击期间发出的请求 URL（主页面与弹窗都听）——
+        页面把内容 ID 藏在组件状态里时，往往只有"点一下看它请求了什么"才能拿到。
         """
-        listener = None
-        if captured is not None and hasattr(page, "on"):
+        listeners = []
+        if captured is not None:
             def _on_request(request):
                 try:
                     captured.append(getattr(request, "url", ""))
                 except Exception:
                     pass
-            try:
-                page.on("request", _on_request)
-                listener = _on_request
-            except Exception:
-                listener = None
+
+            for target in (page,):
+                if hasattr(target, "on"):
+                    try:
+                        target.on("request", _on_request)
+                        listeners.append((target, _on_request))
+                    except Exception:
+                        pass
         popup = None
         try:
             try:
@@ -7291,11 +7336,18 @@ class AutoLearner:
                                              timeout=CHANNEL_POPUP_WAIT_MS) as popup_info:
                     await clicker()
                 popup = await popup_info.value
+                # 弹窗里的请求也要听：详情/文章内容多半是弹窗自己拉的
+                if captured is not None and hasattr(popup, "on"):
+                    try:
+                        popup.on("request", _on_request)
+                        listeners.append((popup, _on_request))
+                    except Exception:
+                        pass
                 try:
                     await popup.wait_for_load_state("domcontentloaded", timeout=15000)
                 except Exception:
                     pass
-                return _page_url(popup)
+                return await self._wait_popup_url(popup)
             except Exception:
                 # 同标签页打开：等路由真的变成 /detail 再读，避免拿到跳转前的地址
                 return await self._wait_channel_detail_url(page)
@@ -7305,11 +7357,12 @@ class AutoLearner:
                     await popup.close()
                 except Exception:
                     pass
-            if listener is not None and hasattr(page, "remove_listener"):
-                try:
-                    page.remove_listener("request", listener)
-                except Exception:
-                    pass
+            for target, handler in listeners:
+                if hasattr(target, "remove_listener"):
+                    try:
+                        target.remove_listener("request", handler)
+                    except Exception:
+                        pass
 
     async def _channel_harvest_workshops(self, page: Page, log_callback=None) -> List[str]:
         """不点击，直接从 DOM 里读专题班入口（href / data-* / onclick）。
@@ -7464,8 +7517,8 @@ class AutoLearner:
                 continue
             if len(label) <= 5 or label == "查看全部":
                 continue
-            if CHANNEL_NON_CONTENT_LABEL.search(label):
-                # 协议/隐私/登录这类链接点了也不是课程入口，别浪费时间
+            if self._is_non_content_label(label):
+                # 协议/隐私/导航这类链接点了也不是内容入口，别浪费时间
                 continue
             if not self._looks_like_channel_card(href):
                 continue
