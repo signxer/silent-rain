@@ -60,10 +60,12 @@ class FakeAnchor:
     async def click(self, timeout=None):
         self.page.clicks += 1
         if self.spec.get("popup"):
-            self.page.pending_popup = PopupPage(
+            self.page.events.append(("click", self.spec.get("label", "")))
+            self.page.pending_popup = self.page._track_popup(PopupPage(
                 self.spec["popup"],
                 nav_ticks=int(self.spec.get("popup_nav_ticks") or 0),
-                requests=self.spec.get("popup_requests") or ())
+                requests=self.spec.get("popup_requests") or (),
+                events=self.page.events))
         elif self.spec.get("same_tab"):
             self.page.schedule_route(self.spec["same_tab"])
 
@@ -112,8 +114,9 @@ class _GateLocator:
 class PopupPage:
     """频道卡片 window.open 出来的弹窗：先 about:blank，随后才落到真地址。"""
 
-    def __init__(self, url, nav_ticks=0, requests=()):
+    def __init__(self, url, nav_ticks=0, requests=(), events=None):
         self.target = url
+        self.events = events if events is not None else []
         self.url = "about:blank" if nav_ticks > 0 else url
         self.nav_ticks = nav_ticks
         self.pending_requests = list(requests)
@@ -124,6 +127,7 @@ class PopupPage:
         return None
 
     async def wait_for_timeout(self, ms):
+        self.events.append(("resolve", self.target))
         if self.pending_requests and self.listeners:
             url = self.pending_requests.pop(0)
             for handler in list(self.listeners):
@@ -193,6 +197,9 @@ class FakeChannelPage:
         self.request_listeners = []
         self.response_listeners = []
         self.page_data = []            # 组件状态里能直接读到的 {id,title}
+        self.content_candidates = None  # 页面上"像内容条目"的链接数（None=按锚点算）
+        self.events = []               # 点击/地址解析的先后顺序，用于验证并行
+        self.opened_popups = []
         self.responses = []            # 导航期间的内容接口响应
 
     # ── 路由 ──
@@ -237,6 +244,11 @@ class FakeChannelPage:
             return {"hasPwd": bool(self.login_form),
                     "userBox": bool(self.user_box),
                     "hasSms": bool(self.login_form)}
+        if "skip.test" in str(script):           # 内容候选数量脚本
+            if getattr(self, "content_candidates", None) is not None:
+                return self.content_candidates
+            return len([a for a in self.anchors
+                        if len(str(a.get("label", ""))) > 5])
         if "slice(0, 30)" in str(script):        # 链接清单 dump 脚本
             return list(getattr(self, "anchor_dump", []))
         if "__vueParentComponent" in str(script):    # 页面组件状态收割脚本
@@ -296,6 +308,10 @@ class FakeChannelPage:
 
     def is_closed(self):
         return False
+
+    def _track_popup(self, popup):
+        self.opened_popups.append(popup)
+        return popup
 
 
 _ID_PATTERN = (r"(?:[?&](?:id|workshopId|workshop_id)=|/detail/|/myworkshop/detail/)"
@@ -969,24 +985,29 @@ class ChannelFastHarvestTests(unittest.TestCase):
             {"label": "页面骨架", "href": "javascript:void(0);"}])
         page.page_data = [{"id": WS_A, "title": "《习近平关于中国式现代化论述》"},
                           {"id": WS_B, "title": "《伟大建党精神与国防和军队现代化》"}]
+        page.content_candidates = 2
         self.assertEqual(self._collect(page), [WS_A, WS_B])
         self.assertEqual(page.clicks, 0, "能直接读数据就不该逐张点击")
-        self.assertTrue(any("页面数据" in m for m in self.logs), self.logs)
+        self.assertTrue(any("快速通道" in m for m in self.logs), self.logs)
 
     def test_channel_id_is_excluded_from_page_data(self):
         page = FakeChannelPage(anchors=[
             {"label": "页面骨架", "href": "javascript:void(0);"}])
         page.page_data = [{"id": CHANNEL_ID, "title": "频道本体"},
                           {"id": WS_A, "title": "《某专题》"}]
+        page.content_candidates = 1
         self.assertEqual(self._collect(page), [WS_A])
 
     def test_response_harvest_is_used_when_page_data_is_empty(self):
         page = FakeChannelPage(anchors=[
             {"label": "页面骨架", "href": "javascript:void(0);"}])
+        many = ",".join('{"id":"%s"}' % f"1111111{i}-2222-3333-4444-555555555555"
+                        for i in range(6))
         page.responses = [_FakeResponse(
-            "https://api.u.ccb.com/v1/cu/getChannelContent",
-            '{"data":[{"id":"%s"},{"id":"%s"}]}' % (WS_A, WS_B))]
-        self.assertEqual(self._collect(page), [WS_A, WS_B])
+            "https://api.u.ccb.com/v1/cu/getChannelContent", '{"data":[%s]}' % many)]
+        page.content_candidates = 6
+        collected = self._collect(page)
+        self.assertEqual(len(collected), 6)
         self.assertEqual(page.clicks, 0)
 
     def test_page_data_wins_over_clicking_and_dedups(self):
@@ -994,6 +1015,7 @@ class ChannelFastHarvestTests(unittest.TestCase):
             {"label": "《某专题》", "href": DETAIL_A}])
         page.page_data = [{"id": WS_A, "title": "《某专题》"},
                           {"id": WS_A, "title": "《某专题》重复"}]
+        page.content_candidates = 1
         self.assertEqual(self._collect(page), [WS_A])
 
     def test_channel_id_from_url(self):
@@ -1050,6 +1072,120 @@ class PageDataScriptBrowserTests(unittest.TestCase):
         self.assertEqual(ids, sorted([WS_A, WS_B, CHANNEL_ID]))
         titles = {entry["id"]: entry["title"] for entry in out}
         self.assertIn("中国式现代化", titles[WS_A])
+
+
+class FastHarvestCompletenessTests(unittest.TestCase):
+    """快速通道必须"取全"才算数：实测它曾命中频道元数据只回 3 个 ID，
+    比逐张点击（24 个）还差。"""
+
+    def setUp(self):
+        for name, value in (("CHANNEL_DETAIL_WAIT_MS", 120),
+                            ("CHANNEL_POPUP_WAIT_MS", 120)):
+            patcher = patch(f"main.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        return asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
+
+    def _card(self, label, target):
+        return {"label": label, "href": "javascript:void(0)",
+                "popup": target, "popup_nav_ticks": 1}
+
+    def test_incomplete_fast_result_falls_back_to_clicking(self):
+        """找到 3 个但页面有 4 张卡片 → 不能就这么算了，要回退点击补全。"""
+        anchors = [self._card(f"《专题班第{i}期》", DETAIL_A.replace("11111111", f"0000000{i}"))
+                   for i in range(4)]
+        page = FakeChannelPage(anchors=anchors)
+        page.content_candidates = 4
+        page.page_data = [{"id": "11111111-2222-3333-4444-555555555555", "title": "a"},
+                          {"id": WS_B, "title": "b"},
+                          {"id": "99999999-2222-3333-4444-555555555555", "title": "c"}]
+        collected = self._collect(page)
+        self.assertEqual(len(collected), 4, "回退点击后应当补齐")
+        self.assertGreater(page.clicks, 0, "快速通道取不全时必须回退点击")
+        self.assertTrue(any("回退逐张点击补齐" in m for m in self.logs), self.logs)
+
+    def test_channel_metadata_response_is_rejected(self):
+        """channel/findById 只有 3 个 ID，低于门槛，不能拿来当内容列表。"""
+        page = FakeChannelPage(anchors=[
+            {"label": "页面骨架", "href": "javascript:void(0);"}])
+        page.content_candidates = 24
+        page.responses = [_FakeResponse(
+            "https://api.u.ccb.com/v1/channel/findById",
+            '{"data":{"id":"%s","collegeId":"%s","parentId":"%s"}}'
+            % (CHANNEL_ID, WS_A, WS_B))]
+        with patch("main.debug") as dbg:
+            collected = self._collect(page)
+        self.assertEqual(collected, [], "不该把频道元数据当成专题班")
+        joined = "\n".join(str(c.args[0]) for c in dbg.call_args_list if c.args)
+        self.assertIn("判定不可靠", joined, joined)
+
+    def test_richest_response_wins_over_the_first_one(self):
+        """先出现的响应只有 1 个 ID，真正的列表在后面 —— 要取最富的那条。"""
+        import asyncio as _asyncio
+        many = ",".join('{"id":"%s"}' % f"7777777{i}-2222-3333-4444-555555555555"
+                        for i in range(6))
+        responses = [
+            _FakeResponse("https://api.u.ccb.com/v1/channel/findById",
+                          '{"data":{"id":"%s"}}' % CHANNEL_ID),
+            _FakeResponse("https://api.u.ccb.com/v1/cu/getChannelContent",
+                          '{"data":[%s]}' % many),
+        ]
+        ids = _asyncio.run(self.learner._channel_harvest_from_responses(
+            responses, exclude_id=CHANNEL_ID, log_callback=lambda m, s="": None))
+        self.assertEqual(len(ids), 6)
+        self.assertNotIn(CHANNEL_ID, ids)
+
+
+class ClickParallelismTests(unittest.TestCase):
+    """24 张卡片串行等弹窗地址要 ~50 秒：必须"先点完、再统一并行解析"。"""
+
+    def setUp(self):
+        for name, value in (("CHANNEL_DETAIL_WAIT_MS", 120),
+                            ("CHANNEL_POPUP_WAIT_MS", 120)):
+            patcher = patch(f"main.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def test_all_clicks_happen_before_any_url_wait(self):
+        anchors = [{"label": f"《专题班第{i}期》", "href": "javascript:void(0)",
+                    "popup": DETAIL_A.replace("11111111", f"0000000{i}"),
+                    "popup_nav_ticks": 2} for i in range(3)]
+        page = FakeChannelPage(anchors=anchors)
+        ids = asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": None))
+        self.assertEqual(len(ids), 3)
+        kinds = [kind for kind, _ in page.events]
+        self.assertEqual(kinds[:3], ["click"] * 3, kinds)
+        self.assertNotIn("click", kinds[3:],
+                         "不能在两次点击之间串行等待地址：" + str(kinds))
+        self.assertEqual(len([k for k in kinds if k == "resolve"]), 6)
+
+    def test_popups_are_closed_afterwards(self):
+        anchors = [{"label": f"《专题班第{i}期》", "href": "javascript:void(0)",
+                    "popup": DETAIL_A.replace("11111111", f"0000000{i}"),
+                    "popup_nav_ticks": 1} for i in range(2)]
+        page = FakeChannelPage(anchors=anchors)
+        asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": None))
+        self.assertTrue(page.opened_popups, "应当记录弹窗以便关闭")
+        self.assertTrue(all(p.closed for p in page.opened_popups),
+                        "弹窗用完要关掉，否则越点越多")
 
 
 if __name__ == "__main__":

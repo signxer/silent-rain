@@ -242,6 +242,18 @@ CHANNEL_PAGE_DATA_JS = r"""
 }
 """
 
+# 频道页里"像内容条目"的链接数量，用来校验快速通道是否取全
+CHANNEL_CONTENT_COUNT_JS = r"""
+() => {
+  const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
+  const skip = /协议|隐私|免责|声明|公约|取消|同意/;
+  return Array.from(document.querySelectorAll('a')).filter((a) => {
+    const label = norm(a.innerText || a.textContent);
+    return label.length > 5 && !skip.test(label);
+  }).length;
+}
+"""
+
 # 收割一无所获时，把页面链接原样记下来：否则只能靠猜这个页面的链接长什么样。
 CHANNEL_ANCHOR_DUMP_JS = r"""
 () => {
@@ -284,6 +296,10 @@ CHANNEL_POPUP_WAIT_MS = 2500
 # 频道卡片点开后，弹窗先落在 about:blank，真正地址是随后跳转过去的；
 # 立刻读只会拿到空地址（实测 id=- → "#"），所以还要等它落到真地址。
 CHANNEL_POPUP_NAV_MS = 8000
+# 只等"弹窗事件"出现的时间（不等它导航到真地址）——导航统一放到最后并行等
+CHANNEL_POPUP_EVENT_MS = 1500
+# 点击兜底最多处理多少个候选入口
+CHANNEL_CLICK_LIMIT = 60
 
 # 频道页常见的"遮挡层"：文明公约/须知需要先点同意才会显示内容
 CHANNEL_GATE_TEXTS = ("同意", "我同意", "接受", "我知道了", "继续访问")
@@ -1146,6 +1162,23 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
   };
 }
 """
+
+
+def _uuids_from_json_text(text: str, exclude_id: str = "") -> List[str]:
+    """从接口返回的 JSON 文本里取内容 ID。
+
+    只看 id 类字段（id / dataStoreId / workshopId ...），不扫载荷里的任意 UUID——
+    否则频道名、图片名里的 UUID 都会被当成内容。
+    """
+    ids = []
+    seen = set()
+    for match in re.findall(r'"[A-Za-z]{0,20}[Ii]d"\s*:\s*"([0-9a-fA-F-]{36})"',
+                            text or ""):
+        if match == exclude_id or match in seen:
+            continue
+        seen.add(match)
+        ids.append(match)
+    return ids
 
 
 def _channel_id_from_url(channel_url: str) -> str:
@@ -7641,30 +7674,40 @@ class AutoLearner:
                 _log(f"  频道课程: {title[:42]}", "green")
         return ids
 
+    async def _channel_content_candidate_count(self, page: Page) -> int:
+        """页面上"像内容条目"的链接数，用来判断快速通道是否取全。"""
+        try:
+            return int(await page.evaluate(CHANNEL_CONTENT_COUNT_JS))
+        except Exception:
+            return 0
+
     async def _channel_harvest_from_responses(self, responses, exclude_id: str = "",
+                                              min_ids: int = 5,
                                               log_callback=None) -> List[str]:
-        """从页面自己请求的内容接口响应里取 ID（一次拿全，也不用点击）。"""
+        """从页面自己请求的内容接口响应里取 ID（一次拿全，也不用点击）。
+
+        关键：不能"碰到第一个含 UUID 的响应就用"——实测那样命中
+        /v1/channel/findById（频道自身元数据，只有 3 个 UUID），而真正的内容
+        列表在另一个接口里。这里扫完所有候选，取最富的那一条。
+        """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
-        ids = []
-        seen = set()
-        uuid_re = re.compile(
-            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-        for response in list(responses or [])[:12]:
+        best_ids, best_url = [], ""
+        for response in list(responses or [])[:20]:
             try:
                 body = await response.text()
             except Exception:
                 continue
-            for match in uuid_re.findall(body or ""):
-                if match in seen or match == exclude_id:
-                    continue
-                seen.add(match)
-                ids.append(match)
-            if ids:
-                debug(f"频道页内容接口命中: {_debug_url_shape(getattr(response, 'url', ''))}")
-                break
-        if ids:
-            _log(f"频道页从内容接口取到 {len(ids)} 个专题班", "green")
-        return ids
+            ids = _uuids_from_json_text(body, exclude_id)
+            if len(ids) > len(best_ids):
+                best_ids = ids
+                best_url = str(getattr(response, "url", "") or "")
+        if len(best_ids) < min_ids:
+            debug(f"内容接口最多只取到 {len(best_ids)} 个 ID（<{min_ids}），"
+                  f"判定不可靠，交给点击兜底")
+            return []
+        debug(f"频道页内容接口命中 {len(best_ids)} 个 ID: {_debug_url_shape(best_url)}")
+        _log(f"频道页从内容接口取到 {len(best_ids)} 个专题班", "green")
+        return best_ids
 
     async def _dump_channel_anchors(self, page: Page, log_callback=None) -> None:
         """收割不到 ID 时，把频道页链接原样记进日志。
@@ -7687,21 +7730,71 @@ class AutoLearner:
                   f"href={item.get('href')!r} attrs={item.get('attrs')!r}")
         _log(f"频道页 {len(anchors)} 个链接的属性已写入调试日志", "yellow")
 
+    def _attach_page_requests(self, page: Page, sink: List[str]):
+        """挂上请求监听，返回解绑函数（拿不到监听能力时返回 None）。"""
+        if not hasattr(page, "on"):
+            return None
+
+        def _on_request(request):
+            try:
+                sink.append(str(getattr(request, "url", "") or ""))
+            except Exception:
+                pass
+
+        try:
+            page.on("request", _on_request)
+        except Exception:
+            return None
+
+        def _detach():
+            if hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("request", _on_request)
+                except Exception:
+                    pass
+        return _detach
+
+    async def _click_collect_popup(self, page: Page, link, captured=None,
+                                   detachers=None):
+        """点一下，只等"弹窗出现"（不等它导航），返回弹窗对象或 None。
+
+        频道卡片是 window.open 出来的：真正贵的不是点击，而是等弹窗从
+        about:blank 跳到详情地址（每张约 2 秒）。这一步不等待，
+        所有弹窗的地址最后并行解析。
+
+        captured/detachers：弹窗里的请求也要记（详情接口多半是弹窗自己拉的）。
+        """
+        try:
+            async with page.expect_event("popup",
+                                         timeout=CHANNEL_POPUP_EVENT_MS) as popup_info:
+                await link.click(timeout=10000)
+            popup = await popup_info.value
+        except Exception:
+            return None
+        if captured is not None:
+            detach = self._attach_page_requests(popup, captured)
+            if detach is not None and detachers is not None:
+                detachers.append(detach)
+        return popup
+
     async def _channel_click_workshops(self, page: Page, channel_url: str,
                                        log_callback=None) -> List[str]:
-        """兜底：逐个点击频道入口，从落地地址里取专题班 ID。"""
+        """兜底：逐个点击频道入口，从落地地址里取专题班 ID。
+
+        点击"一下一张"，但**不等每张卡片的弹窗跳转**——24 张卡片串行等
+        24 次约 2 秒的跳转要 ~50 秒；改成点完统一并行解析地址。
+        """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        channel_id = _channel_id_from_url(channel_url)
         anchors = page.locator("a")
         try:
             total = await anchors.count()
         except Exception:
             return []
-        workshop_ids = []
-        seen = set()
-        consecutive_misses = 0
-        for index in range(min(total, 60)):
-            if self._stop_event.is_set():
-                break
+
+        # 点击前先筛出候选入口，别边点边判断
+        candidates = []
+        for index in range(min(total, CHANNEL_CLICK_LIMIT)):
             link = anchors.nth(index)
             try:
                 href = await link.get_attribute("href")
@@ -7715,51 +7808,76 @@ class AutoLearner:
                 continue
             if not self._looks_like_channel_card(href):
                 continue
-            detail_url = ""
-            captured = []
-            channel_id = channel_url.rstrip("/").rsplit("/", 1)[-1]
-            try:
-                detail_url = await self._channel_open_detail(
-                    page, lambda item=link: item.click(timeout=10000),
-                    captured=captured)
-                # 落在频道落地页时提取器会返回空（那里只有频道 ID），
-                # 已跳走则按各种形状取；都没取到就听点击期间请求了什么详情接口
-                workshop_id = self._channel_workshop_id_from_landing(
-                    detail_url, exclude_id=channel_id)
-                if not workshop_id:
-                    workshop_id = self._workshop_id_from_requests(
-                        captured, exclude_id=channel_id)
-                # 每次点击都留痕：不然"点了没反应"在日志里完全看不见
-                debug(f"频道页点击[{index}] label={label[:30]!r} "
-                      f"href={_debug_url_shape(href)} → {_debug_url_shape(detail_url)} "
-                      f"id={workshop_id or '-'} 请求{len(captured)}条")
-                if not workshop_id and captured:
-                    debug("  点击期间的请求: " + " | ".join(
-                        _debug_url_shape(u) for u in captured[:6]))
-                if workshop_id:
-                    consecutive_misses = 0
-                    if workshop_id not in seen:
-                        seen.add(workshop_id)
-                        workshop_ids.append(workshop_id)
-                        _log(f"  频道课程: {label[:42]}", "green")
-                else:
-                    # 点了没打开详情：多半是导航链接，连续多次没结果就收手
-                    consecutive_misses += 1
-                    if consecutive_misses >= 6:
-                        _log("频道页多次点击都未打开专题班详情，停止尝试", "yellow")
-                        break
-            except Exception as e:
-                _log(f"  读取频道课程失败: {label[:32]} - {e}", "yellow")
-            finally:
-                # 同标签页跳过之后要回到频道页，否则后续入口点不到
+            candidates.append((index, link, label, href))
+        if not candidates:
+            return []
+
+        captured: List[str] = []
+        detach = self._attach_page_requests(page, captured)
+        popup_detachers: List = []
+        opened = []      # [(index, label, href, popup)]
+        same_tab = []    # [(index, label, href, url)]
+        try:
+            for index, link, label, href in candidates:
+                if self._stop_event.is_set():
+                    break
+                popup = await self._click_collect_popup(
+                    page, link, captured, popup_detachers)
+                if popup is not None:
+                    opened.append((index, label, href, popup))
+                    continue
+                # 没有弹窗：可能是同标签页打开，也可能原地不动
+                detail_url = await self._wait_channel_detail_url(page)
+                same_tab.append((index, label, href, detail_url))
                 if _page_url(page) != channel_url:
                     try:
-                        await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
-                        await page.wait_for_function(
-                            "() => document.querySelectorAll('a').length > 2", timeout=15000)
-                    except Exception as e:
-                        _log(f"返回频道页失败，停止采集: {e}", "yellow")
-                        break
+                        await page.goto(channel_url, wait_until="domcontentloaded",
+                                        timeout=15000)
+                    except Exception:
+                        pass
+
+            # 并行等所有弹窗落到真地址（串行等就是原来 50 秒的来源）
+            resolved = list(same_tab)
+            if opened:
+                urls = await asyncio.gather(
+                    *[self._wait_popup_url(item[3]) for item in opened],
+                    return_exceptions=True)
+                for item, url in zip(opened, urls):
+                    resolved.append((item[0], item[1], item[2],
+                                     url if isinstance(url, str) else ""))
+        finally:
+            if detach is not None:
+                detach()
+            for popup_detach in popup_detachers:
+                popup_detach()
+            for _, _, _, popup in opened:
+                try:
+                    await popup.close()
+                except Exception:
+                    pass
+
+        workshop_ids: List[str] = []
+        seen = set()
+        for index, label, href, detail_url in sorted(resolved, key=lambda x: x[0]):
+            # 落在频道落地页时提取器会返回空（那里只有频道 ID），
+            # 已跳走则按各种形状取；都没取到就听点击期间请求了什么详情接口
+            workshop_id = self._channel_workshop_id_from_landing(
+                detail_url, exclude_id=channel_id)
+            if not workshop_id:
+                workshop_id = self._workshop_id_from_requests(
+                    captured, exclude_id=channel_id)
+            debug(f"频道页点击[{index}] label={label[:30]!r} "
+                  f"href={_debug_url_shape(href)} → {_debug_url_shape(detail_url)} "
+                  f"id={workshop_id or '-'} 请求{len(captured)}条")
+            if not workshop_id and captured:
+                debug("  点击期间的请求: " + " | ".join(
+                    _debug_url_shape(u) for u in captured[:6]))
+            if workshop_id and workshop_id not in seen:
+                seen.add(workshop_id)
+                workshop_ids.append(workshop_id)
+                _log(f"  频道课程: {label[:42]}", "green")
+        if not workshop_ids and candidates:
+            _log("频道页多次点击都未打开专题班详情，停止尝试", "yellow")
         return workshop_ids
 
     async def _collect_channel_workshops(self, page: Page, channel_url: str,
@@ -7841,16 +7959,23 @@ class AutoLearner:
 
         # 链接上没有 ID 时，先从页面自己的数据里取（一次 evaluate 拿全），
         # 再退到内容接口响应；都比"逐张点击 + 等弹窗"快得多。
-        workshop_ids = await self._channel_harvest_from_page_data(page, exclude_id, _log)
-        if not workshop_ids:
-            workshop_ids = await self._channel_harvest_from_responses(
-                responses, exclude_id, _log)
+        # 但快速通道必须"取全"才算数：实测内容接口会命中频道自身元数据、只回
+        # 3 个 ID —— 比逐张点击还差，所以数量不够就回退点击。
+        candidates = await self._channel_content_candidate_count(page)
+        fast_ids = await self._channel_harvest_from_page_data(page, exclude_id, _log)
+        if not fast_ids:
+            fast_ids = await self._channel_harvest_from_responses(
+                responses, exclude_id, log_callback=_log)
         _drop_response_listener()
-        if workshop_ids:
-            _log(f"频道页发现 {len(workshop_ids)} 个专题班入口"
-                 f"（页面数据，未逐张点击）", "blue")
-            _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
-            return workshop_ids
+        debug(f"频道页快速通道: 取到 {len(fast_ids)} 个 ID，页面内容候选 {candidates} 个")
+        # 候选数能测出来时要求"一个不少"；测不出来（0）时才用下限兜住杂质
+        complete = (len(fast_ids) >= candidates) if candidates > 0 else (len(fast_ids) >= 3)
+        if fast_ids and complete:
+            _log(f"频道页发现 {len(fast_ids)} 个专题班入口（快速通道，未逐张点击）", "blue")
+            _log(f"频道页采集到 {len(fast_ids)} 个专题班", "green")
+            return fast_ids
+        if fast_ids:
+            _log(f"快速通道只取到 {len(fast_ids)}/{candidates} 个，回退逐张点击补齐", "yellow")
 
         await self._dump_channel_anchors(page, _log)
         gate = await self._channel_looks_gated(page)
