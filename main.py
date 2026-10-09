@@ -6973,6 +6973,83 @@ class AutoLearner:
         _log(f"训练营 {camp_id}: 找到 {len(course_tasks)} 个课程页面", "green" if course_tasks else "yellow")
         return course_tasks
 
+    async def _collect_channel_workshops(self, page: Page, channel_url: str,
+                                         log_callback=None) -> List[str]:
+        """从学习频道卡片打开专题班详情，收集其 workshop ID。
+
+        频道页卡片链接的 href 是 javascript:void(0)，ID 由点击事件写入新开的
+        /workshop/#/detail?id=...&logChannelId=... 页面，因此从最终路由读取 ID。
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_function("""() => location.hash.includes('/channel/show/') &&
+                Array.from(document.querySelectorAll('a')).some(a =>
+                    (a.innerText || '').trim().length > 5)""", timeout=20000)
+            titles = await page.evaluate("""() => Array.from(new Set(
+                Array.from(document.querySelectorAll('a'))
+                    .map(a => (a.innerText || '').replace(/\\s+/g, ' ').trim())
+                    .filter(text => text.length > 5 && text !== '查看全部')
+            ))""")
+        except Exception as e:
+            _log(f"频道课程列表加载失败: {e}", "yellow")
+            return []
+
+        _log(f"频道页发现 {len(titles)} 个课程入口，正在读取详情", "blue")
+        workshop_ids = []
+        seen_ids = set()
+        for title in titles:
+            if self._stop_event.is_set():
+                break
+            popup = None
+            detail_url = ""
+            try:
+                link = page.get_by_role("link", name=title, exact=True).first
+                if await link.count() == 0:
+                    continue
+                try:
+                    async with page.expect_event("popup", timeout=7000) as popup_info:
+                        await link.click(timeout=10000)
+                    popup = await popup_info.value
+                    try:
+                        await popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    detail_url = popup.url
+                except Exception:
+                    # 兼容课程卡片改为同标签页打开的情况。
+                    detail_url = page.url
+
+                fragment = urlsplit(detail_url).fragment
+                route, _separator, query = fragment.partition("?")
+                if not re.fullmatch(r"/(?:myworkshop/)?detail", route):
+                    continue
+                workshop_id = (parse_qs(query).get("id") or [""])[0].strip()
+                if workshop_id and workshop_id not in seen_ids:
+                    seen_ids.add(workshop_id)
+                    workshop_ids.append(workshop_id)
+                    _log(f"  频道课程: {title[:42]}", "green")
+            except Exception as e:
+                _log(f"  读取频道课程失败: {title[:32]} - {e}", "yellow")
+            finally:
+                if popup:
+                    try:
+                        await popup.close()
+                    except Exception:
+                        pass
+                if page.url != channel_url:
+                    try:
+                        await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
+                        await page.wait_for_function("""() => location.hash.includes('/channel/show/') &&
+                            Array.from(document.querySelectorAll('a')).some(a =>
+                                (a.innerText || '').trim().length > 5)""", timeout=20000)
+                    except Exception as e:
+                        _log(f"返回频道页失败，停止采集: {e}", "yellow")
+                        break
+
+        _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green" if workshop_ids else "yellow")
+        return workshop_ids
+
     async def _learn_course_urls(self, urls: List[Union[str, Dict]], workers: int,
                                  _log, _progress, _hours):
         """手动模式：直接打开课程详情URL学习（无需专题班）"""
@@ -7158,14 +7235,14 @@ class AutoLearner:
         # 区分专题班、训练营详情与课程URL。
         workshop_ids = []
         trainingcamp_ids = []
+        channel_urls = []
         course_urls = []
         for url in urls:
-            # 建行学习中心的频道内容页使用 sys 应用下的 hash 路由，ID 不在 query 中。
-            # 将完整频道页地址作为直接学习任务交给通用媒体播放器流程处理。
-            channel_match = re.search(r"#/channel/show/([^/?#]+)", url)
+            # 频道页不是课程本身；其卡片会打开带课程ID的专题班详情。
+            channel_match = re.search(r"#/channel/show/[^/?#]+", url)
             if channel_match:
-                if url not in course_urls:
-                    course_urls.append(url)
+                if url not in channel_urls:
+                    channel_urls.append(url)
                 continue
 
             study_match = re.search(r"#/traincamp/study/([^/?#]+)/([^/?#]+)", url)
@@ -7191,6 +7268,12 @@ class AutoLearner:
             else:
                 if uid not in workshop_ids:
                     workshop_ids.append(uid)
+
+        for channel_url in channel_urls:
+            _log(f"正在采集学习频道: {channel_url.rsplit('/', 1)[-1]}", "blue")
+            for workshop_id in await self._collect_channel_workshops(page, channel_url, _log):
+                if workshop_id not in workshop_ids:
+                    workshop_ids.append(workshop_id)
 
         # 训练营详情页中的课程页使用 /traincamp/study/{campId}/{courseId} 路由。
         for camp_id in trainingcamp_ids:
