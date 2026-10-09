@@ -7160,6 +7160,14 @@ class AutoLearner:
         trainingcamp_ids = []
         course_urls = []
         for url in urls:
+            # 建行学习中心的频道内容页使用 sys 应用下的 hash 路由，ID 不在 query 中。
+            # 将完整频道页地址作为直接学习任务交给通用媒体播放器流程处理。
+            channel_match = re.search(r"#/channel/show/([^/?#]+)", url)
+            if channel_match:
+                if url not in course_urls:
+                    course_urls.append(url)
+                continue
+
             study_match = re.search(r"#/traincamp/study/([^/?#]+)/([^/?#]+)", url)
             if study_match:
                 if url not in course_urls:

@@ -2005,12 +2005,13 @@ class ManualScreen(QWidget):
             "粘贴URL，每行一个，例如：\n"
             "https://u.ccb.com/workshop/#/myworkshop/detail?id=xxx\n"
             "https://u.ccb.com/workshop/#/detail?id=xxx\n"
-            "https://u.ccb.com/trainingcamp/#/traincampdetail/训练营ID/away"
+            "https://u.ccb.com/trainingcamp/#/traincampdetail/训练营ID/away\n"
+            "https://u.ccb.com/sys/#/channel/show/频道ID"
         )
         self.text_urls.setMinimumHeight(200)
         i_layout.addWidget(self.text_urls)
 
-        hint = CaptionLabel("支持专题班、训练营详情页和课程页URL；详情页会自动提取课程")
+        hint = CaptionLabel("支持专题班、训练营详情页、课程页和频道学习页；详情页会自动提取课程")
         hint.setObjectName("muted")
         i_layout.addWidget(hint)
 
@@ -2047,9 +2048,11 @@ class ManualScreen(QWidget):
     def _parse_urls(self):
         lines = [line.strip() for line in self.text_urls.toPlainText().splitlines() if line.strip()]
         valid = [line for line in lines if "ccb.com" in line and line.startswith(("http://", "https://"))]
-        types = {"专题班": 0, "训练营": 0, "课程页": 0, "未知": 0}
+        types = {"专题班": 0, "训练营": 0, "课程页": 0, "频道学习页": 0, "未知": 0}
         for url in valid:
-            if "/trainingcamp/" in url:
+            if re.search(r"#/channel/show/[^/?#]+", url):
+                types["频道学习页"] += 1
+            elif "/trainingcamp/" in url:
                 types["训练营"] += 1
             elif "/workshop/" in url:
                 types["专题班"] += 1
