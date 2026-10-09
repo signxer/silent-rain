@@ -156,6 +156,8 @@ class FakeChannelPage:
         self.pending_popup = None
         self.anchor_dump = []
         self.body_text = ""
+        self.login_form = False
+        self.user_box = False
         self.gate_text = ""            # 页面上存在这个「同意」按钮
         self.gate_clicks = []
         self.after_gate = None         # 点完提示后替换成的新锚点
@@ -198,6 +200,12 @@ class FakeChannelPage:
     async def evaluate(self, script):
         if self.evaluate_fails:
             raise RuntimeError("evaluate failed")
+        if "querySelectorAll('a').length" in str(script):   # 就绪等待脚本
+            return len(self.anchors)
+        if "inputPwd" in str(script):                       # 登录状态脚本
+            return {"hasPwd": bool(self.login_form),
+                    "userBox": bool(self.user_box),
+                    "hasSms": bool(self.login_form)}
         if "slice(0, 30)" in str(script):        # 链接清单 dump 脚本
             return list(getattr(self, "anchor_dump", []))
         out = []
@@ -771,6 +779,65 @@ class ChannelGateTests(unittest.TestCase):
         page.body_text = "正常页面，没有登录也没有公约"   # 不触发 gated 判定
         self._collect(page)
         self.assertEqual(page.clicks, 0)
+
+
+class ChannelReadinessTests(unittest.TestCase):
+    """采集前要等 SPA 渲染完，并把登录状态写进日志。"""
+
+    def setUp(self):
+        patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.CHANNEL_POPUP_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.debugs = []
+        patcher = patch("main.debug", side_effect=lambda m: self.debugs.append(str(m)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
+
+    def test_login_state_is_logged(self):
+        page = FakeChannelPage(anchors=[{"label": "信贷业务专题班（第一期）",
+                                         "href": DETAIL_A}])
+        page.user_box = True
+        self._collect(page)
+        self.assertTrue(any("频道页登录状态: logged" in m for m in self.debugs), self.debugs)
+
+    def test_missing_login_is_reported_not_hidden(self):
+        page = FakeChannelPage(anchors=[{"label": "首页入口", "href": "javascript:void(0)"}])
+        page.login_form = True
+        page.body_text = "密码登录 短信登录 获取验证码"
+        self._collect(page)
+        self.assertTrue(any("频道页登录状态: login-form" in m for m in self.debugs), self.debugs)
+        self.assertTrue(any("可能没有登录" in m for m in self.logs), self.logs)
+
+    def test_harvest_is_retried_for_async_rendered_content(self):
+        """内容异步渲染：第一轮读不到，等一会再读要能读到。"""
+        page = FakeChannelPage(anchors=[{"label": "页面骨架", "href": "javascript:void(0)"}])
+
+        state = {"round": 0}
+        original = FakeChannelPage.evaluate
+
+        async def evaluate_with_delay(self, script):
+            if "slice(0, 30)" not in str(script) and "querySelectorAll('a').length" not in str(script) \
+                    and "inputPwd" not in str(script):
+                state["round"] += 1
+                if state["round"] >= 2:            # 第二轮才出现内容
+                    self.anchors = [{"label": "信贷业务专题班（第一期）", "href": DETAIL_A}]
+            return await original(self, script)
+
+        with patch.object(FakeChannelPage, "evaluate", evaluate_with_delay):
+            self._collect(page)
+        from main import AutoLearner as _AL
+        self.assertTrue(any("频道页采集到 1 个专题班" in m for m in self.logs), self.logs)
 
 
 if __name__ == "__main__":

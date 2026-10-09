@@ -7343,6 +7343,51 @@ class AutoLearner:
                 _log(f"  频道课程: {title[:42]}", "green")
         return workshop_ids
 
+    async def _wait_channel_ready(self, page: Page, attempts: int = 6,
+                                  delay_ms: int = 1500) -> None:
+        """等频道页的 SPA 稳定：链接数量连续两次不变。
+
+        原来的条件只是"页面上有 2 个链接"——页头、登录壳、协议链接就满足了，
+        于是内容还没渲染就开始采集，采到的全是登录面板与协议链接。
+        """
+        last = -1
+        for _ in range(max(1, attempts)):
+            try:
+                count = await page.evaluate("() => document.querySelectorAll('a').length")
+            except Exception:
+                return
+            if count == last:
+                return
+            last = count
+            try:
+                await page.wait_for_timeout(delay_ms)
+            except Exception:
+                return
+
+    async def _channel_login_state(self, page: Page) -> str:
+        """频道页当前登录状态：logged / login-form / unknown。
+
+        直接写进日志，回答"是不是没登录"这种问题，不用靠猜。
+        """
+        try:
+            state = await page.evaluate("""() => {
+              const hasPwd = !!document.querySelector('#inputPwd, input[type="password"]');
+              const userBox = !!document.querySelector('.ccb-user-box');
+              const body = (document.body && document.body.innerText) || '';
+              const hasSms = body.indexOf('\u83b7\u53d6\u9a8c\u8bc1\u7801') >= 0
+                          || body.indexOf('\u77ed\u4fe1\u767b\u5f55') >= 0;
+              return {hasPwd: hasPwd, userBox: userBox, hasSms: hasSms};
+            }""")
+        except Exception:
+            return "unknown"
+        if not isinstance(state, dict):
+            return "unknown"
+        if state.get("userBox"):
+            return "logged"
+        if state.get("hasPwd") or state.get("hasSms"):
+            return "login-form"
+        return "unknown"
+
     async def _dismiss_channel_gate(self, page: Page, log_callback=None) -> bool:
         """先过掉频道页的文明公约/须知提示，否则内容根本不会渲染。
 
@@ -7427,18 +7472,15 @@ class AutoLearner:
             detail_url = ""
             captured = []
             channel_id = channel_url.rstrip("/").rsplit("/", 1)[-1]
-            before_url = _page_url(page)
             try:
                 detail_url = await self._channel_open_detail(
                     page, lambda item=link: item.click(timeout=10000),
                     captured=captured)
-                workshop_id = ""
-                if detail_url.rstrip("/") != before_url.rstrip("/"):
-                    # 地址变了才从落地地址抠；没跳走时那是频道页地址，抠出来的是频道 ID
-                    workshop_id = self._channel_workshop_id_from_landing(
-                        detail_url, exclude_id=channel_id)
+                # 落在频道落地页时提取器会返回空（那里只有频道 ID），
+                # 已跳走则按各种形状取；都没取到就听点击期间请求了什么详情接口
+                workshop_id = self._channel_workshop_id_from_landing(
+                    detail_url, exclude_id=channel_id)
                 if not workshop_id:
-                    # 地址没变也可能弹层/内嵌加载：看点击期间请求了什么详情接口
                     workshop_id = self._workshop_id_from_requests(
                         captured, exclude_id=channel_id)
                 # 每次点击都留痕：不然"点了没反应"在日志里完全看不见
@@ -7488,15 +7530,27 @@ class AutoLearner:
         except Exception as e:
             _log(f"频道页打开失败: {e}", "yellow")
             return []
-        try:
-            await page.wait_for_function(
-                "() => document.querySelectorAll('a').length > 2", timeout=15000)
-        except Exception:
-            pass
+        await self._wait_channel_ready(page)
+        login_state = await self._channel_login_state(page)
+        debug(f"频道页登录状态: {login_state}")
+        if login_state == "login-form":
+            _log("频道页显示登录框：当前会话可能没有登录到该页面", "yellow")
 
         await self._dismiss_channel_gate(page, _log)
 
-        workshop_ids = await self._channel_harvest_workshops(page, _log)
+        # 内容可能是异步渲染的（提示弹完才拉数据）：多试几轮，别一轮定生死
+        workshop_ids = []
+        for attempt in range(3):
+            workshop_ids = await self._channel_harvest_workshops(page, _log)
+            if workshop_ids:
+                break
+            if attempt < 2:
+                try:
+                    await page.wait_for_timeout(2500)
+                except Exception:
+                    break
+                await self._dismiss_channel_gate(page, _log)
+
         if workshop_ids:
             _log(f"频道页发现 {len(workshop_ids)} 个专题班入口（直接读取链接）", "blue")
             _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
@@ -7506,8 +7560,9 @@ class AutoLearner:
         gate = await self._channel_looks_gated(page)
         if gate:
             # 卡在登录/公约页时逐个点链接毫无意义，直接说清楚原因
-            _log(f"频道页仍停在登录/提示页（命中「{gate}」），未进入频道内容", "red")
-            debug(f"频道页被登录/公约遮挡: {gate}")
+            _log(f"频道页仍停在登录/提示页（命中「{gate}」，登录状态={login_state}），"
+                 f"未进入频道内容", "red")
+            debug(f"频道页被登录/公约遮挡: gate={gate} login_state={login_state}")
             return []
         _log("频道页链接里没有专题班 ID，回退为点击卡片读取", "blue")
         workshop_ids = await self._channel_click_workshops(page, channel_url, _log)
