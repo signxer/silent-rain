@@ -126,11 +126,62 @@ class OnlineCourseListUnavailable(RuntimeError):
 
 ONLINE_COURSE_LIST_CARD_SELECTOR = "a.p-cursor[title]"
 
+# 多 worker 依次启动的间隔（秒）：避免同时打开平台页面；抽成常量便于测试归零
+WORKER_STAGGER_SECONDS = 3.0
+
+# 学习频道页的专题班入口收割：能从 href / data-* / onclick 静态读出 ID 就不要点击。
+# 覆盖站点不同版本的写法：?id= / workshopId= / workshop_id= / /detail/<id>。
+# 故意不认 logChannelId：那是「频道」ID，当成专题班 ID 会跳错详情页。
+CHANNEL_WORKSHOP_HARVEST_JS = r"""
+() => {
+  const PATTERN = /(?:[?&](?:id|workshopId|workshop_id)=|\/detail\/|\/myworkshop\/detail\/)([0-9a-zA-Z_-]{8,})/;
+  const UUID = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/;
+  const IDLIKE = /^[0-9a-zA-Z_-]{8,}$/;
+  const ATTRS = ['href', 'data-href', 'data-url', 'data-workshop-id',
+                 'data-workshopid', 'data-id', 'onclick'];
+  const out = [];
+  const seen = new Set();
+  const nodes = document.querySelectorAll(
+      'a[href], a[data-id], a[data-href], a[data-url], [data-id], [data-href], [data-url], [onclick]');
+  for (const el of nodes) {
+    const isAnchor = el.tagName === 'A' || (el.hasAttribute && el.hasAttribute('href'));
+    let id = '', source = '', raw = '';
+    for (const name of ATTRS) {
+      const value = el.getAttribute ? el.getAttribute(name) : null;
+      if (!value) continue;
+      const text = String(value);
+      let candidate = '';
+      const m = text.match(PATTERN);
+      if (m) {
+        candidate = m[1];
+      } else if (name === 'data-workshop-id' || name === 'data-workshopid') {
+        // 这两个属性本身就是 ID，允许裸值
+        if (IDLIKE.test(text.trim())) candidate = text.trim();
+      } else if (name === 'data-id' && isAnchor) {
+        if (IDLIKE.test(text.trim())) candidate = text.trim();
+      } else if (name === 'onclick') {
+        // onclick="openWorkshop('1111-...')" 这类只有裸 UUID
+        const u = text.match(UUID);
+        if (u) candidate = u[0];
+      }
+      if (candidate) { id = candidate; source = name; raw = text; break; }
+    }
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const title = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    out.push({id: id, title: title, source: source, raw: raw});
+  }
+  return out;
+}
+"""
+
 # 翻页校验的等待预算（毫秒）。抽成常量便于测试压到毫秒级。
 ONLINE_PAGE_CHANGE_TIMEOUT_MS = 4500      # 点击下一页后等渲染真正生效
 ONLINE_PAGE_ROUTE_TIMEOUT_MS = 5000       # 路由跳转后等卡片真正换掉
 ONLINE_PAGE_SETTLE_DELAY_MS = 400         # 落地路由确认间隔
 ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS = 8000   # 深链跳页后等卡片渲染
+# 频道页点击后等路由落到 /detail 的预算（毫秒）；非卡片链接点了不动时别耗太久
+CHANNEL_DETAIL_WAIT_MS = 4000
 
 # 列表页可观测状态：卡片指纹 + 分页器高亮页码 + 路由页码。
 # 翻页点击后用它校验「页面真的换了」，避免 SPA 没渲染完就采集到上一页。
@@ -961,6 +1012,18 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
   };
 }
 """
+
+
+def _manual_progress_payload(done: int, total: int, status: str = "") -> dict:
+    """手动模式的「总体进度」载荷：已完成工作项 / 总工作项。
+
+    手动模式没有学时目标，进度只能按"要学的东西学完了多少"来算。载荷只带
+    manual_* 字段、不带 wid，GUI 据此与单个 worker 的行进度区分开，不会互相覆盖。
+    """
+    payload = {"manual_done": max(0, int(done)), "manual_total": max(0, int(total))}
+    if status:
+        payload["manual_status"] = status
+    return payload
 
 
 def _render_study_hours_dom_js() -> str:
@@ -6236,12 +6299,14 @@ class AutoLearner:
         return all_tasks, ws_locks
 
     async def parallel_learn_courses(self, all_tasks: List, ws_locks: Dict, fetch_more_callback=None,
-                                      progress_callback=None, hours_callback=None, log_callback=None):
+                                      progress_callback=None, hours_callback=None, log_callback=None,
+                                      report_item_progress: bool = False):
         """全局课程队列：所有 worker 跨专题班并发消费，自动标记已完成专题班
         fetch_more_callback: async callable(queue) -> int，队列空时调用，往queue里加新任务，返回新增数
         progress_callback: callable(data_dict) - Textual进度更新回调
         hours_callback: callable(data_dict) - Textual学时更新回调
-        log_callback: callable(msg, style) - Textual日志回调"""
+        log_callback: callable(msg, style) - Textual日志回调
+        report_item_progress: 手动模式用——把「已处理课程数 / 总课程数」当总体进度上报"""
         if not all_tasks:
             console.print("没有需要学习的课程", style="green")
             return set()
@@ -6405,6 +6470,18 @@ class AutoLearner:
         failed = [0]
         lock_stat = asyncio.Lock()
 
+        def report_items(status=""):
+            """手动模式：把已处理课程数当总体进度上报（成功与失败都算处理过）。"""
+            if not report_item_progress or not progress_callback:
+                return
+            try:
+                progress_callback(_manual_progress_payload(
+                    completed_count[0] + failed[0], total_ref[0], status))
+            except Exception:
+                pass
+
+        report_items("准备中")
+
         # 按专题班统计完成情况：{ws_id: {"total": N, "done": N, "title": str}}
         ws_progress = {}
         for ws_id, cidx, course, ws_title in all_tasks:
@@ -6521,6 +6598,7 @@ class AutoLearner:
                         update_status(w_id, status="加载失败")
                         async with lock_stat:
                             failed[0] += 1
+                            report_items()
                         continue
 
                     # 2) 加锁：同一专题班的课程串行点击
@@ -6549,6 +6627,7 @@ class AutoLearner:
                             update_status(w_id, status="未找到课程")
                             async with lock_stat:
                                 failed[0] += 1
+                                report_items()
                             continue
 
                         btn = row.locator("span.edit-block").first
@@ -6556,6 +6635,7 @@ class AutoLearner:
                             update_status(w_id, status="无按钮")
                             async with lock_stat:
                                 failed[0] += 1
+                                report_items()
                             continue
 
                         try:
@@ -6573,6 +6653,7 @@ class AutoLearner:
                             update_status(w_id, status="打开失败")
                             async with lock_stat:
                                 failed[0] += 1
+                                report_items()
                             continue
 
                     # 3) 找学习按钮
@@ -6610,6 +6691,7 @@ class AutoLearner:
                         update_status(w_id, status="播放失败")
                         async with lock_stat:
                             failed[0] += 1
+                            report_items()
                         continue
 
                     # 用户变更配置：放弃当前任务，不再计数
@@ -6638,6 +6720,7 @@ class AutoLearner:
                     # 6) 更新进度 + 检查专题班是否全部完成
                     async with lock_stat:
                         completed_count[0] += 1
+                        report_items()
                         wp = ws_progress.get(ws_id)
                         if wp:
                             wp["done"] += 1
@@ -6687,6 +6770,7 @@ class AutoLearner:
                     update_status(w_id, status="异常")
                     async with lock_stat:
                         failed[0] += 1
+                        report_items()
 
             update_status(w_id, status="已退出", course="-", workshop="-")
 
@@ -6792,6 +6876,7 @@ class AutoLearner:
                                     update_status(wid, status="超时放弃")
                                     async with lock_stat:
                                         failed[0] += 1
+                                        report_items()
                             worker_heartbeat[wid] = now
             if live_ctx:
                 live_ctx.update(make_progress_table())
@@ -6973,81 +7058,185 @@ class AutoLearner:
         _log(f"训练营 {camp_id}: 找到 {len(course_tasks)} 个课程页面", "green" if course_tasks else "yellow")
         return course_tasks
 
+    @staticmethod
+    def _channel_workshop_id_from_url(url: str) -> str:
+        """从 /workshop/#/detail?id=xxx 这类地址里取专题班 ID。"""
+        try:
+            fragment = urlsplit(url or "").fragment
+        except Exception:
+            return ""
+        route, _separator, query = fragment.partition("?")
+        if not re.fullmatch(r"/(?:myworkshop/)?detail", route):
+            return ""
+        return (parse_qs(query).get("id") or [""])[0].strip()
+
+    @staticmethod
+    def _looks_like_channel_card(href: str) -> bool:
+        """频道页卡片入口的粗略特征：无 href、javascript:void(0) 或指向详情。"""
+        href = (href or "").strip().lower()
+        if not href or href.startswith("javascript:"):
+            return True
+        return "detail" in href
+
+    async def _wait_channel_detail_url(self, page: Page,
+                                       timeout_ms: Optional[int] = None) -> str:
+        """等同标签页跳转落到 /detail 路由再读地址（点击后立刻读会读到旧地址）。"""
+        budget_ms = CHANNEL_DETAIL_WAIT_MS if timeout_ms is None else timeout_ms
+        deadline = time.monotonic() + max(0.05, budget_ms / 1000.0)
+        delay_ms = 300
+        while True:
+            url = _page_url(page)
+            if self._channel_workshop_id_from_url(url):
+                return url
+            if time.monotonic() >= deadline:
+                return url
+            try:
+                await page.wait_for_timeout(delay_ms)
+            except Exception:
+                return url
+            delay_ms = min(int(delay_ms * 1.5), 1000)
+
+    async def _channel_open_detail(self, page: Page, clicker) -> str:
+        """点击一个频道入口并返回落地地址；弹窗与同标签页跳转都支持。"""
+        popup = None
+        try:
+            try:
+                async with page.expect_event("popup", timeout=7000) as popup_info:
+                    await clicker()
+                popup = await popup_info.value
+                try:
+                    await popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                return _page_url(popup)
+            except Exception:
+                # 同标签页打开：等路由真的变成 /detail 再读，避免拿到跳转前的地址
+                return await self._wait_channel_detail_url(page)
+        finally:
+            if popup is not None:
+                try:
+                    await popup.close()
+                except Exception:
+                    pass
+
+    async def _channel_harvest_workshops(self, page: Page, log_callback=None) -> List[str]:
+        """不点击，直接从 DOM 里读专题班入口（href / data-* / onclick）。
+
+        频道页卡片可能把 ID 写在 href 上（/workshop/#/detail?id=xxx&logChannelId=…），
+        也可能只是 javascript:void(0) + onclick。能静态读出来的就不要靠"逐张点击
+        再看弹窗地址"——后者会被弹窗拦截、标题重复、以及同标签页渲染时序坑到。
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            entries = await page.evaluate(CHANNEL_WORKSHOP_HARVEST_JS)
+        except Exception as exc:
+            debug(f"频道页链接收割失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+            return []
+        workshop_ids = []
+        seen = set()
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            raw = str(entry.get("raw") or "").lower()
+            # 课程/训练营链接交给各自流程，别当成专题班 ID
+            if "/course/" in raw or "/trainingcamp/" in raw:
+                continue
+            workshop_id = str(entry.get("id") or "").strip()
+            if not workshop_id or workshop_id in seen:
+                continue
+            seen.add(workshop_id)
+            workshop_ids.append(workshop_id)
+            title = str(entry.get("title") or "").strip()
+            if title:
+                _log(f"  频道课程: {title[:42]}", "green")
+        return workshop_ids
+
+    async def _channel_click_workshops(self, page: Page, channel_url: str,
+                                       log_callback=None) -> List[str]:
+        """兜底：逐个点击频道入口，从落地地址里取专题班 ID。"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        anchors = page.locator("a")
+        try:
+            total = await anchors.count()
+        except Exception:
+            return []
+        workshop_ids = []
+        seen = set()
+        consecutive_misses = 0
+        for index in range(min(total, 60)):
+            if self._stop_event.is_set():
+                break
+            link = anchors.nth(index)
+            try:
+                href = await link.get_attribute("href")
+                label = (await link.inner_text() or "").replace("\n", " ").strip()
+            except Exception:
+                continue
+            if len(label) <= 5 or label == "查看全部":
+                continue
+            if not self._looks_like_channel_card(href):
+                continue
+            detail_url = ""
+            try:
+                detail_url = await self._channel_open_detail(
+                    page, lambda item=link: item.click(timeout=10000))
+                workshop_id = self._channel_workshop_id_from_url(detail_url)
+                if workshop_id:
+                    consecutive_misses = 0
+                    if workshop_id not in seen:
+                        seen.add(workshop_id)
+                        workshop_ids.append(workshop_id)
+                        _log(f"  频道课程: {label[:42]}", "green")
+                else:
+                    # 点了没打开详情：多半是导航链接，连续多次没结果就收手
+                    consecutive_misses += 1
+                    if consecutive_misses >= 6:
+                        _log("频道页多次点击都未打开专题班详情，停止尝试", "yellow")
+                        break
+            except Exception as e:
+                _log(f"  读取频道课程失败: {label[:32]} - {e}", "yellow")
+            finally:
+                # 同标签页跳过之后要回到频道页，否则后续入口点不到
+                if _page_url(page) != channel_url:
+                    try:
+                        await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
+                        await page.wait_for_function(
+                            "() => document.querySelectorAll('a').length > 2", timeout=15000)
+                    except Exception as e:
+                        _log(f"返回频道页失败，停止采集: {e}", "yellow")
+                        break
+        return workshop_ids
+
     async def _collect_channel_workshops(self, page: Page, channel_url: str,
                                          log_callback=None) -> List[str]:
-        """从学习频道卡片打开专题班详情，收集其 workshop ID。
+        """从学习频道页收集专题班 ID。
 
-        频道页卡片链接的 href 是 javascript:void(0)，ID 由点击事件写入新开的
-        /workshop/#/detail?id=...&logChannelId=... 页面，因此从最终路由读取 ID。
+        三层，越靠前越稳：先读链接（href/data-*/onclick），再退回点击卡片。
+        频道页可能改写路由（例如落到 /channel/detail/<id>），所以这里不再强求
+        hash 一直停在 /channel/show/，只等页面把链接渲染出来。
         """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         try:
             await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_function("""() => location.hash.includes('/channel/show/') &&
-                Array.from(document.querySelectorAll('a')).some(a =>
-                    (a.innerText || '').trim().length > 5)""", timeout=20000)
-            titles = await page.evaluate("""() => Array.from(new Set(
-                Array.from(document.querySelectorAll('a'))
-                    .map(a => (a.innerText || '').replace(/\\s+/g, ' ').trim())
-                    .filter(text => text.length > 5 && text !== '查看全部')
-            ))""")
         except Exception as e:
-            _log(f"频道课程列表加载失败: {e}", "yellow")
+            _log(f"频道页打开失败: {e}", "yellow")
             return []
+        try:
+            await page.wait_for_function(
+                "() => document.querySelectorAll('a').length > 2", timeout=15000)
+        except Exception:
+            pass
 
-        _log(f"频道页发现 {len(titles)} 个课程入口，正在读取详情", "blue")
-        workshop_ids = []
-        seen_ids = set()
-        for title in titles:
-            if self._stop_event.is_set():
-                break
-            popup = None
-            detail_url = ""
-            try:
-                link = page.get_by_role("link", name=title, exact=True).first
-                if await link.count() == 0:
-                    continue
-                try:
-                    async with page.expect_event("popup", timeout=7000) as popup_info:
-                        await link.click(timeout=10000)
-                    popup = await popup_info.value
-                    try:
-                        await popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                    except Exception:
-                        pass
-                    detail_url = popup.url
-                except Exception:
-                    # 兼容课程卡片改为同标签页打开的情况。
-                    detail_url = page.url
+        workshop_ids = await self._channel_harvest_workshops(page, _log)
+        if workshop_ids:
+            _log(f"频道页发现 {len(workshop_ids)} 个专题班入口（直接读取链接）", "blue")
+            _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
+            return workshop_ids
 
-                fragment = urlsplit(detail_url).fragment
-                route, _separator, query = fragment.partition("?")
-                if not re.fullmatch(r"/(?:myworkshop/)?detail", route):
-                    continue
-                workshop_id = (parse_qs(query).get("id") or [""])[0].strip()
-                if workshop_id and workshop_id not in seen_ids:
-                    seen_ids.add(workshop_id)
-                    workshop_ids.append(workshop_id)
-                    _log(f"  频道课程: {title[:42]}", "green")
-            except Exception as e:
-                _log(f"  读取频道课程失败: {title[:32]} - {e}", "yellow")
-            finally:
-                if popup:
-                    try:
-                        await popup.close()
-                    except Exception:
-                        pass
-                if page.url != channel_url:
-                    try:
-                        await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
-                        await page.wait_for_function("""() => location.hash.includes('/channel/show/') &&
-                            Array.from(document.querySelectorAll('a')).some(a =>
-                                (a.innerText || '').trim().length > 5)""", timeout=20000)
-                    except Exception as e:
-                        _log(f"返回频道页失败，停止采集: {e}", "yellow")
-                        break
-
-        _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green" if workshop_ids else "yellow")
+        _log("频道页链接里没有专题班 ID，回退为点击卡片读取", "blue")
+        workshop_ids = await self._channel_click_workshops(page, channel_url, _log)
+        _log(f"频道页采集到 {len(workshop_ids)} 个专题班",
+             "green" if workshop_ids else "yellow")
         return workshop_ids
 
     async def _learn_course_urls(self, urls: List[Union[str, Dict]], workers: int,
@@ -7055,6 +7244,10 @@ class AutoLearner:
         """手动模式：直接打开课程详情URL学习（无需专题班）"""
         nw = min(workers, len(urls))
         _log(f"共 {len(urls)} 个课程URL待学习，使用 {nw} 个线程", "blue")
+        # 手动模式的总体进度：一个 URL 学完（成功/失败/需人工）算一项
+        manual_total = len(urls)
+        manual_done = [0]
+        _progress(_manual_progress_payload(0, manual_total, "准备中"))
 
         def format_eta(seconds):
             """格式化课程剩余时间，供训练营进度回调显示。"""
@@ -7208,10 +7401,15 @@ class AutoLearner:
                     except Exception:
                         pass
 
+                # 这一项不论是学完、失败还是需人工，都算处理过，推进总进度。
+                # （目标达成会 raise 提前跳出，不会走到这里。）
+                manual_done[0] += 1
+                _progress(_manual_progress_payload(manual_done[0], manual_total))
+
         tasks = []
         for wid in range(nw):
             tasks.append(asyncio.create_task(cworker(wid, self.pages[wid], urls[wid::nw])))
-            await asyncio.sleep(3)
+            await asyncio.sleep(WORKER_STAGGER_SECONDS)
         try:
             await asyncio.gather(*tasks)
         except GoalReached:
@@ -7222,6 +7420,9 @@ class AutoLearner:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except:
                 pass
+        finally:
+            if self._stop_event.is_set() and manual_done[0] < manual_total:
+                _progress(_manual_progress_payload(manual_done[0], manual_total, "已停止"))
 
     async def learn_from_urls(self, urls: List[str], workers: int = 1,
                                progress_callback=None, hours_callback=None, log_callback=None):
@@ -7229,6 +7430,10 @@ class AutoLearner:
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         _progress = progress_callback or (lambda d: None)
         _hours = hours_callback or (lambda d: None)
+
+        # 手动模式没有学时目标，总进度按「要学的东西学完了多少」来报。
+        # 总数要等采集完才知道，先给一个"准备中"，让界面立刻有反馈。
+        _progress(_manual_progress_payload(0, 0, "准备中"))
 
         page = self.pages[0]
 
@@ -7381,7 +7586,8 @@ class AutoLearner:
         # 开始学习
         _log(f"\n开始学习 {len(all_tasks)} 门课程", "bold blue")
         await self.parallel_learn_courses(
-            all_tasks, ws_locks, None, _progress, _hours, _log
+            all_tasks, ws_locks, None, _progress, _hours, _log,
+            report_item_progress=True,
         )
 
     async def get_available_tags(self, page: Page) -> Dict[str, List[str]]:

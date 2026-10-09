@@ -2129,6 +2129,8 @@ class DashboardScreen(QWidget):
         self._eta_seconds = None            # 最新预估剩余秒数
         self._eta_calc_time = None          # 预估计算时的时间戳
         self._session_start_total = None    # 本次会话起始总学时（用于"本次已学"）
+        self._manual_done = 0                # 手动模式：已处理工作项
+        self._manual_total = 0               # 手动模式：工作项总数（0=还没采集出来）
         self._hours_history = []            # 学时趋势点 [(timestamp, total), ...]
         self._runtime_start = None
         self._log_collapsed = False
@@ -2706,6 +2708,9 @@ class DashboardScreen(QWidget):
         self.btn_stop.setEnabled(True)
         self.current_progress.setValue(0)
         self.goal_progress.setValue(0)
+        self._manual_done = 0
+        self._manual_total = 0
+        self._manual_status = ""
         # 重置进度环状态（颜色恢复主题色、数值清零）
         self.progress_ring.setValue(0)
         try:
@@ -3702,7 +3707,43 @@ class DashboardScreen(QWidget):
             self._hero_transition_effect.setOffsetY(0.0)
             self._hero_transition_effect.setOpacity(1.0)
 
+    def _apply_manual_progress(self, data):
+        """记录手动模式的工作项进度并刷新界面。"""
+        total = int(data.get("manual_total") or 0)
+        done = int(data.get("manual_done") or 0)
+        status = str(data.get("manual_status") or "")
+        if total > 0:
+            self._manual_total = total
+            self._manual_done = max(0, min(done, total))
+        elif done == 0 and not self._manual_total:
+            # 总数还没采集出来：保持"准备中"，别显示 0/0
+            self._manual_done = 0
+        self._manual_status = status
+        self._render_manual_progress()
+
+    def _render_manual_progress(self):
+        """手动模式的进度环/进度条/目标文案。"""
+        done, total = self._manual_done, self._manual_total
+        if total > 0:
+            pct = int(round(done * 100.0 / total))
+            pct = max(0, min(100, pct))
+            self._animate_ring(pct)
+            self._animate_progress_bar(self.goal_progress, pct)
+            self.lbl_goal_info.setText(f"手动模式 · 已完成 {done}/{total} 项（{pct}%）")
+        else:
+            # 还没确定要学多少：先给文字反馈，进度保持 0
+            self.progress_ring.setValue(0)
+            self._animate_progress_bar(self.goal_progress, 0)
+            extra = getattr(self, "_manual_status", "")
+            self.lbl_goal_info.setText(
+                f"{self._manual_goal_text()} · {extra}" if extra else self._manual_goal_text())
+        self.lbl_eta.setText("")
+
     def _on_progress(self, data):
+        # 手动模式的总体进度载荷没有 wid，先处理掉，别当成某个 worker 的行进度
+        if "manual_total" in data:
+            self._apply_manual_progress(data)
+            return
         wid = data.get("wid", 0)
         if wid >= self.table.rowCount():
             return
@@ -3794,13 +3835,11 @@ class DashboardScreen(QWidget):
 
         win = self.window()
 
-        # 手动模式：无学时目标，显示手动信息而不是"不学习"
+        # 手动模式：没有学时目标，进度按「已处理工作项 / 总工作项」显示。
+        # 这里只能重绘最近一次状态——不能清零，否则每个学时回调都会把进度打回 0。
         mode = getattr(win, "cfg_mode", "auto")
         if mode == "manual":
-            self.progress_ring.setValue(0)
-            self._animate_progress_bar(self.goal_progress, 0)
-            self.lbl_goal_info.setText(self._manual_goal_text())
-            self.lbl_eta.setText("")
+            self._render_manual_progress()
             return
 
         c_goal = getattr(win, "cfg_central_goal", 0)
