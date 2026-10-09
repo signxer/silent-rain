@@ -6557,13 +6557,16 @@ class AutoLearner:
 
     async def parallel_learn_courses(self, all_tasks: List, ws_locks: Dict, fetch_more_callback=None,
                                       progress_callback=None, hours_callback=None, log_callback=None,
-                                      report_item_progress: bool = False):
+                                      report_item_progress: bool = False,
+                                      total_ref: Optional[List[int]] = None):
         """全局课程队列：所有 worker 跨专题班并发消费，自动标记已完成专题班
         fetch_more_callback: async callable(queue) -> int，队列空时调用，往queue里加新任务，返回新增数
         progress_callback: callable(data_dict) - Textual进度更新回调
         hours_callback: callable(data_dict) - Textual学时更新回调
         log_callback: callable(msg, style) - Textual日志回调
-        report_item_progress: 手动模式用——把「已处理课程数 / 总课程数」当总体进度上报"""
+        report_item_progress: 手动模式用——把「已处理课程数 / 总课程数」当总体进度上报
+        total_ref: 外部传入的单元素列表 [总数]；边学边采集时总数还会增长，
+                   用外部列表才能让进度分母跟着涨"""
         if not all_tasks:
             console.print("没有需要学习的课程", style="green")
             return set()
@@ -6722,7 +6725,8 @@ class AutoLearner:
             return Group(hours_table, table)
 
         # 进度统计
-        total_ref = [len(all_tasks)]
+        if total_ref is None:
+            total_ref = [len(all_tasks)]
         completed_count = [0]
         failed = [0]
         lock_stat = asyncio.Lock()
@@ -8152,95 +8156,156 @@ class AutoLearner:
 
         _log(f"共 {len(workshop_ids)} 个专题班待学习", "blue")
 
-        # 采集每个专题班的课程
-        all_tasks = []
+        # 采集每个专题班的课程。24 个专题班一个个报名要等好几分钟，
+        # 所以这里不再"全部采完才开跑"：先把第一批交给学习线程，剩下的专题班
+        # 在 worker 空转时通过 fetch_more_callback 继续报名/采集（边学边报名）。
         ws_locks = {}
-        for ws_id in workshop_ids:
-            # 用户变更配置：停止采集
-            if self._stop_event.is_set():
-                break
+        pending = list(workshop_ids)
+        collect_page = await self._new_collection_page(page)
+        total_counter = [0]
+
+        async def collect_one(ws_id: str) -> List:
+            """采集一个专题班，返回待学任务 [(ws_id, idx, course, title), ...]。"""
             ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
             _log(f"正在采集: {ws_id[:16]}...", "blue")
 
             # 导航（先回列表页重置SPA，再导航到目标）
             list_url = "https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise"
+            body = ""
             for nav_url in [ws_url, ws_url.replace("/myworkshop/detail", "/detail")]:
                 try:
-                    await page.goto(list_url, wait_until="domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(2000)
-                    await page.evaluate(f"window.location.hash = '{nav_url.split('#')[1]}';")
-                    await page.wait_for_timeout(5000)
-                except:
+                    await collect_page.goto(list_url, wait_until="domcontentloaded", timeout=15000)
+                    await collect_page.wait_for_timeout(2000)
+                    await collect_page.evaluate(
+                        f"window.location.hash = '{nav_url.split('#')[1]}';")
+                    await collect_page.wait_for_timeout(5000)
+                except Exception:
                     pass
-                body = ""
                 try:
-                    body = await page.locator("body").inner_text(timeout=3000)
-                except:
-                    pass
+                    body = await collect_page.locator("body").inner_text(timeout=3000)
+                except Exception:
+                    body = ""
                 if "创建日期" in body or "报名" in body:
                     break
 
             if "报名截止" in body or "报名已结束" in body:
                 _log(f"  ⊘ 报名截止，跳过", "yellow")
-                continue
+                return []
 
             # 专题班必须先报名，课程列表才会出现；报名后详情地址会变，
             # 所以要重新进一次详情页等服务器处理（与自动模式同一套做法）。
-            if await self._enroll_workshop_if_needed(page, ws_url, _log):
+            if await self._enroll_workshop_if_needed(collect_page, ws_url, _log):
                 try:
-                    await page.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(5000)
+                    await collect_page.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                    await collect_page.wait_for_timeout(5000)
                 except Exception as exc:
                     debug(f"报名后重新进入详情页失败: {type(exc).__name__}")
 
             # 点击课程标签
             for tab_text in ["课程", "课程列表", "课程目录"]:
                 try:
-                    tab = page.locator(f"text={tab_text}").first
+                    tab = collect_page.locator(f"text={tab_text}").first
                     if await tab.count() > 0 and await tab.is_visible():
                         await tab.click()
-                        await page.wait_for_timeout(3000)
+                        await collect_page.wait_for_timeout(3000)
                         break
-                except:
+                except Exception:
                     pass
 
             # 等待数据加载
             for _ in range(4):
-                rows = await page.locator("tr.text-center").count()
+                rows = await collect_page.locator("tr.text-center").count()
                 if rows > 0:
                     break
-                await page.wait_for_timeout(3000)
+                await collect_page.wait_for_timeout(3000)
 
-            # 提取课程
-            courses = await self.get_courses_from_workshop(page)
+            courses = await self.get_courses_from_workshop(collect_page)
             if not courses:
                 _log(f"  ✗ 未获取到课程", "yellow")
-                continue
+                return []
 
-            to_learn = [(i, c) for i, c in enumerate(courses) if self._is_learnable(c.get('action', ''), c.get('hours', ''),
-                                                          c.get('progress', ''))]
+            to_learn = [(i, c) for i, c in enumerate(courses)
+                        if self._is_learnable(c.get('action', ''), c.get('hours', ''),
+                                              c.get('progress', ''))]
             ws_title = body[:50].split("\n")[0].strip() if body else ws_id[:16]
 
             if not to_learn:
                 _log(f"  ✓ 全部已完成（{len(courses)}门）", "green")
-                continue
+                return []
 
             _log(f"  ✓ {len(to_learn)} 门待学（共{len(courses)}门）", "green")
             ws_locks[ws_id] = asyncio.Lock()
-            for ci, c in to_learn:
-                all_tasks.append((ws_id, ci, c, ws_title))
+            return [(ws_id, ci, c, ws_title) for ci, c in to_learn]
 
-        if not all_tasks:
-            _log("没有需要学习的课程", "yellow")
+        try:
+            # 先采到第一批任务就开跑，别让用户干等所有专题班报名完
+            all_tasks = []
+            while pending and not all_tasks and not self._stop_event.is_set():
+                all_tasks = await collect_one(pending.pop(0))
+            if not all_tasks:
+                _log("没有需要学习的课程", "yellow")
+                return
+            total_counter[0] = len(all_tasks)
+
+            collect_lock = asyncio.Lock()
+
+            async def fetch_more_courses(queue) -> int:
+                """worker 没活了：继续报名/采集后面的专题班（边学边报名）。
+
+                多个 worker 可能同时空转，但采集页只有一个，所以串行化；
+                等锁期间如果别人已经补过货，就把"已有活干"的数量返回，
+                让 worker 回去取任务而不是退出。
+                """
+                if queue.qsize() > 0:
+                    return queue.qsize()
+                async with collect_lock:
+                    if queue.qsize() > 0:
+                        return queue.qsize()
+                    added = 0
+                    while pending and not self._stop_event.is_set():
+                        tasks = await collect_one(pending.pop(0))
+                        for task in tasks:
+                            queue.put_nowait((*task, 0))
+                        added += len(tasks)
+                        total_counter[0] += len(tasks)
+                        if added:
+                            break
+                    if added:
+                        debug(f"边学边采集: 新增 {added} 门课程，剩余 "
+                              f"{len(pending)} 个专题班")
+                    return added
+
+            _log(f"\n开始学习 {len(all_tasks)} 门课程"
+                 f"（剩余 {len(pending)} 个专题班边学边报名）", "bold blue")
+            debug(f"手动模式专题班开始学习: {len(all_tasks)} 门课程，"
+                  f"待采集 {len(pending)} 个专题班")
+            await self.parallel_learn_courses(
+                all_tasks, ws_locks, fetch_more_courses, _progress, _hours, _log,
+                report_item_progress=True, total_ref=total_counter,
+            )
+        finally:
+            await self._close_collection_page(page, collect_page)
+
+    async def _new_collection_page(self, fallback: Page) -> Page:
+        """采集用的独立标签页。
+
+        学习 worker 会一直占用 pages[0..N-1]，如果"边学边采集"共用同一页，
+        两边的导航会互相踩。单独开一页，学完再关掉。
+        """
+        try:
+            if self.context is not None:
+                return await self.context.new_page()
+        except Exception as exc:
+            debug(f"创建采集专用标签页失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+        return fallback
+
+    async def _close_collection_page(self, fallback: Page, page: Page) -> None:
+        if page is fallback:
             return
-
-        # 开始学习
-        _log(f"\n开始学习 {len(all_tasks)} 门课程", "bold blue")
-        debug(f"手动模式专题班开始学习: {len(all_tasks)} 门课程")
-        await self.parallel_learn_courses(
-            all_tasks, ws_locks, None, _progress, _hours, _log,
-            report_item_progress=True,
-        )
+        try:
+            await page.close()
+        except Exception:
+            pass
 
     async def get_available_tags(self, page: Page) -> Dict[str, List[str]]:
         # 从页面提取所有可见标签，按分类分组

@@ -236,5 +236,103 @@ class CourseTableParseBrowserTests(unittest.TestCase):
             rows[1]["action"], rows[1]["hours"], rows[1]["progress"]))
 
 
+class _FakePage:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class ManualPipelineTests(unittest.TestCase):
+    """拿到课程就开始学，其余专题班边学边报名（不要再干等所有报名）。"""
+
+    def setUp(self):
+        import inspect
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.source = inspect.getsource(AutoLearner.learn_from_urls)
+
+    def test_learning_starts_before_every_workshop_is_collected(self):
+        self.assertIn("fetch_more_courses", self.source)
+        self.assertIn("total_ref=total_counter", self.source)
+        # 先采一批（seed）再调用学习，而不是采完 24 个才调用
+        self.assertLess(self.source.index("while pending and not all_tasks"),
+                        self.source.index("parallel_learn_courses"))
+
+    def test_remaining_workshops_are_handled_by_the_fetch_callback(self):
+        body = self.source[self.source.index("async def fetch_more_courses"):]
+        body = body[:body.index("\n            _log(")]
+        self.assertIn("pending.pop(0)", body)
+        self.assertIn("collect_one(", body)
+        self.assertIn("queue.put_nowait", body)
+
+    def test_enrollment_lives_inside_collect_one(self):
+        body = self.source[self.source.index("async def collect_one"):]
+        self.assertIn("_enroll_workshop_if_needed", body)
+
+    def test_total_grows_as_more_workshops_are_collected(self):
+        self.assertIn("total_counter[0] += len(tasks)", self.source)
+
+    def test_concurrent_workers_do_not_collect_at_the_same_time(self):
+        self.assertIn("collect_lock = asyncio.Lock()", self.source)
+        self.assertIn("async with collect_lock", self.source)
+
+    def test_idle_worker_reuses_work_added_by_others(self):
+        """等锁期间别人补了货，要返回"有活了"，别让 worker 提前退出。"""
+        self.assertIn("return queue.qsize()", self.source)
+
+    def test_collection_page_is_closed_afterwards(self):
+        self.assertIn("_close_collection_page", self.source)
+        self.assertIn("finally", self.source)
+
+
+class CollectionPageTests(unittest.TestCase):
+    """采集专用页：worker 占用 pages[0..N-1]，采集不能共用同一页。"""
+
+    def setUp(self):
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.learner = AutoLearner.__new__(AutoLearner)
+
+    def test_creates_a_dedicated_page(self):
+        created = []
+
+        class Ctx:
+            async def new_page(self):
+                page = _FakePage()
+                created.append(page)
+                return page
+
+        self.learner.context = Ctx()
+        page = asyncio.run(self.learner._new_collection_page("fallback"))
+        self.assertIs(page, created[0])
+
+    def test_falls_back_when_context_is_missing(self):
+        self.learner.context = None
+        self.assertEqual(
+            asyncio.run(self.learner._new_collection_page("fallback")), "fallback")
+
+    def test_falls_back_when_new_page_fails(self):
+        class Ctx:
+            async def new_page(self):
+                raise RuntimeError("target closed")
+
+        self.learner.context = Ctx()
+        self.assertEqual(
+            asyncio.run(self.learner._new_collection_page("fallback")), "fallback")
+
+    def test_dedicated_page_is_closed_but_fallback_is_not(self):
+        page = _FakePage()
+        asyncio.run(self.learner._close_collection_page("fallback", page))
+        self.assertTrue(page.closed)
+
+        fallback = _FakePage()
+        asyncio.run(self.learner._close_collection_page(fallback, fallback))
+        self.assertFalse(fallback.closed, "降级共用时不能把主页面关掉")
+
+
 if __name__ == "__main__":
     unittest.main()
