@@ -255,18 +255,21 @@ class ManualPipelineTests(unittest.TestCase):
         self.source = inspect.getsource(AutoLearner.learn_from_urls)
 
     def test_learning_starts_before_every_workshop_is_collected(self):
-        self.assertIn("fetch_more_courses", self.source)
+        self.assertIn("collect_rest", self.source)
+        self.assertIn("producer=collect_rest", self.source)
         self.assertIn("total_ref=total_counter", self.source)
         # 先采一批（seed）再调用学习，而不是采完 24 个才调用
         self.assertLess(self.source.index("while pending and not all_tasks"),
                         self.source.index("parallel_learn_courses"))
 
-    def test_remaining_workshops_are_handled_by_the_fetch_callback(self):
-        body = self.source[self.source.index("async def fetch_more_courses"):]
+    def test_remaining_workshops_are_collected_by_the_background_producer(self):
+        """报名必须与学习并行跑，不能等 worker 空闲（否则学了 2 门就不再报名）。"""
+        body = self.source[self.source.index("async def collect_rest"):]
         body = body[:body.index("\n            _log(")]
         self.assertIn("pending.pop(0)", body)
         self.assertIn("collect_one(", body)
         self.assertIn("queue.put_nowait", body)
+        self.assertNotIn("asyncio.Lock()", body, "后台采集只有一个，不需要锁")
 
     def test_enrollment_lives_inside_collect_one(self):
         body = self.source[self.source.index("async def collect_one"):]
@@ -275,13 +278,18 @@ class ManualPipelineTests(unittest.TestCase):
     def test_total_grows_as_more_workshops_are_collected(self):
         self.assertIn("total_counter[0] += len(tasks)", self.source)
 
-    def test_concurrent_workers_do_not_collect_at_the_same_time(self):
-        self.assertIn("collect_lock = asyncio.Lock()", self.source)
-        self.assertIn("async with collect_lock", self.source)
+    def test_workers_wait_for_the_background_producer(self):
+        """后台采集还在跑时 worker 不能退出，否则剩下的专题班不会被学。"""
+        import inspect
+        worker_src = inspect.getsource(AutoLearner.parallel_learn_courses)
+        self.assertIn("producer is not None", worker_src)
+        self.assertIn("producer_task", worker_src)
+        self.assertIn("not producer_task.done()", worker_src)
 
-    def test_idle_worker_reuses_work_added_by_others(self):
-        """等锁期间别人补了货，要返回"有活了"，别让 worker 提前退出。"""
-        self.assertIn("return queue.qsize()", self.source)
+    def test_producer_is_cancelled_on_teardown(self):
+        import inspect
+        worker_src = inspect.getsource(AutoLearner.parallel_learn_courses)
+        self.assertIn("producer_task.cancel()", worker_src)
 
     def test_collection_page_is_closed_afterwards(self):
         self.assertIn("_close_collection_page", self.source)

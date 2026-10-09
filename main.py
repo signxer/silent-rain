@@ -296,8 +296,11 @@ CHANNEL_POPUP_WAIT_MS = 2500
 # 频道卡片点开后，弹窗先落在 about:blank，真正地址是随后跳转过去的；
 # 立刻读只会拿到空地址（实测 id=- → "#"），所以还要等它落到真地址。
 CHANNEL_POPUP_NAV_MS = 8000
-# 只等"弹窗事件"出现的时间（不等它导航到真地址）——导航统一放到最后并行等
-CHANNEL_POPUP_EVENT_MS = 1500
+# 只等"弹窗事件"出现的时间（不等它导航到真地址）——导航统一放到最后并行等。
+# 给得宽一些：连点时 SPA 要先请求再 window.open，实测卡得紧会漏掉一部分卡片
+CHANNEL_POPUP_EVENT_MS = 5000
+# 两次点击之间留一点处理时间，别把 SPA 点懵
+CHANNEL_CLICK_GAP_MS = 200
 # 点击兜底最多处理多少个候选入口
 CHANNEL_CLICK_LIMIT = 60
 
@@ -6591,7 +6594,8 @@ class AutoLearner:
     async def parallel_learn_courses(self, all_tasks: List, ws_locks: Dict, fetch_more_callback=None,
                                       progress_callback=None, hours_callback=None, log_callback=None,
                                       report_item_progress: bool = False,
-                                      total_ref: Optional[List[int]] = None):
+                                      total_ref: Optional[List[int]] = None,
+                                      producer=None):
         """全局课程队列：所有 worker 跨专题班并发消费，自动标记已完成专题班
         fetch_more_callback: async callable(queue) -> int，队列空时调用，往queue里加新任务，返回新增数
         progress_callback: callable(data_dict) - Textual进度更新回调
@@ -6599,7 +6603,10 @@ class AutoLearner:
         log_callback: callable(msg, style) - Textual日志回调
         report_item_progress: 手动模式用——把「已处理课程数 / 总课程数」当总体进度上报
         total_ref: 外部传入的单元素列表 [总数]；边学边采集时总数还会增长，
-                   用外部列表才能让进度分母跟着涨"""
+                   用外部列表才能让进度分母跟着涨
+        producer: async callable(queue) —— 后台采集协程，与学习**并行**跑，
+                  持续把新任务投进队列。fetch_more_callback 只在 worker 空闲时
+                  才被调用，学得慢就会出现"学了 2 门就再也不报名了"""
         if not all_tasks:
             console.print("没有需要学习的课程", style="green")
             return set()
@@ -6860,6 +6867,9 @@ class AutoLearner:
                     # 队列获取超时——但不代表队列真的空了（可能是ws_lock排队）
                     if course_queue.qsize() > 0:
                         continue  # 队列还有任务，继续取
+                    # 后台采集还在跑：等它投喂，不要就此退出
+                    if producer_task is not None and not producer_task.done():
+                        continue
                     # 队列确实空了，尝试采集更多课程
                     if fetch_more_callback:
                         try:
@@ -7068,6 +7078,22 @@ class AutoLearner:
 
             update_status(w_id, status="已退出", course="-", workshop="-")
 
+        # 后台采集协程：与学习并行把后续专题班报名+采集进来。
+        # 只靠 fetch_more_callback 的话，worker 忙着学就不会去采集，
+        # 表现就是"开始学了 2 门课程就没有继续报名了"。
+        producer_task = None
+        if producer is not None:
+            async def _run_producer():
+                try:
+                    await producer(course_queue)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    debug(f"后台采集协程异常: {type(exc).__name__}: {_safe_debug_error(exc)}")
+                    if log_callback:
+                        log_callback(f"后台采集中断: {type(exc).__name__}", "yellow")
+            producer_task = asyncio.create_task(_run_producer())
+
         # 用 Live 表格实时刷新
         from rich.live import Live
         # 创建独立页面用于定时查询学时（不与worker冲突）
@@ -7221,6 +7247,15 @@ class AutoLearner:
                                     t.cancel()
                         except:
                             pass
+
+        # 后台采集协程：学习都结束了就收掉（正常应已自然结束）
+        if producer_task is not None:
+            if not producer_task.done():
+                producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # 记录完成统计（供 GUI 显示真实成功/失败数）
         self.last_stats = (completed_count[0], failed[0])
@@ -7781,8 +7816,9 @@ class AutoLearner:
                                        log_callback=None) -> List[str]:
         """兜底：逐个点击频道入口，从落地地址里取专题班 ID。
 
-        点击"一下一张"，但**不等每张卡片的弹窗跳转**——24 张卡片串行等
-        24 次约 2 秒的跳转要 ~50 秒；改成点完统一并行解析地址。
+        点击"一下一张"但不等弹窗跳转（那才是原来 ~50 秒的来源）：先点完，
+        再并行解析所有弹窗地址。第一轮没取到 ID 的入口会**串行补采一次**，
+        避免连点太快漏掉一部分卡片（实测 24 个只出 15 个）。
         """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         channel_id = _channel_id_from_url(channel_url)
@@ -7825,16 +7861,20 @@ class AutoLearner:
                     page, link, captured, popup_detachers)
                 if popup is not None:
                     opened.append((index, label, href, popup))
-                    continue
-                # 没有弹窗：可能是同标签页打开，也可能原地不动
-                detail_url = await self._wait_channel_detail_url(page)
-                same_tab.append((index, label, href, detail_url))
-                if _page_url(page) != channel_url:
-                    try:
-                        await page.goto(channel_url, wait_until="domcontentloaded",
-                                        timeout=15000)
-                    except Exception:
-                        pass
+                else:
+                    # 没有弹窗：可能是同标签页打开，也可能原地不动
+                    detail_url = await self._wait_channel_detail_url(page)
+                    same_tab.append((index, label, href, detail_url))
+                    if _page_url(page) != channel_url:
+                        try:
+                            await page.goto(channel_url, wait_until="domcontentloaded",
+                                            timeout=15000)
+                        except Exception:
+                            pass
+                try:
+                    await page.wait_for_timeout(CHANNEL_CLICK_GAP_MS)
+                except Exception:
+                    pass
 
             # 并行等所有弹窗落到真地址（串行等就是原来 50 秒的来源）
             resolved = list(same_tab)
@@ -7858,6 +7898,16 @@ class AutoLearner:
 
         workshop_ids: List[str] = []
         seen = set()
+        misses = []      # 第一轮没拿到 ID 的入口，第二轮补采
+
+        def _take(workshop_id: str, label: str) -> bool:
+            if not workshop_id or workshop_id in seen:
+                return bool(workshop_id)
+            seen.add(workshop_id)
+            workshop_ids.append(workshop_id)
+            _log(f"  频道课程: {label[:42]}", "green")
+            return True
+
         for index, label, href, detail_url in sorted(resolved, key=lambda x: x[0]):
             # 落在频道落地页时提取器会返回空（那里只有频道 ID），
             # 已跳走则按各种形状取；都没取到就听点击期间请求了什么详情接口
@@ -7869,17 +7919,44 @@ class AutoLearner:
             debug(f"频道页点击[{index}] label={label[:30]!r} "
                   f"href={_debug_url_shape(href)} → {_debug_url_shape(detail_url)} "
                   f"id={workshop_id or '-'} 请求{len(captured)}条")
-            if not workshop_id and captured:
-                debug("  点击期间的请求: " + " | ".join(
-                    _debug_url_shape(u) for u in captured[:6]))
-            if workshop_id and workshop_id not in seen:
-                seen.add(workshop_id)
-                workshop_ids.append(workshop_id)
-                _log(f"  频道课程: {label[:42]}", "green")
-        if not workshop_ids and candidates:
+            if not workshop_id:
+                misses.append((index, label, href))
+            _take(workshop_id, label)
+
+        # 第二轮：漏掉的入口串行补采（等满弹窗地址），专治"连点太快漏卡片"
+        if misses and not self._stop_event.is_set():
+            _log(f"  第一轮有 {len(misses)} 个入口没取到 ID，串行补采一次", "yellow")
+            debug(f"频道页补采: {[m[0] for m in misses]}")
+            for index, label, href in misses:
+                if self._stop_event.is_set():
+                    break
+                retry_captured: List[str] = []
+                try:
+                    link = anchors.nth(index)
+                    detail_url = await self._channel_open_detail(
+                        page, lambda item=link: item.click(timeout=10000),
+                        captured=retry_captured)
+                except Exception as exc:
+                    debug(f"频道页补采[{index}] 失败: {type(exc).__name__}")
+                    continue
+                workshop_id = self._channel_workshop_id_from_landing(
+                    detail_url, exclude_id=channel_id)
+                if not workshop_id:
+                    workshop_id = self._workshop_id_from_requests(
+                        retry_captured, exclude_id=channel_id)
+                debug(f"频道页补采[{index}] label={label[:30]!r} "
+                      f"→ {_debug_url_shape(detail_url)} id={workshop_id or '-'}")
+                if not workshop_id and _page_url(page) != channel_url:
+                    try:
+                        await page.goto(channel_url, wait_until="domcontentloaded",
+                                        timeout=15000)
+                    except Exception:
+                        pass
+                _take(workshop_id, label)
+
+        if not workshop_ids:
             _log("频道页多次点击都未打开专题班详情，停止尝试", "yellow")
         return workshop_ids
-
     async def _collect_channel_workshops(self, page: Page, channel_url: str,
                                          log_callback=None) -> List[str]:
         """从学习频道页收集专题班 ID。
@@ -7957,10 +8034,9 @@ class AutoLearner:
             _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
             return workshop_ids
 
-        # 链接上没有 ID 时，先从页面自己的数据里取（一次 evaluate 拿全），
-        # 再退到内容接口响应；都比"逐张点击 + 等弹窗"快得多。
-        # 但快速通道必须"取全"才算数：实测内容接口会命中频道自身元数据、只回
-        # 3 个 ID —— 比逐张点击还差，所以数量不够就回退点击。
+        # 链接上没有 ID 时，先用快速通道试一次（页面组件状态 / 内容接口），
+        # 但**不能拿它当权威**：实测它命中过频道元数据只回 3 个，也出现过
+        # 与可见条目数正好相等却仍然不全的情况。所以点击照跑，最后取并集。
         candidates = await self._channel_content_candidate_count(page)
         fast_ids = await self._channel_harvest_from_page_data(page, exclude_id, _log)
         if not fast_ids:
@@ -7968,14 +8044,6 @@ class AutoLearner:
                 responses, exclude_id, log_callback=_log)
         _drop_response_listener()
         debug(f"频道页快速通道: 取到 {len(fast_ids)} 个 ID，页面内容候选 {candidates} 个")
-        # 候选数能测出来时要求"一个不少"；测不出来（0）时才用下限兜住杂质
-        complete = (len(fast_ids) >= candidates) if candidates > 0 else (len(fast_ids) >= 3)
-        if fast_ids and complete:
-            _log(f"频道页发现 {len(fast_ids)} 个专题班入口（快速通道，未逐张点击）", "blue")
-            _log(f"频道页采集到 {len(fast_ids)} 个专题班", "green")
-            return fast_ids
-        if fast_ids:
-            _log(f"快速通道只取到 {len(fast_ids)}/{candidates} 个，回退逐张点击补齐", "yellow")
 
         await self._dump_channel_anchors(page, _log)
         gate = await self._channel_looks_gated(page)
@@ -7986,7 +8054,15 @@ class AutoLearner:
             debug(f"频道页被登录/公约遮挡: gate={gate} login_state={login_state}")
             return []
         _log("频道页链接里没有专题班 ID，回退为点击卡片读取", "blue")
-        workshop_ids = await self._channel_click_workshops(page, channel_url, _log)
+        clicked_ids = await self._channel_click_workshops(page, channel_url, _log)
+        # 取并集：点击是权威枚举，快速通道只做补充（两边都可能多出对方漏掉的）
+        workshop_ids = list(clicked_ids)
+        for workshop_id in fast_ids:
+            if workshop_id not in workshop_ids:
+                workshop_ids.append(workshop_id)
+        if clicked_ids and fast_ids:
+            debug(f"频道页取并集: 点击 {len(clicked_ids)} 个 + 快速通道 "
+                  f"{len(fast_ids)} 个 → {len(workshop_ids)} 个")
         _log(f"频道页采集到 {len(workshop_ids)} 个专题班",
              "green" if workshop_ids else "yellow")
         return workshop_ids
@@ -8282,8 +8358,8 @@ class AutoLearner:
         _log(f"共 {len(workshop_ids)} 个专题班待学习", "blue")
 
         # 采集每个专题班的课程。24 个专题班一个个报名要等好几分钟，
-        # 所以这里不再"全部采完才开跑"：先把第一批交给学习线程，剩下的专题班
-        # 在 worker 空转时通过 fetch_more_callback 继续报名/采集（边学边报名）。
+        # 所以不再"全部采完才开跑"：先把第一批交给学习线程，剩下的专题班由
+        # 后台 producer 协程**并行**报名+采集（不是等 worker 空闲才去采）。
         ws_locks = {}
         pending = list(workshop_ids)
         collect_page = await self._new_collection_page(page)
@@ -8372,41 +8448,29 @@ class AutoLearner:
                 return
             total_counter[0] = len(all_tasks)
 
-            collect_lock = asyncio.Lock()
+            async def collect_rest(queue) -> None:
+                """后台把剩余专题班报名+采集进队列——与学习**并行**。
 
-            async def fetch_more_courses(queue) -> int:
-                """worker 没活了：继续报名/采集后面的专题班（边学边报名）。
-
-                多个 worker 可能同时空转，但采集页只有一个，所以串行化；
-                等锁期间如果别人已经补过货，就把"已有活干"的数量返回，
-                让 worker 回去取任务而不是退出。
+                之前靠 fetch_more_callback（worker 空闲才调用），结果"开始学了
+                2 门课程就没有继续报名了"：worker 忙着学，采集根本没机会跑。
                 """
-                if queue.qsize() > 0:
-                    return queue.qsize()
-                async with collect_lock:
-                    if queue.qsize() > 0:
-                        return queue.qsize()
-                    added = 0
-                    while pending and not self._stop_event.is_set():
-                        tasks = await collect_one(pending.pop(0))
-                        for task in tasks:
-                            queue.put_nowait((*task, 0))
-                        added += len(tasks)
-                        total_counter[0] += len(tasks)
-                        if added:
-                            break
-                    if added:
-                        debug(f"边学边采集: 新增 {added} 门课程，剩余 "
-                              f"{len(pending)} 个专题班")
-                    return added
+                while pending and not self._stop_event.is_set():
+                    tasks = await collect_one(pending.pop(0))
+                    for task in tasks:
+                        queue.put_nowait((*task, 0))
+                    total_counter[0] += len(tasks)
+                    if tasks:
+                        debug(f"边学边采集: 新增 {len(tasks)} 门课程，"
+                              f"剩余 {len(pending)} 个专题班")
 
             _log(f"\n开始学习 {len(all_tasks)} 门课程"
-                 f"（剩余 {len(pending)} 个专题班边学边报名）", "bold blue")
+                 f"（剩余 {len(pending)} 个专题班后台报名中）", "bold blue")
             debug(f"手动模式专题班开始学习: {len(all_tasks)} 门课程，"
                   f"待采集 {len(pending)} 个专题班")
             await self.parallel_learn_courses(
-                all_tasks, ws_locks, fetch_more_courses, _progress, _hours, _log,
+                all_tasks, ws_locks, None, _progress, _hours, _log,
                 report_item_progress=True, total_ref=total_counter,
+                producer=collect_rest,
             )
         finally:
             await self._close_collection_page(page, collect_page)

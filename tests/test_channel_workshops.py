@@ -59,7 +59,9 @@ class FakeAnchor:
 
     async def click(self, timeout=None):
         self.page.clicks += 1
-        if self.spec.get("popup"):
+        self.spec["_clicks"] = self.spec.get("_clicks", 0) + 1
+        if self.spec.get("popup") and (
+                self.spec["_clicks"] >= int(self.spec.get("popup_from_click", 1))):
             self.page.events.append(("click", self.spec.get("label", "")))
             self.page.pending_popup = self.page._track_popup(PopupPage(
                 self.spec["popup"],
@@ -979,16 +981,15 @@ class ChannelFastHarvestTests(unittest.TestCase):
         return asyncio.run(self.learner._collect_channel_workshops(
             page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
 
-    def test_page_data_harvest_needs_no_clicking(self):
-        """组件状态里有 ID 时，一次 evaluate 就够，绝不去点卡片。"""
+    def test_fast_ids_are_included_without_clicking_the_wrong_things(self):
+        """快速通道的 ID 一定进结果；这里的锚点不是内容候选，所以不会去点。"""
         page = FakeChannelPage(anchors=[
             {"label": "页面骨架", "href": "javascript:void(0);"}])
         page.page_data = [{"id": WS_A, "title": "《习近平关于中国式现代化论述》"},
                           {"id": WS_B, "title": "《伟大建党精神与国防和军队现代化》"}]
         page.content_candidates = 2
         self.assertEqual(self._collect(page), [WS_A, WS_B])
-        self.assertEqual(page.clicks, 0, "能直接读数据就不该逐张点击")
-        self.assertTrue(any("快速通道" in m for m in self.logs), self.logs)
+        self.assertEqual(page.clicks, 0, "非内容候选不该被点击")
 
     def test_channel_id_is_excluded_from_page_data(self):
         page = FakeChannelPage(anchors=[
@@ -1100,19 +1101,19 @@ class FastHarvestCompletenessTests(unittest.TestCase):
         return {"label": label, "href": "javascript:void(0)",
                 "popup": target, "popup_nav_ticks": 1}
 
-    def test_incomplete_fast_result_falls_back_to_clicking(self):
-        """找到 3 个但页面有 4 张卡片 → 不能就这么算了，要回退点击补全。"""
-        anchors = [self._card(f"《专题班第{i}期》", DETAIL_A.replace("11111111", f"0000000{i}"))
+    def test_clicking_is_authoritative_and_runs_alongside_fast_ids(self):
+        """快速通道只准补充，不准代替点击枚举（它两次给出过残缺结果）。"""
+        anchors = [self._card(f"《专题班第{i}期》",
+                              f"https://u.ccb.com/workshop/#/detail?id=0000000{i}-2222-3333-4444-555555555555")
                    for i in range(4)]
         page = FakeChannelPage(anchors=anchors)
         page.content_candidates = 4
-        page.page_data = [{"id": "11111111-2222-3333-4444-555555555555", "title": "a"},
-                          {"id": WS_B, "title": "b"},
-                          {"id": "99999999-2222-3333-4444-555555555555", "title": "c"}]
+        page.page_data = [{"id": "11111111-2222-3333-4444-555555555555", "title": "a"}]
         collected = self._collect(page)
-        self.assertEqual(len(collected), 4, "回退点击后应当补齐")
-        self.assertGreater(page.clicks, 0, "快速通道取不全时必须回退点击")
-        self.assertTrue(any("回退逐张点击补齐" in m for m in self.logs), self.logs)
+        self.assertGreater(page.clicks, 0, "点击枚举必须照跑")
+        for i in range(4):
+            self.assertIn(f"0000000{i}-2222-3333-4444-555555555555", collected)
+        self.assertIn("11111111-2222-3333-4444-555555555555", collected)
 
     def test_channel_metadata_response_is_rejected(self):
         """channel/findById 只有 3 个 ID，低于门槛，不能拿来当内容列表。"""
@@ -1186,6 +1187,51 @@ class ClickParallelismTests(unittest.TestCase):
         self.assertTrue(page.opened_popups, "应当记录弹窗以便关闭")
         self.assertTrue(all(p.closed for p in page.opened_popups),
                         "弹窗用完要关掉，否则越点越多")
+
+
+class ClickRetryTests(unittest.TestCase):
+    """连点太快漏掉的卡片必须串行补采 —— 实测 24 个只出 15 个就是这么来的。"""
+
+    def setUp(self):
+        for name, value in (("CHANNEL_DETAIL_WAIT_MS", 120),
+                            ("CHANNEL_POPUP_WAIT_MS", 120),
+                            ("CHANNEL_POPUP_NAV_MS", 600),
+                            ("CHANNEL_CLICK_GAP_MS", 0)):
+            patcher = patch(f"main.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        return asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
+
+    def test_missed_entry_is_retried_and_recovered(self):
+        anchors = [
+            # 第一次点击不弹窗（模拟连点太快），补采时才弹
+            {"label": "《专题班第一期》", "href": "javascript:void(0)",
+             "popup": DETAIL_A, "popup_nav_ticks": 1, "popup_from_click": 2},
+            {"label": "《专题班第二期》", "href": "javascript:void(0)",
+             "popup": DETAIL_B, "popup_nav_ticks": 1},
+        ]
+        page = FakeChannelPage(anchors=anchors)
+        collected = self._collect(page)
+        self.assertIn(WS_A, collected, "漏掉的入口应当靠串行补采找回来")
+        self.assertIn(WS_B, collected)
+        self.assertTrue(any("串行补采" in m for m in self.logs), self.logs)
+
+    def test_no_retry_when_everything_succeeded(self):
+        anchors = [{"label": "《专题班第一期》", "href": "javascript:void(0)",
+                    "popup": DETAIL_A, "popup_nav_ticks": 1}]
+        page = FakeChannelPage(anchors=anchors)
+        self.assertEqual(self._collect(page), [WS_A])
+        self.assertFalse(any("串行补采" in m for m in self.logs), self.logs)
 
 
 if __name__ == "__main__":
