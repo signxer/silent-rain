@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import (  # noqa: E402
+from main import (
+    CHANNEL_PAGE_DATA_JS,  # noqa: E402
     AutoLearner,
     CHANNEL_WORKSHOP_HARVEST_JS,
 )
@@ -190,6 +191,9 @@ class FakeChannelPage:
         self._pending_route = None
         self.route_ticks_left = 0
         self.request_listeners = []
+        self.response_listeners = []
+        self.page_data = []            # 组件状态里能直接读到的 {id,title}
+        self.responses = []            # 导航期间的内容接口响应
 
     # ── 路由 ──
     def schedule_route(self, target):
@@ -219,6 +223,7 @@ class FakeChannelPage:
             raise TimeoutError("net::ERR_CONNECTION_TIMED_OUT")
         self.gotos.append(url)
         self.url = url
+        self.emit_responses()
 
     async def wait_for_function(self, script, timeout=None):
         return True
@@ -234,6 +239,8 @@ class FakeChannelPage:
                     "hasSms": bool(self.login_form)}
         if "slice(0, 30)" in str(script):        # 链接清单 dump 脚本
             return list(getattr(self, "anchor_dump", []))
+        if "__vueParentComponent" in str(script):    # 页面组件状态收割脚本
+            return list(getattr(self, "page_data", []))
         out = []
         seen = set()
         for spec in self.anchors:
@@ -267,15 +274,25 @@ class FakeChannelPage:
         return _EventContext(self)
 
     def on(self, event, handler):
-        self.request_listeners.append(handler)
+        if event == "response":
+            self.response_listeners.append(handler)
+        else:
+            self.request_listeners.append(handler)
 
     def remove_listener(self, event, handler):
-        if handler in self.request_listeners:
-            self.request_listeners.remove(handler)
+        bucket = (self.response_listeners if event == "response"
+                  else self.request_listeners)
+        if handler in bucket:
+            bucket.remove(handler)
 
     def emit_request(self, url):
         for handler in list(self.request_listeners):
             handler(SimpleNamespace(url=url))
+
+    def emit_responses(self):
+        for response in list(self.responses):
+            for handler in list(self.response_listeners):
+                handler(response)
 
     def is_closed(self):
         return False
@@ -912,6 +929,127 @@ class PopupNavigationTests(unittest.TestCase):
              "popup_requests": [f"https://api.u.ccb.com/v1/workshop/detail?id={WS_D}"]},
         ])
         self.assertEqual(self._collect(page), [WS_D])
+
+
+class _FakeResponse:
+    def __init__(self, url, body, ctype="application/json"):
+        self.url = url
+        self.headers = {"content-type": ctype}
+        self._body = body
+
+    async def text(self):
+        return self._body
+
+
+class ChannelFastHarvestTests(unittest.TestCase):
+    """别逐张点击：优先从页面组件状态/内容接口一次拿全。"""
+
+    def setUp(self):
+        patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.CHANNEL_POPUP_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        return asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
+
+    def test_page_data_harvest_needs_no_clicking(self):
+        """组件状态里有 ID 时，一次 evaluate 就够，绝不去点卡片。"""
+        page = FakeChannelPage(anchors=[
+            {"label": "页面骨架", "href": "javascript:void(0);"}])
+        page.page_data = [{"id": WS_A, "title": "《习近平关于中国式现代化论述》"},
+                          {"id": WS_B, "title": "《伟大建党精神与国防和军队现代化》"}]
+        self.assertEqual(self._collect(page), [WS_A, WS_B])
+        self.assertEqual(page.clicks, 0, "能直接读数据就不该逐张点击")
+        self.assertTrue(any("页面数据" in m for m in self.logs), self.logs)
+
+    def test_channel_id_is_excluded_from_page_data(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "页面骨架", "href": "javascript:void(0);"}])
+        page.page_data = [{"id": CHANNEL_ID, "title": "频道本体"},
+                          {"id": WS_A, "title": "《某专题》"}]
+        self.assertEqual(self._collect(page), [WS_A])
+
+    def test_response_harvest_is_used_when_page_data_is_empty(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "页面骨架", "href": "javascript:void(0);"}])
+        page.responses = [_FakeResponse(
+            "https://api.u.ccb.com/v1/cu/getChannelContent",
+            '{"data":[{"id":"%s"},{"id":"%s"}]}' % (WS_A, WS_B))]
+        self.assertEqual(self._collect(page), [WS_A, WS_B])
+        self.assertEqual(page.clicks, 0)
+
+    def test_page_data_wins_over_clicking_and_dedups(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "《某专题》", "href": DETAIL_A}])
+        page.page_data = [{"id": WS_A, "title": "《某专题》"},
+                          {"id": WS_A, "title": "《某专题》重复"}]
+        self.assertEqual(self._collect(page), [WS_A])
+
+    def test_channel_id_from_url(self):
+        from main import _channel_id_from_url
+        self.assertEqual(_channel_id_from_url(CHANNEL_URL), CHANNEL_ID)
+        self.assertEqual(_channel_id_from_url("https://u.ccb.com/portal/#/study"), "")
+
+
+class PageDataScriptBrowserTests(unittest.TestCase):
+    """在真实 Chromium 里验证组件状态收割脚本确实能取到 ID。"""
+
+    HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body>
+    <div class="channel-show">
+      <div class="card-item" id="c1">《习近平关于中国式现代化论述》</div>
+      <div class="card-item" id="c2">《伟大建党精神与国防和军队现代化》</div>
+      <div class="card-item" id="c3">频道本体</div>
+    </div>
+    <script>
+      const ids = ['11111111-2222-3333-4444-555555555555',
+                   'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+                   '%s'];
+      document.querySelectorAll('.card-item').forEach((el, i) => {
+        el.__vueParentComponent = {
+          props: {item: {dataStoreId: ids[i], title: el.innerText}},
+          setupState: {unrelated: i},
+        };
+      });
+      document.body.dataset.done = '1';
+    </script></body></html>""" % CHANNEL_ID
+
+    def test_script_reads_ids_from_component_state(self):
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:  # pragma: no cover
+            self.skipTest("playwright 未安装")
+
+        async def go():
+            async with async_playwright() as p:
+                try:
+                    browser = await p.chromium.launch()
+                except Exception as exc:  # pragma: no cover
+                    return f"skip:{exc}"
+                try:
+                    page = await browser.new_page()
+                    await page.set_content(self.HTML)
+                    return await page.evaluate(CHANNEL_PAGE_DATA_JS)
+                finally:
+                    await browser.close()
+
+        out = asyncio.run(go())
+        if isinstance(out, str):  # pragma: no cover
+            self.skipTest(out)
+        ids = sorted(entry["id"] for entry in out)
+        self.assertEqual(ids, sorted([WS_A, WS_B, CHANNEL_ID]))
+        titles = {entry["id"]: entry["title"] for entry in out}
+        self.assertIn("中国式现代化", titles[WS_A])
 
 
 if __name__ == "__main__":

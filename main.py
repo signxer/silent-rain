@@ -196,6 +196,52 @@ CHANNEL_WORKSHOP_HARVEST_JS = r"""
 }
 """
 
+# 更聪明的收割：频道页已经把这 24 个内容渲染出来了，说明数据就在页面的
+# 组件状态里（卡片是 Vue 组件，点击时才用里面的 id 拼出详情地址）。
+# 直接从组件状态里取，一次 evaluate 拿全，省掉"逐张点击 + 等弹窗"的几十秒。
+CHANNEL_PAGE_DATA_JS = r"""
+() => {
+  const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  const found = new Map();
+  let budget = 6000;
+  const walk = (value, depth, sink) => {
+    if (value == null || depth > 4 || budget <= 0) return;
+    if (typeof value === 'string') {
+      if (UUID_RE.test(value)) sink.add(value);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    budget -= 1;
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 60)) walk(item, depth + 1, sink);
+      return;
+    }
+    for (const key of Object.keys(value)) {
+      if (key.charCodeAt(0) === 95 /* _ */) continue;      // __vue__ / _self 这类内部字段
+      if (key === '$el' || key === '$parent' || key === 'parent' || key === 'children') continue;
+      try { walk(value[key], depth + 1, sink); } catch (err) { /* 忽略 getter 报错 */ }
+    }
+  };
+  const nodes = Array.from(document.querySelectorAll(
+      '[class*=card],[class*=item],[class*=list] a,a')).slice(0, 300);
+  for (const el of nodes) {
+    const inst = el.__vueParentComponent || el.__vue__;
+    if (!inst) continue;
+    const ids = new Set();
+    walk(inst.props, 0, ids);
+    walk(inst.setupState, 0, ids);
+    walk(inst.data, 0, ids);
+    walk(inst.ctx, 0, ids);
+    if (!ids.size) continue;
+    const title = ((el.innerText || '').replace(/\s+/g, ' ').trim()).slice(0, 60);
+    for (const id of ids) {
+      if (!found.has(id)) found.set(id, title);
+    }
+  }
+  return Array.from(found, ([id, title]) => ({id: id, title: title}));
+}
+"""
+
 # 收割一无所获时，把页面链接原样记下来：否则只能靠猜这个页面的链接长什么样。
 CHANNEL_ANCHOR_DUMP_JS = r"""
 () => {
@@ -1100,6 +1146,17 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
   };
 }
 """
+
+
+def _channel_id_from_url(channel_url: str) -> str:
+    """频道页地址末段的频道 ID（用来把它从收割结果里排掉）。"""
+    try:
+        parts = urlsplit(str(channel_url))
+    except Exception:
+        return ""
+    fragment = parts.fragment or parts.path
+    tail = fragment.rstrip("/").rsplit("/", 1)[-1]
+    return tail if re.fullmatch(r"[0-9a-fA-F-]{8,}", tail or "") else ""
 
 
 def _progress_completed(progress) -> bool:
@@ -7556,6 +7613,55 @@ class AutoLearner:
                 return hint
         return ""
 
+    async def _channel_harvest_from_page_data(self, page: Page, exclude_id: str = "",
+                                             log_callback=None) -> List[str]:
+        """从页面组件状态里直接取专题班 ID（不点击）。"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            entries = await page.evaluate(CHANNEL_PAGE_DATA_JS)
+        except Exception as exc:
+            debug(f"频道页组件状态读取失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+            return []
+        ids = []
+        seen = set()
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            workshop_id = str(entry.get("id") or "").strip()
+            if not workshop_id or workshop_id in seen or workshop_id == exclude_id:
+                continue
+            seen.add(workshop_id)
+            ids.append(workshop_id)
+            title = str(entry.get("title") or "").strip()
+            if title:
+                _log(f"  频道课程: {title[:42]}", "green")
+        return ids
+
+    async def _channel_harvest_from_responses(self, responses, exclude_id: str = "",
+                                              log_callback=None) -> List[str]:
+        """从页面自己请求的内容接口响应里取 ID（一次拿全，也不用点击）。"""
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        ids = []
+        seen = set()
+        uuid_re = re.compile(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        for response in list(responses or [])[:12]:
+            try:
+                body = await response.text()
+            except Exception:
+                continue
+            for match in uuid_re.findall(body or ""):
+                if match in seen or match == exclude_id:
+                    continue
+                seen.add(match)
+                ids.append(match)
+            if ids:
+                debug(f"频道页内容接口命中: {_debug_url_shape(getattr(response, 'url', ''))}")
+                break
+        if ids:
+            _log(f"频道页从内容接口取到 {len(ids)} 个专题班", "green")
+        return ids
+
     async def _dump_channel_anchors(self, page: Page, log_callback=None) -> None:
         """收割不到 ID 时，把频道页链接原样记进日志。
 
@@ -7661,9 +7767,45 @@ class AutoLearner:
         hash 一直停在 /channel/show/，只等页面把链接渲染出来。
         """
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        exclude_id = _channel_id_from_url(channel_url)
+
+        # 内容接口是在导航时请求的，监听必须在 goto 之前挂上
+        responses = []
+        keep_responses = [True]
+        response_listener = None
+        if hasattr(page, "on"):
+            def _on_response(response):
+                if not keep_responses[0]:
+                    return
+                try:
+                    url = str(getattr(response, "url", "") or "")
+                    headers = getattr(response, "headers", None) or {}
+                    ctype = str(headers.get("content-type", "")).lower()
+                    if "json" not in ctype:
+                        return
+                    if not any(k in url for k in ("/cu/", "channel", "workshop", "content")):
+                        return
+                    responses.append(response)
+                except Exception:
+                    pass
+            try:
+                page.on("response", _on_response)
+                response_listener = _on_response
+            except Exception:
+                response_listener = None
+
+        def _drop_response_listener():
+            keep_responses[0] = False
+            if response_listener is not None and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("response", response_listener)
+                except Exception:
+                    pass
+
         try:
             await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
         except Exception as e:
+            _drop_response_listener()
             _log(f"频道页打开失败: {e}", "yellow")
             return []
         await self._wait_channel_ready(page)
@@ -7688,7 +7830,21 @@ class AutoLearner:
                 await self._dismiss_channel_gate(page, _log)
 
         if workshop_ids:
+            _drop_response_listener()
             _log(f"频道页发现 {len(workshop_ids)} 个专题班入口（直接读取链接）", "blue")
+            _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
+            return workshop_ids
+
+        # 链接上没有 ID 时，先从页面自己的数据里取（一次 evaluate 拿全），
+        # 再退到内容接口响应；都比"逐张点击 + 等弹窗"快得多。
+        workshop_ids = await self._channel_harvest_from_page_data(page, exclude_id, _log)
+        if not workshop_ids:
+            workshop_ids = await self._channel_harvest_from_responses(
+                responses, exclude_id, _log)
+        _drop_response_listener()
+        if workshop_ids:
+            _log(f"频道页发现 {len(workshop_ids)} 个专题班入口"
+                 f"（页面数据，未逐张点击）", "blue")
             _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
             return workshop_ids
 
