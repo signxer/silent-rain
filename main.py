@@ -1102,6 +1102,14 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
 """
 
 
+def _progress_completed(progress) -> bool:
+    """进度文本是否表示已学完（"100%" / "100" 都算）。"""
+    try:
+        return float(str(progress).replace("%", "").strip()) >= 100
+    except Exception:
+        return False
+
+
 def _debug_url_shape(url: str) -> str:
     """日志里记录 URL 形状：保留路由与参数名，丢掉参数值（避免把 token 写进日志）。"""
     try:
@@ -1111,6 +1119,61 @@ def _debug_url_shape(url: str) -> str:
         return f"{parts.netloc}{parts.path}#{route}" + (f"?[{names}]" if names else "")
     except Exception:
         return ""
+
+
+WORKSHOP_COURSE_TABLE_JS = r"""() => {
+                const norm = (el) => (el && el.innerText ? el.innerText : '')
+                    .replace(/\s+/g, ' ').trim();
+                const table = document.querySelector('table.courseList-table')
+                    || document.querySelector('table');
+                if (!table) return {rows: [], headers: []};
+                const headers = Array.from(
+                    table.querySelectorAll('tr.header th, thead th')).map(norm);
+                const findIdx = (keywords, fallback) => {
+                    for (let i = 0; i < headers.length; i++) {
+                        if (keywords.some((k) => headers[i].indexOf(k) >= 0)) return i;
+                    }
+                    return fallback;
+                };
+                const idx = {
+                    type: findIdx(['类型'], 0),
+                    title: findIdx(['标题', '课程'], 1),
+                    required: findIdx(['必'], 2),
+                    hours: findIdx(['学时'], 3),
+                    progress: findIdx(['进度'], 4),
+                    action: findIdx(['操作'], 5),
+                };
+                const rows = [];
+                const seen = new Set();
+                const push = (tr) => {
+                    if (!tr || seen.has(tr)) return;
+                    const cells = Array.from(tr.querySelectorAll('td'));
+                    if (!cells.length) return;
+                    const cellText = (i) => (i >= 0 && i < cells.length) ? norm(cells[i]) : '';
+                    const title = cellText(idx.title) || cellText(1);
+                    if (!title) return;
+                    seen.add(tr);
+                    const typeCell = cells[idx.type] ? cells[idx.type].querySelector('.course-type') : null;
+                    const pct = cells[idx.progress] ? cells[idx.progress].querySelector('.percent-text') : null;
+                    const actionSpan = cells[idx.action] ? cells[idx.action].querySelector('.edit-block') : null;
+                    const titleCell = cells[idx.title] || tr;
+                    const link = titleCell.querySelector('a[href]') || tr.querySelector('a[href*="course"]');
+                    const href = link ? link.getAttribute('href') : '';
+                    const dataId = tr.getAttribute('data-id') || tr.getAttribute('data-course-id') || '';
+                    rows.push({
+                        type: typeCell ? norm(typeCell) : cellText(idx.type),
+                        title: title,
+                        required: cellText(idx.required),
+                        hours: cellText(idx.hours),
+                        progress: pct ? norm(pct) : cellText(idx.progress),
+                        action: actionSpan ? norm(actionSpan) : cellText(idx.action),
+                        url: href || dataId || ''
+                    });
+                };
+                table.querySelectorAll('tbody tr').forEach(push);
+                document.querySelectorAll('tr.text-center').forEach(push);
+                return {rows: rows, headers: headers};
+            }"""
 
 
 def _manual_progress_payload(done: int, total: int, status: str = "") -> dict:
@@ -4622,6 +4685,41 @@ class AutoLearner:
             _log(f"  API异常: {e}", "red")
             return None
 
+    async def _enroll_workshop_if_needed(self, page: Page, ws_url: str, _log) -> bool:
+        """专题班要先报名，课程列表才会出现（未报名时课程接口拿不到数据）。
+
+        返回 True 表示点了报名；调用方需要重新进详情页等服务器处理。
+        """
+        for keyword in ("立即报名", "加入学习", "免费报名"):
+            try:
+                btn = page.locator(f"text={keyword}").first
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                _log(f"  需要报名，点击「{keyword}」", "blue")
+                old_url = _page_url(page)
+                await btn.click(timeout=8000)
+                # 报名后地址会变（详情路由切到"已报名"形态），等它切过去再继续
+                for _ in range(10):
+                    await page.wait_for_timeout(2000)
+                    if _page_url(page) != old_url:
+                        break
+                    try:
+                        if not await btn.is_visible(timeout=1000):
+                            break
+                    except Exception:
+                        break
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(3000)
+                debug(f"报名前后 URL: {_safe_debug_url(old_url)} → "
+                      f"{_safe_debug_url(_page_url(page))}")
+                return True
+            except Exception as exc:
+                debug(f"报名按钮「{keyword}」点击失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+        return False
+
     async def get_courses_from_workshop(self, page: Page, ws_title: str = "") -> List[Dict]:
         # 从表格提取全部课程信息（不含URL，URL由collector动态采集）
         courses = []
@@ -4657,30 +4755,9 @@ class AutoLearner:
                 except:
                     pass
 
-            rows_data = await page.evaluate("""() => {
-                const results = [];
-                document.querySelectorAll('tr.text-center').forEach(tr => {
-                    const cells = tr.querySelectorAll('td');
-                    if (cells.length < 4) return;
-                    const typeCell = cells[0].querySelector('.course-type');
-                    const pct = cells[4].querySelector('.percent-text');
-                    const actionSpan = cells[5].querySelector('.edit-block');
-                    const link = cells[1].querySelector('a') || tr.querySelector('a[href*="course"]');
-                    const href = link ? link.getAttribute('href') : '';
-                    const dataId = tr.getAttribute('data-id') || tr.getAttribute('data-course-id') || '';
-                    results.push({
-                        type: typeCell ? typeCell.innerText.trim() : cells[0].innerText.trim(),
-                        title: cells[1].innerText.trim(),
-                        required: cells[2].innerText.trim(),
-                        hours: cells[3].innerText.trim(),
-                        progress: pct ? pct.innerText.trim() : cells[4].innerText.trim(),
-                        action: actionSpan ? actionSpan.innerText.trim() : cells[5].innerText.trim(),
-                        url: href || dataId || ''
-                    });
-                });
-                return results;
-            }""")
-
+            table_data = await page.evaluate(WORKSHOP_COURSE_TABLE_JS)
+            rows_data = table_data.get("rows") or []
+            debug(f"  表格列头: {table_data.get('headers')}")
             debug(f"  原始表格行数: {len(rows_data)}, URL: {page.url}")
             if not rows_data:
                 # 没有任何行，dump页面关键区域
@@ -4725,7 +4802,7 @@ class AutoLearner:
                 return None  # 返回None表示需要重试
 
             # 区分：表格有数据但全被过滤 vs 表格根本没数据
-            raw_count = await page.locator("tr.text-center").count()
+            raw_count = len(rows_data) or await page.locator("tr.text-center").count()
             if raw_count > 0 and len(courses) == 0:
                 # 表格有行但全被过滤（图书/考试等），不需要重试
                 skipped_str = ", ".join(skipped[:5])
@@ -6111,10 +6188,15 @@ class AutoLearner:
                     and not self._stop_event.is_set())
 
     @staticmethod
-    def _is_learnable(action: str, hours: str = "") -> bool:
-        """判断课程是否可以学习（未完成或进行中）"""
+    def _is_learnable(action: str, hours: str = "", progress: str = "") -> bool:
+        """判断课程是否可以学习（未完成或进行中）。
+
+        频道里的专题班课程表只有「类型/标题/必选修」三列、没有「操作」列，
+        这时不能一律判成不可学（原来 action 为空直接 False，整张表会被过滤光），
+        改看进度：读到 100% 才算学完。
+        """
         if not action:
-            return False
+            return not _progress_completed(progress)
         # 跳过0学时课程
         try:
             h = float(hours) if hours else -1
@@ -6356,7 +6438,8 @@ class AutoLearner:
 
                 if courses:
                     to_learn = [(i, c) for i, c in enumerate(courses)
-                                if self._is_learnable(c.get('action', ''), c.get('hours', ''))]
+                                if self._is_learnable(c.get('action', ''), c.get('hours', ''),
+                                                          c.get('progress', ''))]
                     action_vals = set(c.get('action', '') for c in courses)
                     debug(f"  课程action值: {action_vals}, 待学: {len(to_learn)}")
                     if not to_learn:
@@ -7941,9 +8024,18 @@ class AutoLearner:
                 if "创建日期" in body or "报名" in body:
                     break
 
-            if "报名截止" in body:
+            if "报名截止" in body or "报名已结束" in body:
                 _log(f"  ⊘ 报名截止，跳过", "yellow")
                 continue
+
+            # 专题班必须先报名，课程列表才会出现；报名后详情地址会变，
+            # 所以要重新进一次详情页等服务器处理（与自动模式同一套做法）。
+            if await self._enroll_workshop_if_needed(page, ws_url, _log):
+                try:
+                    await page.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(5000)
+                except Exception as exc:
+                    debug(f"报名后重新进入详情页失败: {type(exc).__name__}")
 
             # 点击课程标签
             for tab_text in ["课程", "课程列表", "课程目录"]:
@@ -7969,7 +8061,8 @@ class AutoLearner:
                 _log(f"  ✗ 未获取到课程", "yellow")
                 continue
 
-            to_learn = [(i, c) for i, c in enumerate(courses) if self._is_learnable(c.get('action', ''), c.get('hours', ''))]
+            to_learn = [(i, c) for i, c in enumerate(courses) if self._is_learnable(c.get('action', ''), c.get('hours', ''),
+                                                          c.get('progress', ''))]
             ws_title = body[:50].split("\n")[0].strip() if body else ws_id[:16]
 
             if not to_learn:
