@@ -10,6 +10,7 @@ import asyncio
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -244,6 +245,9 @@ class WorkshopIdParsingTests(unittest.TestCase):
 
 class ChannelHarvestTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch("main.console", SimpleNamespace(print=lambda *a, **k: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -303,6 +307,9 @@ class ChannelHarvestTests(unittest.TestCase):
 
 class ChannelClickFallbackTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch("main.console", SimpleNamespace(print=lambda *a, **k: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # 把等待预算压到毫秒级：非卡片链接点了不动时不该拖慢测试
         patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
         patcher.start()
@@ -429,6 +436,11 @@ def _new_learner():
 
 class ChannelHarvestBrowserTests(unittest.TestCase):
     """在真实 Chromium 里跑收割脚本：既验证脚本本身，也防假页面镜像漂移。"""
+
+    def setUp(self):
+        patcher = patch("main.console", SimpleNamespace(print=lambda *a, **k: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _with_browser(self, callback):
         try:
