@@ -57,7 +57,7 @@ from main import (
     DEEPSEEK_DEFAULT_BASE_URL, DEEPSEEK_DEFAULT_MODEL, DeepSeekClient,
     EXAM_DELAY_PER_QUESTION_LIMIT, EXAM_DELAY_MIN_DEFAULT, EXAM_DELAY_MAX_DEFAULT,
     _exam_delay_bounds,
-    obfuscate_secret, deobfuscate_secret, init_debug_log,
+    obfuscate_secret, deobfuscate_secret, init_debug_log, debug,
 )
 
 
@@ -685,11 +685,12 @@ def _macos_app_bundle():
     return bundle if bundle.endswith(".app") else None
 
 
-def _install_macos_pkg(pkg_path, runner=None) -> bool:
+def _install_macos_pkg(pkg_path, runner=None) -> tuple:
     """用 installer(8) 安装 .pkg，经 osascript 申请管理员权限。
 
-    `with administrator privileges` 会弹出系统原生授权框；安装完成才返回，
-    因此可以据此判断成功与否并在失败时退回手动安装。
+    `with administrator privileges` 会弹出系统原生授权框；安装完成才返回。
+    返回 (是否成功, 失败原因)：原因会写进调试日志与界面提示——之前只看
+    返回布尔值，用户看到"退回手动安装"却完全不知道为什么。
     """
     runner = runner or subprocess.run
     command = f"{MACOS_INSTALLER} -pkg {shlex.quote(str(pkg_path))} -target /"
@@ -697,9 +698,17 @@ def _install_macos_pkg(pkg_path, runner=None) -> bool:
     try:
         proc = runner([MACOS_OSASCRIPT, "-e", script],
                       capture_output=True, text=True, timeout=900)
-    except Exception:
-        return False
-    return getattr(proc, "returncode", 1) == 0
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {str(exc)[:160]}"
+        debug(f"installer 调用异常: {reason}")
+        return False, reason
+    code = getattr(proc, "returncode", 1)
+    out = (getattr(proc, "stdout", "") or "").strip()
+    err = (getattr(proc, "stderr", "") or "").strip()
+    debug(f"installer 退出码={code} stdout={out[:200]!r} stderr={err[:300]!r}")
+    if code == 0:
+        return True, ""
+    return False, (err or out or f"exit={code}")
 
 
 def _schedule_macos_relaunch(app_path, pid=None, popen=None) -> None:
@@ -710,9 +719,15 @@ def _schedule_macos_relaunch(app_path, pid=None, popen=None) -> None:
     """
     popen = popen or subprocess.Popen
     pid = os.getpid() if pid is None else pid
+    target = shlex.quote(str(app_path))
+    # 必须等旧进程真的退出再开新版：旧进程还活着时 open -n 会叠出第二个实例，
+    # 两个实例抢同一份会话/浏览器，新版会卡在浏览器初始化。
+    # 等不到就 TERM→KILL，最后用 open（不带 -n）启动，避免强制再开一个实例。
     script = (
-        f"for _ in $(seq 1 60); do kill -0 {int(pid)} 2>/dev/null || break; sleep 0.5; done; "
-        f"/usr/bin/open -n {shlex.quote(str(app_path))}"
+        f"for _ in $(seq 1 40); do kill -0 {int(pid)} 2>/dev/null || break; sleep 0.5; done; "
+        f"if kill -0 {int(pid)} 2>/dev/null; then kill -TERM {int(pid)} 2>/dev/null; sleep 2; fi; "
+        f"if kill -0 {int(pid)} 2>/dev/null; then kill -KILL {int(pid)} 2>/dev/null; sleep 1; fi; "
+        f"/usr/bin/open {target}"
     )
     try:
         popen(["/bin/sh", "-c", script], start_new_session=True)
@@ -4531,12 +4546,21 @@ class MainWindow(_BaseWindow):
             pass
 
     def closeEvent(self, event):
-        """关闭窗口时二次确认并清理资源"""
-        dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
-        style_moisten_dialog(dlg)
-        dlg.cancelButton.setText("取消")
-        dlg.yesButton.setText("退出")
-        if dlg.exec():
+        """关闭窗口时二次确认并清理资源。
+
+        更新流程里的退出必须直接放行：那是程序自己发起的重启，再弹一次
+        "确认退出"会让用户白点一下；更糟的是旧进程会一直卡在弹窗上不退，
+        等不及的 relaunch 于是又叠一个新版实例起来。
+        """
+        if getattr(self, "_quitting_for_update", False):
+            confirmed = True
+        else:
+            dlg = Dialog("确认退出", "确定要退出吗？学习进度会自动保存。", self)
+            style_moisten_dialog(dlg)
+            dlg.cancelButton.setText("取消")
+            dlg.yesButton.setText("退出")
+            confirmed = bool(dlg.exec())
+        if confirmed:
             dash = getattr(self, "screen_dashboard", None)
             # 1) 请求协作式停止（置位停止标志、解除对话框等待，让 worker 尽快退出）
             if dash:
@@ -4596,6 +4620,7 @@ class MainWindow(_BaseWindow):
         self._in_main_shell = False
         self._settings_mode = False
         self._update_in_progress = False
+        self._quitting_for_update = False   # 更新触发的自动退出：不再二次确认
         self._update_download_path = ""
         self._update_wait_started = 0.0
         self._update_wait_timer = None
@@ -5054,6 +5079,7 @@ class MainWindow(_BaseWindow):
                     InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
                     return
                 InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
+                self._quitting_for_update = True
                 QTimer.singleShot(300, QApplication.instance().quit)
                 return
 
@@ -5082,6 +5108,7 @@ del "%~f0"
                 InfoBar.error("更新失败", str(exc)[:180], parent=self, position=InfoBarPosition.TOP)
                 return
             InfoBar.success("更新中", "程序将自动重启", parent=self, position=InfoBarPosition.TOP)
+            self._quitting_for_update = True
             QTimer.singleShot(500, QApplication.instance().quit)
 
         elif _plat.system() == "Darwin":
@@ -5117,7 +5144,8 @@ del "%~f0"
             return
 
         self._set_update_status("正在安装新版本（需要管理员授权）…")
-        if _install_macos_pkg(download_path):
+        installed_ok, reason = _install_macos_pkg(download_path)
+        if installed_ok:
             InfoBar.success("更新完成", "正在重启新版本…", parent=self,
                             position=InfoBarPosition.TOP)
             # .pkg 固定装到 /Applications；用户若从别处（下载目录/AppTranslocation）
@@ -5127,12 +5155,16 @@ del "%~f0"
                 _macos_app_bundle() or installed)
             # 安装已落盘：等本进程退出后再启动，避免新旧两个实例同时运行
             _schedule_macos_relaunch(target_app)
+            self._quitting_for_update = True
             QTimer.singleShot(500, QApplication.instance().quit)
             return
 
-        # 授权被取消或安装失败：用系统安装器打开，让用户手动完成
-        InfoBar.warning("需要手动完成安装", "已打开安装包，请按提示完成安装",
-                        parent=self, position=InfoBarPosition.TOP)
+        # 授权被取消或安装失败：用系统安装器打开，让用户手动完成（并说明原因）
+        debug(f"自动安装未成功，改用系统安装器: {reason}")
+        self._set_update_status("自动安装未成功，已打开安装包")
+        InfoBar.warning("需要手动完成安装",
+                        f"已打开安装包，请按提示完成安装\n（原因：{reason[:80]}）",
+                        parent=self, position=InfoBarPosition.TOP, duration=10000)
         try:
             subprocess.Popen(["/usr/bin/open", download_path])
         except Exception:

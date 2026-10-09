@@ -129,6 +129,10 @@ ONLINE_COURSE_LIST_CARD_SELECTOR = "a.p-cursor[title]"
 # 多 worker 依次启动的间隔（秒）：避免同时打开平台页面；抽成常量便于测试归零
 WORKER_STAGGER_SECONDS = 3.0
 
+# 浏览器启动/建上下文/开页的单项超时（秒）。没有超时的话，一旦被安全软件
+# 拦截或驱动半死，就会永远卡在「使用系统 Chrome」那一步且毫无提示。
+BROWSER_STEP_TIMEOUT_SECONDS = 90
+
 # 学习频道页的专题班入口收割：能从 href / data-* / onclick 静态读出 ID 就不要点击。
 # 覆盖站点不同版本的写法：?id= / workshopId= / workshop_id= / /detail/<id>。
 # 故意不认 logChannelId：那是「频道」ID，当成专题班 ID 会跳错详情页。
@@ -231,6 +235,16 @@ ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS = 8000   # 深链跳页后等卡片渲染
 # 频道页点击后的等待预算（毫秒）。弹窗要短：卡片多数是同标签页跳转，
 # 等满超时会让每次落空都很贵（实测 6 次落空耗了 87 秒）。
 CHANNEL_POPUP_WAIT_MS = 2500
+
+# 频道页常见的"遮挡层"：文明公约/须知需要先点同意才会显示内容
+CHANNEL_GATE_TEXTS = ("同意", "我同意", "接受", "我知道了", "继续访问")
+# 判定"还停在登录/公约页"的特征词
+CHANNEL_LOGIN_HINTS = ("密码登录", "短信登录", "获取验证码", "验证码登录",
+                       "账号登录", "立即登录", "文明公约")
+# 点击兜底时跳过这些明显不是课程入口的链接（协议/隐私/导航/工具）
+CHANNEL_NON_CONTENT_LABEL = re.compile(
+    r"协议|隐私|免责|公约|声明|版权|取消|同意|登录|注册|验证码|下载|浏览器|"
+    r"首页|返回|退出|更多|全部|帮助|客服|关于|设置|收藏|分享|刷新")
 CHANNEL_DETAIL_WAIT_MS = 4000
 
 # 列表页可观测状态：卡片指纹 + 分页器高亮页码 + 路由页码。
@@ -411,6 +425,12 @@ try:
 except Exception:
     pass
 
+# 打包版把调试日志放到固定的用户目录：DEBUG_LOG 原本是相对路径，写的是「当前工作
+# 目录」。用户从 Finder 启动 .app 时 CWD 是 /，写不进去，异常又被吞掉——于是自动
+# 更新重启之后日志会整个消失，排查时什么都拿不到。
+if getattr(sys, 'frozen', False):
+    DEBUG_LOG = os.path.join(_BASE_DIR, "moisten_debug.log")
+
 STORAGE_STATE_PATH = os.path.join(_BASE_DIR, "moisten_session.json")
 USER_CREDENTIALS_PATH = os.path.join(_BASE_DIR, "moisten_credentials.json")
 TAGS_STATE_PATH = os.path.join(_BASE_DIR, "moisten_tags.json")
@@ -442,6 +462,8 @@ def init_debug_log(version: str = ""):
     try:
         tag = f" v{version}" if version else " v?"
         frozen = "frozen" if getattr(sys, "frozen", False) else "source"
+        with _DEBUG_LOG_LOCK, open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n# 日志文件: {os.path.abspath(DEBUG_LOG)}\n")
         with _DEBUG_LOG_LOCK, open(DEBUG_LOG, "a", encoding="utf-8") as f:
             f.write(f"\n=== Moisten Debug Run{tag} | started "
                     f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
@@ -1360,6 +1382,17 @@ class AutoLearner:
         # 考试没考成/没通过时询问是否重考的回调（GUI 注入；命令行/无界面时保持 None → 不重考）
         self.exam_retry_hook = None
 
+    async def _browser_step(self, coro, what: str, _log, seconds=None):
+        """给浏览器启动的每一步加超时：卡住要能看见、能报错，而不是无声挂起。"""
+        budget = BROWSER_STEP_TIMEOUT_SECONDS if seconds is None else seconds
+        try:
+            return await asyncio.wait_for(coro, timeout=budget)
+        except asyncio.TimeoutError:
+            debug(f"{what} 超时（{budget}s）")
+            _log(f"{what}超时（{budget:.0f} 秒无响应），已中止本次启动；"
+                 f"常见原因是安全软件拦截或浏览器未完全退出，稍后重试即可", "red")
+            raise RuntimeError(f"{what}超时") from None
+
     async def init(self, log_callback=None, chrome_path="", download_callback=None):
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         # download_callback(start: bool)：下载 Chromium 前回调 True、完成后回调 False，
@@ -1462,13 +1495,15 @@ class AutoLearner:
             _log("使用内置 Chromium", "yellow")
 
         try:
-            self.browser = await self.playwright.chromium.launch(**launch_opts)
+            self.browser = await self._browser_step(
+                self.playwright.chromium.launch(**launch_opts), "启动浏览器", _log)
         except Exception as e:
             if use_system_chrome:
                 console.print("系统Chrome启动失败，改用内置Chromium", style="yellow")
                 launch_opts.pop("channel", None)
                 try:
-                    self.browser = await self.playwright.chromium.launch(**launch_opts)
+                    self.browser = await self._browser_step(
+                        self.playwright.chromium.launch(**launch_opts), "启动内置 Chromium", _log)
                 except Exception as e2:
                     err2 = str(e2)
                     if "Executable doesn't exist" in err2 or "Browser" in err2:
@@ -1483,7 +1518,9 @@ class AutoLearner:
                             _log("Chromium 下载失败，请检查网络后重试，或改用系统 Chrome 浏览器", "red")
                             raise RuntimeError("Chromium download failed")
                         _log("Chromium 下载完成", "green")
-                        self.browser = await self.playwright.chromium.launch(**launch_opts)
+                        self.browser = await self._browser_step(
+                            self.playwright.chromium.launch(**launch_opts),
+                            "启动内置 Chromium", _log)
                     else:
                         raise
             else:
@@ -1495,18 +1532,21 @@ class AutoLearner:
         }
         if os.path.exists(STORAGE_STATE_PATH):
             try:
-                self.context = await self.browser.new_context(
-                    storage_state=STORAGE_STATE_PATH, **context_opts
-                )
+                self.context = await self._browser_step(
+                    self.browser.new_context(storage_state=STORAGE_STATE_PATH, **context_opts),
+                    "创建浏览器上下文", _log)
                 console.print("已加载保存的会话", style="green")
             except Exception as e:
                 console.print("加载会话失败，创建新会话", style="yellow")
-                self.context = await self.browser.new_context(**context_opts)
+                self.context = await self._browser_step(
+                    self.browser.new_context(**context_opts), "创建浏览器上下文", _log)
         else:
-            self.context = await self.browser.new_context(**context_opts)
+            self.context = await self._browser_step(
+                self.browser.new_context(**context_opts), "创建浏览器上下文", _log)
 
         for i in range(self.workers):
-            page = await self.context.new_page()
+            page = await self._browser_step(
+                self.context.new_page(), f"打开第 {i + 1} 个标签页", _log)
             self.pages.append(page)
 
     async def _download_chromium(self, _log=None, download_callback=None) -> bool:
@@ -7303,6 +7343,38 @@ class AutoLearner:
                 _log(f"  频道课程: {title[:42]}", "green")
         return workshop_ids
 
+    async def _dismiss_channel_gate(self, page: Page, log_callback=None) -> bool:
+        """先过掉频道页的文明公约/须知提示，否则内容根本不会渲染。
+
+        实测：未过公约时页面只有登录面板与协议链接，采集必然为 0；
+        此时再去逐个点链接纯属白费（会点到《用户服务协议》这类链接上）。
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        for text in CHANNEL_GATE_TEXTS:
+            try:
+                btn = page.get_by_text(text, exact=True).first
+                if await btn.count() == 0 or not await btn.is_visible():
+                    continue
+                await btn.click(timeout=5000)
+                await page.wait_for_timeout(1500)
+                _log(f"频道页已点击「{text}」通过提示", "blue")
+                debug(f"频道页点击提示按钮: {text}")
+                return True
+            except Exception as exc:
+                debug(f"频道页提示按钮 {text} 点击失败: {type(exc).__name__}")
+        return False
+
+    async def _channel_looks_gated(self, page: Page) -> str:
+        """页面是否还停在登录/公约状态；返回命中的特征词（空=看起来正常）。"""
+        try:
+            text = await page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            return ""
+        for hint in CHANNEL_LOGIN_HINTS:
+            if hint in text:
+                return hint
+        return ""
+
     async def _dump_channel_anchors(self, page: Page, log_callback=None) -> None:
         """收割不到 ID 时，把频道页链接原样记进日志。
 
@@ -7346,6 +7418,9 @@ class AutoLearner:
             except Exception:
                 continue
             if len(label) <= 5 or label == "查看全部":
+                continue
+            if CHANNEL_NON_CONTENT_LABEL.search(label):
+                # 协议/隐私/登录这类链接点了也不是课程入口，别浪费时间
                 continue
             if not self._looks_like_channel_card(href):
                 continue
@@ -7419,6 +7494,8 @@ class AutoLearner:
         except Exception:
             pass
 
+        await self._dismiss_channel_gate(page, _log)
+
         workshop_ids = await self._channel_harvest_workshops(page, _log)
         if workshop_ids:
             _log(f"频道页发现 {len(workshop_ids)} 个专题班入口（直接读取链接）", "blue")
@@ -7426,6 +7503,12 @@ class AutoLearner:
             return workshop_ids
 
         await self._dump_channel_anchors(page, _log)
+        gate = await self._channel_looks_gated(page)
+        if gate:
+            # 卡在登录/公约页时逐个点链接毫无意义，直接说清楚原因
+            _log(f"频道页仍停在登录/提示页（命中「{gate}」），未进入频道内容", "red")
+            debug(f"频道页被登录/公约遮挡: {gate}")
+            return []
         _log("频道页链接里没有专题班 ID，回退为点击卡片读取", "blue")
         workshop_ids = await self._channel_click_workshops(page, channel_url, _log)
         _log(f"频道页采集到 {len(workshop_ids)} 个专题班",

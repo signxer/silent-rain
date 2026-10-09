@@ -75,6 +75,36 @@ class AnchorLocator:
         return FakeAnchor(self.page, self.page.anchors[index])
 
 
+class _BodyLocator:
+    def __init__(self, page):
+        self.page = page
+
+    async def inner_text(self, timeout=None):
+        return self.page.body_text
+
+
+class _GateLocator:
+    def __init__(self, page, hit):
+        self.page = page
+        self.hit = hit
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return 1 if self.hit else 0
+
+    async def is_visible(self):
+        return self.hit
+
+    async def click(self, timeout=None):
+        self.page.gate_clicks.append(1)
+        if self.page.after_gate is not None:
+            self.page.anchors = list(self.page.after_gate)
+            self.page.body_text = ""
+
+
 class PopupPage:
     def __init__(self, url):
         self.url = url
@@ -125,6 +155,10 @@ class FakeChannelPage:
         self.timeouts = 0
         self.pending_popup = None
         self.anchor_dump = []
+        self.body_text = ""
+        self.gate_text = ""            # 页面上存在这个「同意」按钮
+        self.gate_clicks = []
+        self.after_gate = None         # 点完提示后替换成的新锚点
         self._pending_route = None
         self.route_ticks_left = 0
         self.request_listeners = []
@@ -187,7 +221,13 @@ class FakeChannelPage:
     def locator(self, selector):
         if selector == "a":
             return AnchorLocator(self)
+        if selector == "body":
+            return _BodyLocator(self)
         return EmptyLocator()
+
+    def get_by_text(self, text, exact=False):
+        hit = bool(self.gate_text) and text == self.gate_text and not self.gate_clicks
+        return _GateLocator(self, hit)
 
     def expect_event(self, name, timeout=None):
         return _EventContext(self)
@@ -590,7 +630,7 @@ class ChannelDiagnosticsTests(unittest.TestCase):
     def test_click_attempts_are_logged(self):
         """点了没反应也要留痕，否则日志里完全看不到。"""
         page = FakeChannelPage(anchors=[
-            {"label": "首页导航入口", "href": "javascript:void(0)"},
+            {"label": "信贷业务专题班（第一期）", "href": "javascript:void(0)"},
         ])
         asyncio.run(self._learner()._collect_channel_workshops(
             page, CHANNEL_URL, self.silent))
@@ -677,6 +717,60 @@ class ChannelHarvestChildAttrTests(unittest.TestCase):
         self.assertEqual(harvested, [WS_B, WS_A])
         # 标题取自外层链接（子元素没有完整文案时也要有可读名字）
         self.assertIn("数据安全专题班", [e["title"] for e in raw])
+
+
+class ChannelGateTests(unittest.TestCase):
+    """频道页的文明公约/登录遮挡：必须先过掉，且不要在遮挡页上乱点链接。"""
+
+    def setUp(self):
+        patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.CHANNEL_POPUP_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        import threading
+        self.learner._stop_event = threading.Event()
+
+    def _collect(self, page):
+        asyncio.run(self.learner._collect_channel_workshops(
+            page, CHANNEL_URL, lambda m, s="": self.logs.append(str(m))))
+
+    def test_gate_is_dismissed_then_content_is_harvested(self):
+        page = FakeChannelPage(anchors=[{"label": "导航入口", "href": "javascript:void(0)"}])
+        page.gate_text = "同意"
+        page.body_text = "文明公约 取消 同意"
+        page.after_gate = [{"label": "2026年信贷业务专题班", "href": DETAIL_A}]
+        self._collect(page)
+        self.assertEqual(page.gate_clicks, [1])
+        self.assertTrue(any("通过提示" in m for m in self.logs), self.logs)
+
+    def test_gated_page_stops_without_clicking_links(self):
+        """停在登录/公约页时逐个点链接毫无意义——实测会点到《用户服务协议》上。"""
+        page = FakeChannelPage(anchors=[
+            {"label": "《用户服务协议》", "href": ""},
+            {"label": "《隐私政策》", "href": ""},
+            {"label": "《免责声明》", "href": ""},
+        ])
+        page.body_text = "密码登录 短信登录 获取验证码 文明公约取消 同意"
+        self._collect(page)
+        self.assertEqual(page.clicks, 0, "遮挡页上不该去点协议/导航链接")
+        self.assertTrue(any("仍停在登录/提示页" in m for m in self.logs), self.logs)
+
+    def test_non_content_labels_are_skipped_in_click_fallback(self):
+        page = FakeChannelPage(anchors=[
+            {"label": "《用户服务协议》", "href": "javascript:void(0)"},
+            {"label": "首页返回入口", "href": "javascript:void(0)"},
+            {"label": "获取验证码按钮", "href": "javascript:void(0)"},
+        ])
+        page.body_text = "正常页面，没有登录也没有公约"   # 不触发 gated 判定
+        self._collect(page)
+        self.assertEqual(page.clicks, 0)
 
 
 if __name__ == "__main__":

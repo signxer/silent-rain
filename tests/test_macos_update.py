@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -187,8 +188,9 @@ class MacOSUpdateHelperTests(unittest.TestCase):
             calls.append(args)
             return type("P", (), {"returncode": 0})()
 
-        ok = gui._install_macos_pkg("/tmp/Moisten 2.3.9-macOS.pkg", runner=runner)
+        ok, reason = gui._install_macos_pkg("/tmp/Moisten 2.3.9-macOS.pkg", runner=runner)
         self.assertTrue(ok)
+        self.assertEqual(reason, "")
         self.assertEqual(calls[0][0], gui.MACOS_OSASCRIPT)
         self.assertEqual(calls[0][1], "-e")
         script = calls[0][2]
@@ -201,13 +203,17 @@ class MacOSUpdateHelperTests(unittest.TestCase):
         def runner(args, **kwargs):
             return type("P", (), {"returncode": 1})()
 
-        self.assertFalse(gui._install_macos_pkg("/tmp/x.pkg", runner=runner))
+        ok, reason = gui._install_macos_pkg("/tmp/x.pkg", runner=runner)
+        self.assertFalse(ok)
+        self.assertIn("exit=1", reason)
 
     def test_install_pkg_handles_runner_exception(self):
         def runner(args, **kwargs):
             raise OSError("osascript missing")
 
-        self.assertFalse(gui._install_macos_pkg("/tmp/x.pkg", runner=runner))
+        ok, reason = gui._install_macos_pkg("/tmp/x.pkg", runner=runner)
+        self.assertFalse(ok)
+        self.assertIn("OSError", reason)
 
     def test_relaunch_waits_for_pid_then_opens_app(self):
         calls = []
@@ -221,7 +227,7 @@ class MacOSUpdateHelperTests(unittest.TestCase):
         args, kwargs = calls[0]
         self.assertEqual(args[0], "/bin/sh")
         self.assertIn("kill -0 4242", args[2])
-        self.assertIn("/usr/bin/open -n /Applications/Moisten.app", args[2])
+        self.assertIn("/usr/bin/open /Applications/Moisten.app", args[2])
         self.assertTrue(kwargs.get("start_new_session"))
 
 
@@ -251,7 +257,8 @@ class MacOSUpdateLaunchTests(unittest.TestCase):
              patch("gui.os.path.isfile", return_value=True), \
              patch("gui.os.path.isdir", return_value=installed_app_exists), \
              patch("gui.os.path.abspath", side_effect=lambda p: p), \
-             patch("gui._install_macos_pkg", return_value=install_ok) as install, \
+             patch("gui._install_macos_pkg",
+                    return_value=(install_ok, "" if install_ok else "test-fail")) as install, \
              patch("gui._schedule_macos_relaunch") as relaunch, \
              patch("gui.subprocess.Popen") as popen, \
              patch("gui.InfoBar"), \
@@ -320,6 +327,75 @@ class DownloadValidationWiringTests(unittest.TestCase):
             source = fh.read()
         self.assertNotIn("_looks_like_executable(", source)
         self.assertIn("_looks_like_installer(download_path)", source)
+
+
+class UpdateQuitFlowTests(unittest.TestCase):
+    """更新流程的自动退出不能弹"确认退出"，否则旧进程会卡住不退。"""
+
+    class _Event:
+        def __init__(self):
+            self.accepted = False
+            self.ignored = False
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.ignored = True
+
+    def _close(self, quitting, exec_result=True):
+        win = SimpleNamespace(_quitting_for_update=quitting, screen_dashboard=None)
+        event = self._Event()
+        with patch("gui.Dialog") as dialog_cls, \
+             patch("gui.style_moisten_dialog"):
+            dialog_cls.return_value.exec.return_value = exec_result
+            gui.MainWindow.closeEvent(win, event)
+        return event, dialog_cls
+
+    def test_update_quit_skips_confirmation_dialog(self):
+        event, dialog_cls = self._close(quitting=True)
+        dialog_cls.assert_not_called()
+        self.assertTrue(event.accepted)
+        self.assertFalse(event.ignored)
+
+    def test_normal_quit_still_confirms(self):
+        event, dialog_cls = self._close(quitting=False, exec_result=True)
+        dialog_cls.assert_called_once()
+        self.assertTrue(event.accepted)
+
+    def test_cancelled_quit_keeps_window_open(self):
+        event, dialog_cls = self._close(quitting=False, exec_result=False)
+        dialog_cls.assert_called_once()
+        self.assertTrue(event.ignored)
+        self.assertFalse(event.accepted)
+
+    def test_relaunch_escalates_and_does_not_force_a_second_instance(self):
+        """等旧进程退出；等不到就 TERM/KILL；最后用 open（不带 -n）启动。"""
+        calls = []
+
+        def popen(args, **kwargs):
+            calls.append((args, kwargs))
+            return object()
+
+        gui._schedule_macos_relaunch("/Applications/Moisten.app", pid=4242, popen=popen)
+        script = calls[0][0][2]
+        self.assertIn("kill -0 4242", script)
+        self.assertIn("kill -TERM 4242", script)
+        self.assertIn("kill -KILL 4242", script)
+        self.assertIn("/usr/bin/open /Applications/Moisten.app", script)
+        self.assertNotIn("open -n", script)          # -n 会在旧实例还活着时叠一个
+        self.assertTrue(calls[0][1].get("start_new_session"))
+
+    def test_install_failure_reason_is_logged(self):
+        def runner(args, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="installer: not permitted")
+
+        logs = []
+        with patch("gui.debug", side_effect=lambda m: logs.append(str(m))):
+            ok, reason = gui._install_macos_pkg("/tmp/x.pkg", runner=runner)
+        self.assertFalse(ok)
+        self.assertIn("not permitted", reason)
+        self.assertTrue(any("installer 退出码=1" in m for m in logs), logs)
 
 
 if __name__ == "__main__":
