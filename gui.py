@@ -5380,7 +5380,7 @@ def main():
 def _main():
     import platform, multiprocessing
     multiprocessing.freeze_support()
-    init_debug_log()
+    init_debug_log(CURRENT_VERSION)
     # 抑制 Qt 字体警告
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     # macOS 高DPI支持

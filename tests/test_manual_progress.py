@@ -12,6 +12,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -298,6 +299,86 @@ class ManualProgressWiringTests(unittest.TestCase):
                                 "成功与各失败分支都要推进总进度")
         self.assertIn('report_items("准备中")', source,
                       "开工前要先报一次总数，界面才能显示 0/N")
+
+
+class ManualEntryDiagnosticsTests(unittest.TestCase):
+    """入口分类与"没有可学内容"的终态：不能让进度环停在"准备中"。"""
+
+    def setUp(self):
+        self.logs = []
+        patcher = patch("main.debug", side_effect=lambda msg: self.logs.append(str(msg)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.learner = AutoLearner.__new__(AutoLearner)
+        self.learner._stop_event = threading.Event()
+        self.learner.pages = [SimpleNamespace(url="about:blank")]
+        self.events = []
+
+    def _run(self, urls):
+        asyncio.run(self.learner.learn_from_urls(
+            urls, 1, progress_callback=self.events.append,
+            hours_callback=lambda d: None, log_callback=lambda m, s="": None))
+        return [e for e in self.events if "manual_total" in e]
+
+    def test_unrecognized_urls_report_terminal_state(self):
+        events = self._run(["https://u.ccb.com/portal/#/study",
+                            "https://u.ccb.com/portal/#/index"])
+        self.assertEqual(events[0]["manual_total"], 0)
+        self.assertEqual(events[-1].get("manual_status"), "未识别到可学习的链接")
+        self.assertTrue(any("都没识别出类型" in m for m in self.logs), self.logs)
+
+    def test_channel_and_workshop_urls_are_classified(self):
+        CH = "https://u.ccb.com/sys/#/channel/show/268bc9bb-3ed5-466c-adca-39191ed61666"
+        self.learner._collect_channel_workshops = AsyncStub([])
+        events = self._run([CH])
+        self.assertTrue(any("频道1" in m for m in self.logs), self.logs)
+        self.assertEqual(events[-1].get("manual_status"), "没有可学习的内容")
+
+    def test_trainingcamp_without_courses_reports_done_like_state(self):
+        self.learner._collect_trainingcamp_courses = AsyncStub([])
+        events = self._run(["https://u.ccb.com/trainingcamp/#/traincampdetail/camp-1/away"])
+        self.assertEqual(events[-1].get("manual_status"), "没有可学习的内容（可能已全部完成）")
+        self.assertTrue(any("训练营采集结果: 0" in m for m in self.logs), self.logs)
+
+
+class AsyncStub:
+    def __init__(self, result):
+        self.result = result
+
+    async def __call__(self, *args, **kwargs):
+        return self.result
+
+
+class DebugLogIdentityTests(unittest.TestCase):
+    """日志必须能看出跑的是哪一版：否则排查时只能猜。"""
+
+    def test_run_marker_carries_version_and_runtime(self):
+        import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "d.log")
+            with patch("main.DEBUG_LOG", path):
+                main.init_debug_log("2.4.3")
+            with open(path, encoding="utf-8") as fh:
+                marker = fh.read().strip()
+        self.assertIn("v2.4.3", marker)
+        self.assertIn("python", marker)
+        self.assertIn("Darwin" if sys.platform == "darwin" else "", marker)
+        self.assertIn("frozen" if getattr(sys, "frozen", False) else "source", marker)
+
+    def test_run_marker_without_version_still_written(self):
+        import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "d.log")
+            with patch("main.DEBUG_LOG", path):
+                main.init_debug_log()
+            with open(path, encoding="utf-8") as fh:
+                marker = fh.read().strip()
+        self.assertIn("Moisten Debug Run", marker)
+
+    def test_gui_passes_current_version(self):
+        import inspect
+        source = inspect.getsource(gui._main)
+        self.assertIn("init_debug_log(CURRENT_VERSION)", source)
 
 
 if __name__ == "__main__":

@@ -139,15 +139,11 @@ CHANNEL_WORKSHOP_HARVEST_JS = r"""
   const IDLIKE = /^[0-9a-zA-Z_-]{8,}$/;
   const ATTRS = ['href', 'data-href', 'data-url', 'data-workshop-id',
                  'data-workshopid', 'data-id', 'onclick'];
-  const out = [];
-  const seen = new Set();
-  const nodes = document.querySelectorAll(
-      'a[href], a[data-id], a[data-href], a[data-url], [data-id], [data-href], [data-url], [onclick]');
-  for (const el of nodes) {
-    const isAnchor = el.tagName === 'A' || (el.hasAttribute && el.hasAttribute('href'));
-    let id = '', source = '', raw = '';
+  const idOf = (el) => {
+    if (!el || !el.getAttribute) return null;
+    const isAnchor = el.tagName === 'A' || el.hasAttribute('href');
     for (const name of ATTRS) {
-      const value = el.getAttribute ? el.getAttribute(name) : null;
+      const value = el.getAttribute(name);
       if (!value) continue;
       const text = String(value);
       let candidate = '';
@@ -155,21 +151,73 @@ CHANNEL_WORKSHOP_HARVEST_JS = r"""
       if (m) {
         candidate = m[1];
       } else if (name === 'data-workshop-id' || name === 'data-workshopid') {
-        // 这两个属性本身就是 ID，允许裸值
         if (IDLIKE.test(text.trim())) candidate = text.trim();
       } else if (name === 'data-id' && isAnchor) {
         if (IDLIKE.test(text.trim())) candidate = text.trim();
       } else if (name === 'onclick') {
-        // onclick="openWorkshop('1111-...')" 这类只有裸 UUID
         const u = text.match(UUID);
         if (u) candidate = u[0];
       }
-      if (candidate) { id = candidate; source = name; raw = text; break; }
+      if (candidate) return {id: candidate, source: name, raw: text};
     }
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
+    return null;
+  };
+  const out = [];
+  const seen = new Set();
+  const push = (hit, title) => {
+    if (!hit || seen.has(hit.id)) return false;
+    seen.add(hit.id);
+    out.push({id: hit.id, title: title, source: hit.source, raw: hit.raw});
+    return true;
+  };
+  // 1) 链接本身带 ID
+  for (const a of Array.from(document.querySelectorAll('a'))) {
+    const title = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+    if (push(idOf(a), title)) continue;
+    // 2) 卡片把 ID 挂在链接里的子元素上（Vue 常见：外层 a 只有 @click）
+    const kids = a.querySelectorAll(
+        '[href],[data-id],[data-href],[data-url],[data-workshop-id],[data-workshopid],[onclick]');
+    for (const child of Array.from(kids)) {
+      if (push(idOf(child), title)) break;
+    }
+  }
+  // 3) 非 <a> 的卡片容器
+  for (const el of Array.from(document.querySelectorAll(
+      '[data-id],[data-href],[data-url],[data-workshop-id],[data-workshopid],[onclick]'))) {
+    if (el.closest && el.closest('a')) continue;   // 上面已扫过
     const title = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-    out.push({id: id, title: title, source: source, raw: raw});
+    push(idOf(el), title);
+  }
+  return out;
+}
+"""
+
+# 收割一无所获时，把页面链接原样记下来：否则只能靠猜这个页面的链接长什么样。
+CHANNEL_ANCHOR_DUMP_JS = r"""
+() => {
+  const out = [];
+  const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
+  for (const a of Array.from(document.querySelectorAll('a')).slice(0, 30)) {
+    out.push({
+      kind: 'a',
+      label: clean(a.innerText || a.textContent).slice(0, 40),
+      href: (a.getAttribute('href') || '').slice(0, 160),
+      attrs: Array.from(a.attributes || []).map((x) => x.name)
+          .filter((n) => n.startsWith('data-') || n === 'onclick').join(','),
+    });
+  }
+  // 卡片可能根本不是链接（div/li + @click）：一并列出来，才知道点击该找谁
+  for (const el of Array.from(document.querySelectorAll(
+      '[class*=card],[class*=item],[class*=course],[class*=channel],[class*=list]')).slice(0, 30)) {
+    if (el.closest('a') || el.querySelector('a')) continue;
+    const label = clean(el.innerText || el.textContent);
+    if (label.length < 4) continue;
+    out.push({
+      kind: 'card',
+      label: label.slice(0, 40),
+      href: '',
+      attrs: String(el.className || '').slice(0, 80),
+    });
   }
   return out;
 }
@@ -180,7 +228,9 @@ ONLINE_PAGE_CHANGE_TIMEOUT_MS = 4500      # 点击下一页后等渲染真正生
 ONLINE_PAGE_ROUTE_TIMEOUT_MS = 5000       # 路由跳转后等卡片真正换掉
 ONLINE_PAGE_SETTLE_DELAY_MS = 400         # 落地路由确认间隔
 ONLINE_PAGE_DEEP_LINK_TIMEOUT_MS = 8000   # 深链跳页后等卡片渲染
-# 频道页点击后等路由落到 /detail 的预算（毫秒）；非卡片链接点了不动时别耗太久
+# 频道页点击后的等待预算（毫秒）。弹窗要短：卡片多数是同标签页跳转，
+# 等满超时会让每次落空都很贵（实测 6 次落空耗了 87 秒）。
+CHANNEL_POPUP_WAIT_MS = 2500
 CHANNEL_DETAIL_WAIT_MS = 4000
 
 # 列表页可观测状态：卡片指纹 + 分页器高亮页码 + 路由页码。
@@ -383,11 +433,20 @@ def safe_print(text, style=None):
 DEBUG_LOG = "moisten_debug.log"
 _DEBUG_LOG_LOCK = threading.Lock()
 
-def init_debug_log():
-    # Append a run marker instead of discarding prior diagnostics.
+def init_debug_log(version: str = ""):
+    """写一条运行标记。
+
+    带上版本号与运行形态：没有这些信息时，拿到日志也无法判断用户跑的是哪一版、
+    是源码还是打包版，排查只能靠猜（每次都要多问一轮）。
+    """
     try:
+        tag = f" v{version}" if version else " v?"
+        frozen = "frozen" if getattr(sys, "frozen", False) else "source"
         with _DEBUG_LOG_LOCK, open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n=== Moisten Debug Run | started {datetime.now().astimezone().isoformat(timespec='seconds')} ===\n")
+            f.write(f"\n=== Moisten Debug Run{tag} | started "
+                    f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
+                    f"| {platform.system()} {platform.release()} "
+                    f"| python {platform.python_version()} | {frozen} ===\n")
     except:
         pass
 
@@ -1012,6 +1071,17 @@ _STUDY_HOURS_DOM_JS_TEMPLATE = r"""
   };
 }
 """
+
+
+def _debug_url_shape(url: str) -> str:
+    """日志里记录 URL 形状：保留路由与参数名，丢掉参数值（避免把 token 写进日志）。"""
+    try:
+        parts = urlsplit(url or "")
+        route, _sep, query = parts.fragment.partition("?")
+        names = ",".join(sorted(parse_qs(query).keys())) if query else ""
+        return f"{parts.netloc}{parts.path}#{route}" + (f"?[{names}]" if names else "")
+    except Exception:
+        return ""
 
 
 def _manual_progress_payload(done: int, total: int, status: str = "") -> dict:
@@ -7071,6 +7141,65 @@ class AutoLearner:
         return (parse_qs(query).get("id") or [""])[0].strip()
 
     @staticmethod
+    def _channel_workshop_id_from_landing(url: str, exclude_id: str = "") -> str:
+        """从点击后的落地地址里尽力取专题班 ID。
+
+        频道页的卡片不一定跳到 /workshop/#/detail：可能是别的路由、路径式
+        /detail/<id>，或者只是地址里带了个 UUID。这里按"越明确的越优先"来取。
+        """
+        strict = AutoLearner._channel_workshop_id_from_url(url)
+        if strict:
+            return strict
+        try:
+            parts = urlsplit(url or "")
+        except Exception:
+            return ""
+        fragment = parts.fragment
+        route, _sep, fragment_query = fragment.partition("?")
+        # 1) 明确的 ID 参数：hash 里的、以及 API 地址 query 里的（SPA 取详情时最常见）
+        for query in (fragment_query, parts.query):
+            params = parse_qs(query or "")
+            for key in ("id", "workshopId", "workshop_id"):
+                value = (params.get(key) or [""])[0].strip()
+                if value:
+                    return value
+        # 2) 路径式 /detail/<id>、/myworkshop/detail/<id>
+        haystack = f"{parts.path}#{fragment}"
+        match = (re.search(r"/(?:my)?workshop/detail/([0-9a-zA-Z_-]{8,})", haystack)
+                 or re.search(r"/detail/([0-9a-zA-Z_-]{8,})", haystack))
+        if match:
+            return match.group(1)
+        # 3) 兜底：只有一个 UUID 才敢认。
+        #    还在频道落地页上时地址里的 UUID 是频道 ID；已知频道 ID 也要排掉。
+        if route.rstrip("/").startswith("/channel/show"):
+            return ""
+        uuids = set(re.findall(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            fragment))
+        if exclude_id:
+            uuids.discard(exclude_id)
+        return next(iter(uuids)) if len(uuids) == 1 else ""
+
+    @staticmethod
+    def _workshop_id_from_requests(urls, exclude_id: str = "") -> str:
+        """从点击期间的网络请求里找专题班 ID（SPA 一定会去取详情）。"""
+        found = ""
+        for url in urls or []:
+            try:
+                low = str(url).lower()
+            except Exception:
+                continue
+            if "workshop" not in low and "/detail" not in low:
+                continue
+            if "/channel/show" in low:
+                continue
+            candidate = AutoLearner._channel_workshop_id_from_landing(
+                str(url), exclude_id=exclude_id)
+            if candidate:
+                found = candidate
+        return found
+
+    @staticmethod
     def _looks_like_channel_card(href: str) -> bool:
         """频道页卡片入口的粗略特征：无 href、javascript:void(0) 或指向详情。"""
         href = (href or "").strip().lower()
@@ -7096,12 +7225,30 @@ class AutoLearner:
                 return url
             delay_ms = min(int(delay_ms * 1.5), 1000)
 
-    async def _channel_open_detail(self, page: Page, clicker) -> str:
-        """点击一个频道入口并返回落地地址；弹窗与同标签页跳转都支持。"""
+    async def _channel_open_detail(self, page: Page, clicker,
+                                   captured: Optional[list] = None) -> str:
+        """点击一个频道入口并返回落地地址；弹窗与同标签页跳转都支持。
+
+        captured 传入列表时，顺带记录点击期间发出的请求 URL —— 页面把 ID 藏在
+        组件状态里时，往往只有"点一下看它请求了什么"才能拿到。
+        """
+        listener = None
+        if captured is not None and hasattr(page, "on"):
+            def _on_request(request):
+                try:
+                    captured.append(getattr(request, "url", ""))
+                except Exception:
+                    pass
+            try:
+                page.on("request", _on_request)
+                listener = _on_request
+            except Exception:
+                listener = None
         popup = None
         try:
             try:
-                async with page.expect_event("popup", timeout=7000) as popup_info:
+                async with page.expect_event("popup",
+                                             timeout=CHANNEL_POPUP_WAIT_MS) as popup_info:
                     await clicker()
                 popup = await popup_info.value
                 try:
@@ -7116,6 +7263,11 @@ class AutoLearner:
             if popup is not None:
                 try:
                     await popup.close()
+                except Exception:
+                    pass
+            if listener is not None and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("request", listener)
                 except Exception:
                     pass
 
@@ -7151,6 +7303,27 @@ class AutoLearner:
                 _log(f"  频道课程: {title[:42]}", "green")
         return workshop_ids
 
+    async def _dump_channel_anchors(self, page: Page, log_callback=None) -> None:
+        """收割不到 ID 时，把频道页链接原样记进日志。
+
+        页面把 ID 藏在组件状态里（Vue @click）时，只能靠点击；但下一次若是别的
+        写法，有这份链接清单就能直接改选择器，不用再让用户来回跑一轮。
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        try:
+            anchors = await page.evaluate(CHANNEL_ANCHOR_DUMP_JS)
+        except Exception as exc:
+            debug(f"频道页链接清单读取失败: {type(exc).__name__}")
+            return
+        if not anchors:
+            debug("频道页链接清单: 页面上没有 <a> 元素")
+            return
+        debug(f"频道页链接清单({len(anchors)}条):")
+        for item in anchors:
+            debug(f"  node[{item.get('kind', 'a')}]: label={item.get('label')!r} "
+                  f"href={item.get('href')!r} attrs={item.get('attrs')!r}")
+        _log(f"频道页 {len(anchors)} 个链接的属性已写入调试日志", "yellow")
+
     async def _channel_click_workshops(self, page: Page, channel_url: str,
                                        log_callback=None) -> List[str]:
         """兜底：逐个点击频道入口，从落地地址里取专题班 ID。"""
@@ -7177,10 +7350,29 @@ class AutoLearner:
             if not self._looks_like_channel_card(href):
                 continue
             detail_url = ""
+            captured = []
+            channel_id = channel_url.rstrip("/").rsplit("/", 1)[-1]
+            before_url = _page_url(page)
             try:
                 detail_url = await self._channel_open_detail(
-                    page, lambda item=link: item.click(timeout=10000))
-                workshop_id = self._channel_workshop_id_from_url(detail_url)
+                    page, lambda item=link: item.click(timeout=10000),
+                    captured=captured)
+                workshop_id = ""
+                if detail_url.rstrip("/") != before_url.rstrip("/"):
+                    # 地址变了才从落地地址抠；没跳走时那是频道页地址，抠出来的是频道 ID
+                    workshop_id = self._channel_workshop_id_from_landing(
+                        detail_url, exclude_id=channel_id)
+                if not workshop_id:
+                    # 地址没变也可能弹层/内嵌加载：看点击期间请求了什么详情接口
+                    workshop_id = self._workshop_id_from_requests(
+                        captured, exclude_id=channel_id)
+                # 每次点击都留痕：不然"点了没反应"在日志里完全看不见
+                debug(f"频道页点击[{index}] label={label[:30]!r} "
+                      f"href={_debug_url_shape(href)} → {_debug_url_shape(detail_url)} "
+                      f"id={workshop_id or '-'} 请求{len(captured)}条")
+                if not workshop_id and captured:
+                    debug("  点击期间的请求: " + " | ".join(
+                        _debug_url_shape(u) for u in captured[:6]))
                 if workshop_id:
                     consecutive_misses = 0
                     if workshop_id not in seen:
@@ -7233,6 +7425,7 @@ class AutoLearner:
             _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
             return workshop_ids
 
+        await self._dump_channel_anchors(page, _log)
         _log("频道页链接里没有专题班 ID，回退为点击卡片读取", "blue")
         workshop_ids = await self._channel_click_workshops(page, channel_url, _log)
         _log(f"频道页采集到 {len(workshop_ids)} 个专题班",
@@ -7474,16 +7667,29 @@ class AutoLearner:
                 if uid not in workshop_ids:
                     workshop_ids.append(uid)
 
+        debug(f"手动模式URL分类: 共{len(urls)}条 → 频道{len(channel_urls)} "
+              f"训练营{len(trainingcamp_ids)} 课程{len(course_urls)} 专题班{len(workshop_ids)}")
+        if not (channel_urls or trainingcamp_ids or course_urls or workshop_ids):
+            # 一条都没认出来：明确告诉用户，别让进度环停在"准备中"
+            debug(f"手动模式: {len(urls)} 条 URL 都没识别出类型")
+            _progress(_manual_progress_payload(0, 0, "未识别到可学习的链接"))
+            _log("未从URL中提取到有效的专题班/训练营/课程ID", "red")
+            return
+
         for channel_url in channel_urls:
             _log(f"正在采集学习频道: {channel_url.rsplit('/', 1)[-1]}", "blue")
-            for workshop_id in await self._collect_channel_workshops(page, channel_url, _log):
+            found = await self._collect_channel_workshops(page, channel_url, _log)
+            debug(f"学习频道采集结果: {len(found)} 个专题班")
+            for workshop_id in found:
                 if workshop_id not in workshop_ids:
                     workshop_ids.append(workshop_id)
 
         # 训练营详情页中的课程页使用 /traincamp/study/{campId}/{courseId} 路由。
         for camp_id in trainingcamp_ids:
             _log(f"正在采集训练营课程: {camp_id}", "blue")
-            course_urls.extend(await self._collect_trainingcamp_courses(page, camp_id, _log))
+            camp_courses = await self._collect_trainingcamp_courses(page, camp_id, _log)
+            debug(f"训练营采集结果: {len(camp_courses)} 个课程链接")
+            course_urls.extend(camp_courses)
 
         # 课程URL：直接打开课程页学习（不走专题班流程）
         if course_urls:
@@ -7499,14 +7705,19 @@ class AutoLearner:
                 elif isinstance(task, dict) and not isinstance(deduplicated_urls[course_url_indexes[url]], dict):
                     # 详情页采集到的标题比单独粘贴课程路由更完整。
                     deduplicated_urls[course_url_indexes[url]] = task
+            debug(f"手动模式课程URL开始学习: {len(deduplicated_urls)} 个")
             await self._learn_course_urls(deduplicated_urls, workers, _log, _progress, _hours)
 
         if not workshop_ids:
             if not course_urls:
                 if trainingcamp_ids:
                     _log("训练营中未获取到可学习课程", "yellow")
+                    debug("手动模式: 训练营没有采集到可学习课程")
+                    _progress(_manual_progress_payload(0, 0, "没有可学习的内容（可能已全部完成）"))
                 else:
                     _log("未从URL中提取到有效的专题班/训练营/课程ID", "red")
+                    debug("手动模式: 专题班/课程都没采集到内容")
+                    _progress(_manual_progress_payload(0, 0, "没有可学习的内容"))
             return
 
         _log(f"共 {len(workshop_ids)} 个专题班待学习", "blue")
@@ -7585,6 +7796,7 @@ class AutoLearner:
 
         # 开始学习
         _log(f"\n开始学习 {len(all_tasks)} 门课程", "bold blue")
+        debug(f"手动模式专题班开始学习: {len(all_tasks)} 门课程")
         await self.parallel_learn_courses(
             all_tasks, ws_locks, None, _progress, _hours, _log,
             report_item_progress=True,

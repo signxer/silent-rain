@@ -124,8 +124,10 @@ class FakeChannelPage:
         self.gotos = []
         self.timeouts = 0
         self.pending_popup = None
+        self.anchor_dump = []
         self._pending_route = None
         self.route_ticks_left = 0
+        self.request_listeners = []
 
     # ── 路由 ──
     def schedule_route(self, target):
@@ -162,6 +164,8 @@ class FakeChannelPage:
     async def evaluate(self, script):
         if self.evaluate_fails:
             raise RuntimeError("evaluate failed")
+        if "slice(0, 30)" in str(script):        # 链接清单 dump 脚本
+            return list(getattr(self, "anchor_dump", []))
         out = []
         seen = set()
         for spec in self.anchors:
@@ -187,6 +191,17 @@ class FakeChannelPage:
 
     def expect_event(self, name, timeout=None):
         return _EventContext(self)
+
+    def on(self, event, handler):
+        self.request_listeners.append(handler)
+
+    def remove_listener(self, event, handler):
+        if handler in self.request_listeners:
+            self.request_listeners.remove(handler)
+
+    def emit_request(self, url):
+        for handler in list(self.request_listeners):
+            handler(SimpleNamespace(url=url))
 
     def is_closed(self):
         return False
@@ -492,6 +507,176 @@ class ChannelHarvestBrowserTests(unittest.TestCase):
         self.assertEqual(
             script_ids, [entry["id"] for entry in mirror_ids],
             "假页面镜像与真实收割脚本结果不一致，请同步更新 _candidate_id")
+
+
+class WorkshopIdFromLandingTests(unittest.TestCase):
+    """点击后落地地址形状不确定：要尽力取到 ID，又不能把频道 ID 当成专题班。"""
+
+    def test_prefers_detail_route(self):
+        extract = AutoLearner._channel_workshop_id_from_landing
+        self.assertEqual(extract(DETAIL_A), WS_A)
+        self.assertEqual(extract(DETAIL_B), WS_B)
+
+    def test_accepts_path_style_and_other_params(self):
+        extract = AutoLearner._channel_workshop_id_from_landing
+        self.assertEqual(
+            extract(f"https://u.ccb.com/workshop/#/detail/{WS_C}"), WS_C)
+        self.assertEqual(
+            extract(f"https://u.ccb.com/portal/#/workshopDetail?workshopId={WS_C}"), WS_C)
+        self.assertEqual(
+            extract(f"https://u.ccb.com/sys/#/channel/course?workshop_id={WS_C}"), WS_C)
+
+    def test_single_uuid_is_accepted_anywhere(self):
+        extract = AutoLearner._channel_workshop_id_from_landing
+        self.assertEqual(extract(f"https://u.ccb.com/x/#/y/{WS_C}"), WS_C)
+
+    def test_channel_page_id_is_never_treated_as_workshop(self):
+        """点击没跳走时页面还是频道地址，里面的 UUID 是频道 ID。"""
+        extract = AutoLearner._channel_workshop_id_from_landing
+        self.assertEqual(extract(CHANNEL_URL), "")
+        self.assertEqual(extract(f"https://u.ccb.com/sys/#/channel/show/{CHANNEL_ID}"), "")
+
+    def test_ambiguous_uuids_are_rejected(self):
+        extract = AutoLearner._channel_workshop_id_from_landing
+        self.assertEqual(
+            extract(f"https://u.ccb.com/x/#/y/{WS_C}/{WS_D}"), "")
+
+    def test_requests_can_supply_the_id(self):
+        find = AutoLearner._workshop_id_from_requests
+        urls = ["https://api.u.ccb.com/v1/user/me",
+                f"https://api.u.ccb.com/v1/workshop/detail?id={WS_C}",
+                "https://u.ccb.com/sys/#/channel/show/x"]
+        self.assertEqual(find(urls), WS_C)
+
+    def test_requests_ignore_channel_urls(self):
+        self.assertEqual(
+            AutoLearner._workshop_id_from_requests([CHANNEL_URL]), "")
+
+
+class ChannelDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("main.CHANNEL_DETAIL_WAIT_MS", 120)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        patcher = patch("main.debug", side_effect=lambda m: self.logs.append(str(m)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.console", SimpleNamespace(print=lambda *a, **k: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.silent = lambda msg, style="": None
+
+    def _learner(self):
+        import threading
+        learner = AutoLearner.__new__(AutoLearner)
+        learner._stop_event = threading.Event()
+        return learner
+
+    def test_dump_lists_links_when_harvest_is_empty(self):
+        page = FakeChannelPage(anchors=[{"label": "导航", "href": "javascript:void(0)"}])
+        page.anchor_dump = [{"kind": "a", "label": "2026年信贷业务专题班",
+                             "href": "javascript:void(0)", "attrs": "data-id"},
+                            {"kind": "card", "label": "不是链接的卡片",
+                             "href": "", "attrs": "channel-card"}]
+        asyncio.run(self._learner()._dump_channel_anchors(page, self.silent))
+        joined = "\n".join(self.logs)
+        self.assertIn("频道页链接清单", joined)
+        self.assertIn("2026年信贷业务专题班", joined)
+        self.assertIn("javascript:void(0)", joined)
+        self.assertIn("node[card]", joined)      # 非链接卡片也要列出来
+        self.assertIn("channel-card", joined)
+
+    def test_click_attempts_are_logged(self):
+        """点了没反应也要留痕，否则日志里完全看不到。"""
+        page = FakeChannelPage(anchors=[
+            {"label": "首页导航入口", "href": "javascript:void(0)"},
+        ])
+        asyncio.run(self._learner()._collect_channel_workshops(
+            page, CHANNEL_URL, self.silent))
+        joined = "\n".join(self.logs)
+        self.assertIn("频道页点击[0]", joined)
+        self.assertIn("id=-", joined)
+
+    def test_requests_during_click_supply_the_id(self):
+        class ClickRequestsThenNavPage(FakeChannelPage):
+            async def _noop(self):
+                return None
+
+        page = ClickRequestsThenNavPage(route_delay=3, anchors=[
+            {"label": "信贷业务专题班（第一期）", "href": "javascript:void(0)"},
+        ])
+        original_click = FakeAnchor.click
+
+        async def click_with_request(self, timeout=None):
+            self.page.clicks += 1
+            self.page.emit_request(f"https://api.u.ccb.com/v1/workshop/detail?id={WS_D}")
+
+        with patch.object(FakeAnchor, "click", click_with_request):
+            found = asyncio.run(self._learner()._collect_channel_workshops(
+                page, CHANNEL_URL, self.silent))
+        self.assertEqual(found, [WS_D])
+
+
+CHILD_ATTR_FIXTURE = f"""<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div class="channel">
+  <a href="javascript:void(0)" class="card">
+    <div class="card-body" data-workshop-id="{WS_B}">数据安全专题班</div>
+  </a>
+  <a href="javascript:void(0)" class="card">
+    <span data-id="{WS_A}" onclick="openWorkshop('{WS_A}')">内控合规专题班</span>
+  </a>
+  <a href="javascript:void(0)" class="card">
+    <div>纯 @click 卡片，属性里没有 ID</div>
+  </a>
+  <a href="https://u.ccb.com/portal/#/study">学习中心</a>
+</div></body></html>"""
+
+
+class ChannelHarvestChildAttrTests(unittest.TestCase):
+    """ID 挂在链接的子元素上（Vue 常见：外层 a 只有 @click）时也要能读到。"""
+
+    def setUp(self):
+        patcher = patch("main.console", SimpleNamespace(print=lambda *a, **k: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch("main.debug")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_child_element_ids_are_harvested(self):
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:  # pragma: no cover
+            self.skipTest("playwright 未安装")
+
+        async def run():
+            async with async_playwright() as p:
+                try:
+                    browser = await p.chromium.launch()
+                except Exception as exc:  # pragma: no cover
+                    return f"skip:{exc}"
+                try:
+                    page = await browser.new_page()
+                    await page.set_content(CHILD_ATTR_FIXTURE)
+                    raw = await page.evaluate(CHANNEL_WORKSHOP_HARVEST_JS)
+                    learner = AutoLearner.__new__(AutoLearner)
+                    import threading
+                    learner._stop_event = threading.Event()
+                    harvested = await learner._channel_harvest_workshops(
+                        _RealEvaluatePage(page))
+                    return raw, harvested
+                finally:
+                    await browser.close()
+
+        outcome = asyncio.run(run())
+        if isinstance(outcome, str):  # pragma: no cover
+            self.skipTest(outcome)
+        raw, harvested = outcome
+        self.assertEqual([e["id"] for e in raw], [WS_B, WS_A])
+        self.assertEqual(harvested, [WS_B, WS_A])
+        # 标题取自外层链接（子元素没有完整文案时也要有可读名字）
+        self.assertIn("数据安全专题班", [e["title"] for e in raw])
 
 
 if __name__ == "__main__":
