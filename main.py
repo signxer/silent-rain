@@ -8439,20 +8439,26 @@ class AutoLearner:
             return [(ws_id, ci, c, ws_title) for ci, c in to_learn]
 
         try:
-            # 先采到第一批任务就开跑，别让用户干等所有专题班报名完
+            # 先把课程池采到"撑满 worker"再开跑：
+            # 只拿一个专题班的课就开，若那个班只有 2 门而线程数是 4，
+            # 剩下 2 个线程会一直闲着（parallel_learn_courses 按初始任务数
+            # 决定开几个线程，后面补的任务不会再加线程）。
+            worker_target = max(1, int(workers))
             all_tasks = []
-            while pending and not all_tasks and not self._stop_event.is_set():
-                all_tasks = await collect_one(pending.pop(0))
+            while (pending and len(all_tasks) < worker_target
+                   and not self._stop_event.is_set()):
+                all_tasks.extend(await collect_one(pending.pop(0)))
             if not all_tasks:
                 _log("没有需要学习的课程", "yellow")
                 return
             total_counter[0] = len(all_tasks)
 
             async def collect_rest(queue) -> None:
-                """后台把剩余专题班报名+采集进队列——与学习**并行**。
+                """后台持续把专题班报名+采集进课程池——与学习**并行**。
 
                 之前靠 fetch_more_callback（worker 空闲才调用），结果"开始学了
                 2 门课程就没有继续报名了"：worker 忙着学，采集根本没机会跑。
+                这里是一个独立协程，不断给池子补课，让 worker 不用等。
                 """
                 while pending and not self._stop_event.is_set():
                     tasks = await collect_one(pending.pop(0))
@@ -8461,12 +8467,15 @@ class AutoLearner:
                     total_counter[0] += len(tasks)
                     if tasks:
                         debug(f"边学边采集: 新增 {len(tasks)} 门课程，"
-                              f"剩余 {len(pending)} 个专题班")
+                              f"池中 {queue.qsize()} 门，剩余 {len(pending)} 个专题班")
+                    elif pending:
+                        debug(f"边学边采集: 该专题班没有可学课程，"
+                              f"继续下一个（剩余 {len(pending)} 个）")
 
-            _log(f"\n开始学习 {len(all_tasks)} 门课程"
-                 f"（剩余 {len(pending)} 个专题班后台报名中）", "bold blue")
-            debug(f"手动模式专题班开始学习: {len(all_tasks)} 门课程，"
-                  f"待采集 {len(pending)} 个专题班")
+            _log(f"\n课程池已备 {len(all_tasks)} 门（线程数 {max(1, int(workers))}），"
+                 f"开始学习；剩余 {len(pending)} 个专题班后台持续报名", "bold blue")
+            debug(f"手动模式专题班开始学习: 池中 {len(all_tasks)} 门，"
+                  f"待采集 {len(pending)} 个专题班，线程 {workers}")
             await self.parallel_learn_courses(
                 all_tasks, ws_locks, None, _progress, _hours, _log,
                 report_item_progress=True, total_ref=total_counter,
