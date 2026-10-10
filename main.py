@@ -6611,8 +6611,12 @@ class AutoLearner:
             console.print("没有需要学习的课程", style="green")
             return set()
 
-        num_workers = min(self.workers, len(all_tasks))
-        console.print(f"\n[bold]启动 {num_workers} 个工作线程，共 {len(all_tasks)} 门课程[/bold]")
+        # 开局就把配置的线程全部拉起来待命，而不是按"初始任务数"截断：
+        # 课程池是边学边补的，截断会让后补进来的课没人学（线程数不会再涨）。
+        # 池子涨到几门，就立刻有几门被空闲线程接走。
+        num_workers = max(1, min(int(self.workers or 1), len(self.pages) or 1))
+        console.print(f"\n[bold]启动 {num_workers} 个工作线程，"
+                      f"当前 {len(all_tasks)} 门课程（后续边学边补）[/bold]")
 
         # 共享的线程状态（用于Live表格显示）
         worker_status = {}
@@ -8439,15 +8443,11 @@ class AutoLearner:
             return [(ws_id, ci, c, ws_title) for ci, c in to_learn]
 
         try:
-            # 先把课程池采到"撑满 worker"再开跑：
-            # 只拿一个专题班的课就开，若那个班只有 2 门而线程数是 4，
-            # 剩下 2 个线程会一直闲着（parallel_learn_courses 按初始任务数
-            # 决定开几个线程，后面补的任务不会再加线程）。
-            worker_target = max(1, int(workers))
+            # 拿到第一个专题班的课就开跑（线程已全部待命），后面的边学边补，
+            # 池子涨到几门就立刻有几门被空闲线程接走 —— 不用等池子备满。
             all_tasks = []
-            while (pending and len(all_tasks) < worker_target
-                   and not self._stop_event.is_set()):
-                all_tasks.extend(await collect_one(pending.pop(0)))
+            while pending and not all_tasks and not self._stop_event.is_set():
+                all_tasks = await collect_one(pending.pop(0))
             if not all_tasks:
                 _log("没有需要学习的课程", "yellow")
                 return
@@ -8472,8 +8472,9 @@ class AutoLearner:
                         debug(f"边学边采集: 该专题班没有可学课程，"
                               f"继续下一个（剩余 {len(pending)} 个）")
 
-            _log(f"\n课程池已备 {len(all_tasks)} 门（线程数 {max(1, int(workers))}），"
-                 f"开始学习；剩余 {len(pending)} 个专题班后台持续报名", "bold blue")
+            _log(f"\n开始学习 {len(all_tasks)} 门课程"
+                 f"（{max(1, int(workers))} 个线程待命，剩余 {len(pending)} 个专题班后台采集）",
+                 "bold blue")
             debug(f"手动模式专题班开始学习: 池中 {len(all_tasks)} 门，"
                   f"待采集 {len(pending)} 个专题班，线程 {workers}")
             await self.parallel_learn_courses(

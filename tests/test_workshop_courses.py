@@ -254,16 +254,20 @@ class ManualPipelineTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.source = inspect.getsource(AutoLearner.learn_from_urls)
 
-    def test_pool_is_filled_to_saturate_workers_before_learning(self):
-        """先采到撑满线程数再开跑：只拿一个专题班（可能就 2 门课）会让线程闲着，
-        而 parallel_learn_courses 按初始任务数决定线程数，后补的任务不会加线程。"""
-        self.assertIn("worker_target = max(1, int(workers))", self.source)
-        self.assertIn("len(all_tasks) < worker_target", self.source)
+    def test_starts_with_first_workshop_and_keeps_collecting(self):
+        """拿到第一个专题班的课就开跑，剩下的边学边补（不要等池子备满）。"""
         self.assertIn("producer=collect_rest", self.source)
         self.assertIn("total_ref=total_counter", self.source)
-        # 先采一批（seed）再调用学习，而不是采完所有专题班才调用
-        self.assertLess(self.source.index("len(all_tasks) < worker_target"),
+        self.assertLess(self.source.index("while pending and not all_tasks"),
                         self.source.index("await self.parallel_learn_courses("))
+
+    def test_all_configured_workers_are_started_upfront(self):
+        """线程数不能按初始任务数截断，否则后补进来的课没人学。"""
+        import inspect
+        src = inspect.getsource(AutoLearner.parallel_learn_courses)
+        self.assertNotIn("num_workers = min(self.workers, len(all_tasks))", src)
+        self.assertIn("len(self.pages) or 1", src)
+        self.assertIn("后续边学边补", src)
 
     def test_remaining_workshops_are_collected_by_the_background_producer(self):
         """报名必须与学习并行跑，不能等 worker 空闲（否则学了 2 门就不再报名）。"""
