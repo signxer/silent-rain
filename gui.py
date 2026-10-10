@@ -2707,8 +2707,28 @@ class DashboardScreen(QWidget):
             worker.request_stop()
 
     def start_learning(self):
-        # 已有学习线程在运行：先停止旧任务并关闭其浏览器，再用新配置重新开始
+        # 设置页可能在学习过程中保存配置。停止旧任务必须异步等待，不能在
+        # Qt 主线程里 wait()，否则整个窗口会冻结到浏览器清理完成。
         self._stop_worker_rotation()
+        old_worker = getattr(self, "_worker", None)
+        if old_worker and old_worker.isRunning():
+            if getattr(self, "_restart_pending", False):
+                return
+            self._restart_pending = True
+            self._restart_worker = old_worker
+            self._restart_started_at = __import__("time").monotonic()
+            self._restart_cancel_requested = False
+            self._restart_slow_notice = False
+            self._on_log("检测到学习中，正在停止旧任务并应用新设置…", "yellow")
+            self.lbl_session_state.setText("正在应用设置")
+            self.lbl_current_hint.setText("正在安全停止当前任务")
+            self._stop_current_learning()
+            self._restart_timer = QTimer(self)
+            self._restart_timer.setInterval(100)
+            self._restart_timer.timeout.connect(self._poll_learning_restart)
+            self._restart_timer.start()
+            return
+
         self._worker_display_states.clear()
         self._worker_cycle_index = 0
         self._hero_worker_id = None
@@ -2735,24 +2755,6 @@ class DashboardScreen(QWidget):
             self.progress_ring.setCustomBarColor(accent, accent_soft)
         except Exception:
             pass
-        old_worker = getattr(self, "_worker", None)
-        if old_worker and old_worker.isRunning():
-            self._on_log("检测到学习中，正在停止旧任务...", "yellow")
-            old_learner = getattr(self, "_learner", None)
-            self._stop_current_learning()
-            if not old_worker.wait(15000):
-                self._on_log("旧任务未能在限时内停止，请稍后重试", "red")
-                return
-            # 关闭旧 learner 的浏览器，避免新旧两个浏览器并存
-            if old_learner:
-                try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(old_learner.close())
-                    loop.close()
-                except:
-                    pass
-            self._on_log("旧任务已停止，使用新配置重新开始", "green")
         win = self.window()
         self._init_table(win.cfg_workers)
         self._set_goal_info(win)
@@ -2778,6 +2780,39 @@ class DashboardScreen(QWidget):
         self._worker.browser_download_signal.connect(self._on_browser_download)
         self._worker.exam_retry_signal.connect(self._on_exam_retry)
         self._worker.start()
+
+    def _poll_learning_restart(self):
+        """在 GUI 事件循环中等待旧 worker 结束，再按最新配置启动新任务。"""
+        worker = getattr(self, "_restart_worker", None)
+        if not getattr(self, "_restart_pending", False):
+            timer = getattr(self, "_restart_timer", None)
+            if timer:
+                timer.stop()
+                timer.deleteLater()
+                self._restart_timer = None
+            return
+
+        if not worker or not worker.isRunning():
+            timer = getattr(self, "_restart_timer", None)
+            if timer:
+                timer.stop()
+                timer.deleteLater()
+                self._restart_timer = None
+            self._restart_pending = False
+            self._restart_worker = None
+            self._on_log("旧任务已停止，使用新配置重新开始", "green")
+            self.start_learning()
+            return
+
+        elapsed = __import__("time").monotonic() - self._restart_started_at
+        if elapsed >= 2.5 and not self._restart_cancel_requested:
+            # 浏览器导航可能长时间不检查停止标志；取消主协程仍会经过 finally
+            # 在 worker 自己的事件循环中关闭浏览器。
+            worker.cancel_pending()
+            self._restart_cancel_requested = True
+        if elapsed >= 15 and not getattr(self, "_restart_slow_notice", False):
+            self._on_log("旧任务仍在清理中，窗口可以继续操作；完成后会自动应用新设置", "yellow")
+            self._restart_slow_notice = True
 
     @staticmethod
     def _status_kind(status):

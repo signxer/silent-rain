@@ -43,6 +43,19 @@ load_dotenv()
 console = Console()
 
 
+def _hidden_subprocess_kwargs() -> dict:
+    """在 Windows GUI 程序中启动控制台子进程时不显示控制台窗口。"""
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def _atomic_json_dump(path: str, data: dict) -> None:
     """原子写入 JSON，避免进程中断留下半截状态文件。"""
     directory = os.path.dirname(path) or "."
@@ -469,7 +482,8 @@ def _kill_playwright_chrome():
                  "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" "
                  "| Where-Object {$_.CommandLine -match '--remote-debugging'} "
                  "| Stop-Process -Force"],
-                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5)
+                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5,
+                **_hidden_subprocess_kwargs())
         else:
             subprocess.run(["pkill", "-f", "chrome-headless-shell"],
                           stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=5)
@@ -1639,7 +1653,8 @@ class AutoLearner:
                         break
                 if not use_system_chrome:
                     try:
-                        subprocess.run(["where", "chrome"], check=True, capture_output=True, timeout=3)
+                        subprocess.run(["where", "chrome"], check=True, capture_output=True,
+                                       timeout=3, **_hidden_subprocess_kwargs())
                         launch_opts["channel"] = "chrome"
                         use_system_chrome = True
                         _log("使用系统 Chrome (PATH)", "green")
@@ -1738,10 +1753,12 @@ class AutoLearner:
                 # 否则会装进临时 _MEI 目录（每次启动丢失）
                 env.setdefault("PLAYWRIGHT_BROWSERS_PATH", _default_browsers_path())
                 proc = subprocess.Popen([node, cli, "install", "chromium"], env=env,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        **_hidden_subprocess_kwargs())
             else:
                 proc = subprocess.Popen([sys.executable, "-m", "playwright", "install", "chromium"],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        **_hidden_subprocess_kwargs())
 
             # 监控下载进度：缓存目录内新增/增长文件字节数
             reg = _default_browsers_path()
