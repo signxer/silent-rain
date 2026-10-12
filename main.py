@@ -4176,65 +4176,18 @@ class AutoLearner:
             return None
         return data.get("components") or []
 
-    async def solve_trainingcamp_exams(self, page: Page, worker_id: int, log_callback=None) -> Dict:
-        """处理训练营课程页中的考试组件，返回统计信息。
+    async def _solve_exam_tasks(self, exam_tasks: List[Dict], worker_id: int, _log) -> Dict:
+        """逐场完成考试（含"是否重考"询问），返回统计。
 
-        返回 {found, passed, failed, skipped, errors, all_ok, page_has_media}
+        训练营课程页里发现的考试、以及手动模式里直接粘贴的考试链接，
+        走的都是这一段 —— 保证"逻辑和现有考试一样"。
         """
-        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         prefix = f"[工作线程 {worker_id+1}] 考试"
-        state = {"found": 0, "passed": 0, "failed": 0, "skipped": 0,
+        state = {"found": len(exam_tasks), "passed": 0, "failed": 0, "skipped": 0,
                  "errors": 0, "all_ok": True, "page_has_media": False}
-
-        if not self.exam_enabled:
-            return state
-        if not self.deepseek_api_key:
-            _log(f"{prefix} 已开启自动答题但未配置 DeepSeek API Key，跳过考试", "yellow")
-            state["all_ok"] = False
-            state["errors"] += 1
-            return state
-
-        components = await self._trainingcamp_components(page)
-        if components is None:
-            return state
-
-        media_codes = {"cuVideo", "cuAudio", "cuCase", "cuCampLive"}
-        state["page_has_media"] = any(
-            (c.get("componentCode") or "") in media_codes for c in components
-        )
-
-        exam_tasks: List[Dict] = []
-        seen_urls = set()
-        for comp in components:
-            code = comp.get("componentCode") or ""
-            is_exam_component = code in ("cuExam", "cuWebExam")
-            for res in (comp.get("resources") or []):
-                url = (res.get("pcUrl") or "").strip()
-                if not url:
-                    continue
-                # 认证考试之类的资源不一定叫 cuExam：只要指向考试中心（/ote/）就当考试处理
-                if not is_exam_component and "/ote/" not in url and "exampreview" not in url:
-                    continue
-                if url.startswith("//"):
-                    url = "https:" + url
-                elif url.startswith("/"):
-                    url = "https://u.ccb.com" + url
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                name = (res.get("name") or comp.get("componentName") or "随堂测试").strip()
-                exam_tasks.append({
-                    "url": url,
-                    "name": name,
-                    "examDate": res.get("examDate") or "",
-                    "required": res.get("requiredFlag"),
-                })
-
-        state["found"] = len(exam_tasks)
         if not exam_tasks:
             return state
-
-        _log(f"{prefix} 本课程页发现 {len(exam_tasks)} 场考试，开始自动答题", "blue")
+        _log(f"{prefix} 发现 {len(exam_tasks)} 场考试，开始自动答题", "blue")
         for task in exam_tasks:
             if self._stop_event.is_set():
                 state["all_ok"] = False
@@ -4295,6 +4248,68 @@ class AutoLearner:
                    f"跳过 {state['skipped']}，异常 {state['errors']}")
         _log(f"{prefix} {summary}", "green" if state["all_ok"] else "yellow")
         return state
+
+    async def solve_trainingcamp_exams(self, page: Page, worker_id: int, log_callback=None) -> Dict:
+        """处理训练营课程页中的考试组件，返回统计信息。
+
+        返回 {found, passed, failed, skipped, errors, all_ok, page_has_media}
+        """
+        _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
+        prefix = f"[工作线程 {worker_id+1}] 考试"
+        state = {"found": 0, "passed": 0, "failed": 0, "skipped": 0,
+                 "errors": 0, "all_ok": True, "page_has_media": False}
+
+        if not self.exam_enabled:
+            return state
+        if not self.deepseek_api_key:
+            _log(f"{prefix} 已开启自动答题但未配置 DeepSeek API Key，跳过考试", "yellow")
+            state["all_ok"] = False
+            state["errors"] += 1
+            return state
+
+        components = await self._trainingcamp_components(page)
+        if components is None:
+            return state
+
+        media_codes = {"cuVideo", "cuAudio", "cuCase", "cuCampLive"}
+        state["page_has_media"] = any(
+            (c.get("componentCode") or "") in media_codes for c in components
+        )
+
+        exam_tasks: List[Dict] = []
+        seen_urls = set()
+        for comp in components:
+            code = comp.get("componentCode") or ""
+            is_exam_component = code in ("cuExam", "cuWebExam")
+            for res in (comp.get("resources") or []):
+                url = (res.get("pcUrl") or "").strip()
+                if not url:
+                    continue
+                # 认证考试之类的资源不一定叫 cuExam：只要指向考试中心（/ote/）就当考试处理
+                if not is_exam_component and "/ote/" not in url and "exampreview" not in url:
+                    continue
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = "https://u.ccb.com" + url
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                name = (res.get("name") or comp.get("componentName") or "随堂测试").strip()
+                exam_tasks.append({
+                    "url": url,
+                    "name": name,
+                    "examDate": res.get("examDate") or "",
+                    "required": res.get("requiredFlag"),
+                })
+
+        state["found"] = len(exam_tasks)
+        if not exam_tasks:
+            return state
+
+        stats = await self._solve_exam_tasks(exam_tasks, worker_id, _log)
+        stats["page_has_media"] = state["page_has_media"]
+        return stats
 
     _EXAM_PREVIEW_RESULT_JS = r"""() => {
         const el = document.querySelector('.exam_exampreview');
@@ -4419,6 +4434,9 @@ class AutoLearner:
                 await exam_page.wait_for_timeout(1000)
             if not preview:
                 return {"status": "error", "detail": "未能读取考试说明数据"}
+            # 说明页会给出真实考试名：日志与"是否重考"弹窗都用它
+            if (preview.get("arrangeName") or "").strip():
+                task["name"] = preview["arrangeName"].strip()
 
             # 说明页会列出考试记录：已经通过就不用再考一次
             # （允许重考的考试按钮会显示「再考一次」且可点，只靠按钮状态判断不出来）
@@ -8088,6 +8106,44 @@ class AutoLearner:
              "green" if workshop_ids else "yellow")
         return workshop_ids
 
+    async def _learn_exam_urls(self, exam_urls: List[str], _log, _progress) -> Dict:
+        """手动模式：直接打开考试链接参加考试。
+
+        与训练营课程页里发现的考试共用 `_solve_exam_tasks`，
+        因此自动答题、重考询问、成绩判定的逻辑完全一致。
+        """
+        tasks = []
+        for url in exam_urls:
+            arrange = re.search(r"examArrangeID=([0-9a-fA-F\-]+)", url)
+            name = f"考试 {arrange.group(1)[:8]}" if arrange else "自定义考试"
+            tasks.append({"url": url, "name": name, "examDate": "", "required": None})
+
+        total = len(tasks)
+        if not self.exam_enabled:
+            _log("检测到考试链接，但未开启考试自动答题"
+                 "（请在设置里开启并填写 DeepSeek API Key）", "yellow")
+            debug("手动模式考试: 未开启自动答题")
+            _progress(_manual_progress_payload(0, total, "考试自动答题未开启"))
+            return {"found": total, "passed": 0, "failed": 0, "skipped": total,
+                    "errors": 0, "all_ok": False}
+        if not self.deepseek_api_key:
+            _log("已开启考试自动答题但未配置 DeepSeek API Key，跳过考试", "yellow")
+            debug("手动模式考试: 缺少 DeepSeek API Key")
+            _progress(_manual_progress_payload(0, total, "未配置 DeepSeek API Key"))
+            return {"found": total, "passed": 0, "failed": 0, "skipped": total,
+                    "errors": 0, "all_ok": False}
+
+        _log(f"\n开始考试：{total} 场（自动答题）", "bold blue")
+        debug(f"手动模式考试URL: {total} 场")
+        _progress(_manual_progress_payload(0, total, "正在考试"))
+        stats = await self._solve_exam_tasks(tasks, 0, _log)
+        done = (stats.get("passed", 0) + stats.get("failed", 0)
+                + stats.get("skipped", 0) + stats.get("errors", 0))
+        _progress(_manual_progress_payload(
+            done, total,
+            f"考试 通过{stats.get('passed', 0)} 未通过{stats.get('failed', 0)}"))
+        return stats
+
     async def _learn_course_urls(self, urls: List[Union[str, Dict]], workers: int,
                                  _log, _progress, _hours):
         """手动模式：直接打开课程详情URL学习（无需专题班）"""
@@ -8291,7 +8347,14 @@ class AutoLearner:
         trainingcamp_ids = []
         channel_urls = []
         course_urls = []
+        exam_urls = []
         for url in urls:
+            # OTE 考试中心（考试说明页 / 答题页）：直接走现有考试逻辑
+            if re.search(r"/ote/|#/exampreview|#/userexam|#/shamexam", url):
+                if url not in exam_urls:
+                    exam_urls.append(url)
+                continue
+
             # 频道页不是课程本身；其卡片会打开带课程ID的专题班详情。
             channel_match = re.search(r"#/channel/show/[^/?#]+", url)
             if channel_match:
@@ -8324,8 +8387,10 @@ class AutoLearner:
                     workshop_ids.append(uid)
 
         debug(f"手动模式URL分类: 共{len(urls)}条 → 频道{len(channel_urls)} "
-              f"训练营{len(trainingcamp_ids)} 课程{len(course_urls)} 专题班{len(workshop_ids)}")
-        if not (channel_urls or trainingcamp_ids or course_urls or workshop_ids):
+              f"训练营{len(trainingcamp_ids)} 课程{len(course_urls)} "
+              f"专题班{len(workshop_ids)} 考试{len(exam_urls)}")
+        if not (channel_urls or trainingcamp_ids or course_urls or workshop_ids
+                or exam_urls):
             # 一条都没认出来：明确告诉用户，别让进度环停在"准备中"
             debug(f"手动模式: {len(urls)} 条 URL 都没识别出类型")
             _progress(_manual_progress_payload(0, 0, "未识别到可学习的链接"))
@@ -8364,8 +8429,13 @@ class AutoLearner:
             debug(f"手动模式课程URL开始学习: {len(deduplicated_urls)} 个")
             await self._learn_course_urls(deduplicated_urls, workers, _log, _progress, _hours)
 
+        # 考试链接：与训练营课程页里的考试走完全相同的逻辑
+        # （读题 → 问 DeepSeek → 回填提交 → 读成绩 → 未通过时询问是否重考）
+        if exam_urls:
+            await self._learn_exam_urls(exam_urls, _log, _progress)
+
         if not workshop_ids:
-            if not course_urls:
+            if not course_urls and not exam_urls:
                 if trainingcamp_ids:
                     _log("训练营中未获取到可学习课程", "yellow")
                     debug("手动模式: 训练营没有采集到可学习课程")

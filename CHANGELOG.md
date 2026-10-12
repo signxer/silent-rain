@@ -1,5 +1,11 @@
 # 更新日志
 
+## 2.4.15
+- feat(manual): 自定义 URL 支持**考试链接**，例如 `https://u.ccb.com/ote/#/exampreview?examArrangeID=...&domainName=u.ccb.com`。粘贴即可自动参加考试，逻辑与现有考试完全一致（读题 → DeepSeek 答题 → 回填提交 → 读成绩 → 未通过时询问是否重考）
+- refactor(exam): 把"逐场考试 + 重考询问 + 统计"抽成 `_solve_exam_tasks`，训练营课程页里发现的考试与手动粘贴的考试链接**共用同一段逻辑**，不会再出现两套行为不一致
+- feat(exam): 考试名优先取考试说明页的真实名称（`arrangeName`），日志与"是否重考"弹窗都显示真实考试名，而不是一串 ID
+- fix(manual): 只粘贴考试链接时不再误报"未从URL中提取到有效的专题班/训练营/课程ID"；未开启自动答题或未配置 DeepSeek API Key 时给出明确提示，并把状态写进手动模式进度
+
 ## 2.4.14
 - fix(ui): 保存账号或学习设置时，异步等待旧学习任务停止；窗口保持响应，旧任务清理完成后自动按新设置重启
 - fix(windows): 启动/退出时调用 `where`、PowerShell 清理 Chrome 和 Chromium 安装子进程时隐藏控制台窗口，避免命令行小窗闪现
