@@ -682,6 +682,9 @@ TRAINCAMP_LOCAL_SETTLE_SECONDS = 180
 # 考试没考成/没通过时，最多允许用户手动选择重考的次数
 EXAM_RETRY_LIMIT = 3
 
+# 上次已经通过时，询问"跳过还是再考一次"的倒计时（秒）；无响应 = 跳过不考
+EXAM_PASSED_RETRY_TIMEOUT = 10
+
 # 交卷节奏：AI 答题几乎是瞬间完成的，直接交卷会显得异常。
 # 每题模拟耗时取 [min, max] 区间内的一个随机值，交卷前等待「题量 × 每题耗时」秒。
 EXAM_DELAY_MIN_DEFAULT = 10.0
@@ -1558,6 +1561,8 @@ class AutoLearner:
         self.exam_delay_max = EXAM_DELAY_MAX_DEFAULT
         # 考试没考成/没通过时询问是否重考的回调（GUI 注入；命令行/无界面时保持 None → 不重考）
         self.exam_retry_hook = None
+        # 上次已通过时询问"跳过还是再考一次"的回调（GUI 注入；None → 直接跳过）
+        self.exam_passed_retry_hook = None
 
     async def _browser_step(self, coro, what: str, _log, seconds=None):
         """给浏览器启动的每一步加超时：卡住要能看见、能报错，而不是无声挂起。"""
@@ -4406,6 +4411,26 @@ class AutoLearner:
             waited += chunk
         return waited
 
+    async def _confirm_retake_passed_exam(self, task: Dict, prior_detail: str,
+                                          _log) -> bool:
+        """上次已通过时问用户"跳过还是再考一次"，返回 True 表示要再考。
+
+        没有注入回调（命令行/无界面）或用户超时未响应一律返回 False → 跳过，
+        避免无人值守时卡在这里。
+        """
+        if not self.exam_passed_retry_hook:
+            return False
+        _log(f"「{task.get('name', '')}」上次已通过（{prior_detail}），"
+             f"询问是否再考一次", "blue")
+        try:
+            return bool(await self.exam_passed_retry_hook(
+                task.get("name", ""), prior_detail or ""))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug(f"再考确认失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+            return False
+
     async def _solve_one_exam(self, task: Dict, worker_id: int, _log) -> Dict:
         """在独立标签页里完成一场考试：说明页 → 开始考试 → AI 答题 → 提交 → 读成绩"""
         prefix = f"[工作线程 {worker_id+1}] 考试"
@@ -4447,8 +4472,13 @@ class AutoLearner:
             if records:
                 prior = self._exam_result_from_records(records)
                 if prior and "已通过" in (prior.get("detail") or ""):
-                    return {"status": "skipped",
-                            "detail": f"上次已通过（{prior['detail']}），不再重考"}
+                    again = await self._confirm_retake_passed_exam(
+                        task, prior.get("detail") or "", _log)
+                    if not again:
+                        return {"status": "skipped",
+                                "detail": f"上次已通过（{prior['detail']}），不再重考"}
+                    _log(f"「{task.get('name', '')}」按用户选择再考一次", "blue")
+                    # 继续往下走：说明页此时的按钮是「再考一次」
                 if prior and "待批阅" in (prior.get("detail") or ""):
                     return {"status": "skipped",
                             "detail": f"上次{prior['detail']}，不再重考"}

@@ -153,6 +153,7 @@ class AsyncThread(QThread):
     eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
     browser_download_signal = Signal(object)  # True=开始, str=进度文本, False=下载结束
     exam_retry_signal = Signal(str, str)  # (考试名称, 失败原因) → 询问是否重考
+    exam_passed_signal = Signal(str, str)  # (考试名称, 已通过说明) → 询问跳过还是再考
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -492,6 +493,9 @@ CURRENT_VERSION = _get_version()
 DOWNLOAD_URL = "https://signxer.github.io/Moisten/"
 # 考试未通过时询问是否重考的倒计时（秒）；倒计时内不操作 = 不重考
 EXAM_RETRY_TIMEOUT = 30
+
+# 上次已通过时询问"跳过还是再考"的倒计时（秒）；倒计时内不操作 = 跳过不考
+EXAM_PASSED_RETRY_TIMEOUT = 10
 
 
 RELEASES_JSON_URL = "https://raw.githubusercontent.com/signxer/Moisten/main/releases.json"
@@ -2779,6 +2783,7 @@ class DashboardScreen(QWidget):
         self._worker.eta_reset_signal.connect(self._on_eta_reset)
         self._worker.browser_download_signal.connect(self._on_browser_download)
         self._worker.exam_retry_signal.connect(self._on_exam_retry)
+        self._worker.exam_passed_signal.connect(self._on_exam_passed_retry)
         self._worker.start()
 
     def _poll_learning_restart(self):
@@ -3041,6 +3046,21 @@ class DashboardScreen(QWidget):
                 return bool(self._exam_retry_choice)
 
             learner.exam_retry_hook = _ask_exam_retry
+
+            # 上次已通过时问"跳过还是再考一次"（10 秒无响应 → 跳过）
+            async def _ask_exam_passed_retry(exam_name, detail):
+                self._exam_retry_event.clear()
+                self._exam_retry_choice = False
+                thread.exam_passed_signal.emit(exam_name, detail or "")
+                finished = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._exam_retry_event.wait(EXAM_PASSED_RETRY_TIMEOUT))
+                if not finished:
+                    log(f"「{exam_name}」再考确认超时"
+                        f"（{EXAM_PASSED_RETRY_TIMEOUT}秒未操作），跳过不考", "yellow")
+                    return False
+                return bool(self._exam_retry_choice)
+
+            learner.exam_passed_retry_hook = _ask_exam_passed_retry
             # 考试自动答题：只有开启且配置了 Key 时才生效
             learner.apply_exam_settings({
                 "exam_enabled": getattr(win, "cfg_exam_enabled", False),
@@ -4024,12 +4044,12 @@ class DashboardScreen(QWidget):
         self._eta_timer.stop()
         self.lbl_eta.setText("")
 
-    def _on_exam_retry(self, exam_name, reason):
-        """考试没考成/没通过：弹窗问是否重考。倒计时结束未操作 = 不重考。"""
-        TIMEOUT = EXAM_RETRY_TIMEOUT
+    def _run_exam_choice_dialog(self, *, title, headline, info_text, hint_text,
+                                retry_text, skip_text, timeout, skip_icon) -> bool:
+        """考试类询问弹窗（倒计时结束未操作 = 不重考/跳过）。返回 True 表示重考/再考。"""
         dlg = QDialog(self)
         style_moisten_dialog(dlg)
-        dlg.setWindowTitle("考试未通过")
+        dlg.setWindowTitle(title)
         dlg.setMinimumWidth(420)
         dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
@@ -4037,12 +4057,12 @@ class DashboardScreen(QWidget):
         layout.setSpacing(14)
         layout.setContentsMargins(24, 22, 24, 20)
 
-        layout.addWidget(SubtitleLabel(f"「{exam_name}」未通过"))
-        info = BodyLabel(reason or "本次考试没有完成")
+        layout.addWidget(SubtitleLabel(headline))
+        info = BodyLabel(info_text)
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        hint = CaptionLabel(f"不操作将在 {TIMEOUT} 秒后按「不重考」继续，不阻塞学习")
+        hint = CaptionLabel(hint_text)
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -4052,19 +4072,19 @@ class DashboardScreen(QWidget):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
 
-        btn_retry = PushButton("  重考一次")
+        btn_retry = PushButton(f"  {retry_text}")
         btn_retry.setIcon(FIF.SYNC)
         btn_retry.clicked.connect(lambda: dlg.done(1))
         btn_layout.addWidget(btn_retry)
 
-        btn_skip = PrimaryPushButton(f"  不重考 ({TIMEOUT}s)")
-        btn_skip.setIcon(FIF.ACCEPT)
+        btn_skip = PrimaryPushButton(f"  {skip_text} ({timeout}s)")
+        btn_skip.setIcon(skip_icon)
         btn_skip.clicked.connect(lambda: dlg.done(0))
         btn_layout.addWidget(btn_skip)
 
         layout.addLayout(btn_layout)
 
-        countdown = [TIMEOUT]
+        countdown = [timeout]
         timer = QTimer(dlg)
         timer.setInterval(1000)
 
@@ -4072,9 +4092,9 @@ class DashboardScreen(QWidget):
             countdown[0] -= 1
             if countdown[0] <= 0:
                 timer.stop()
-                dlg.done(0)  # 超时按「不重考」
+                dlg.done(0)  # 超时按"不重考/跳过"
             else:
-                btn_skip.setText(f"  不重考 ({countdown[0]}s)")
+                btn_skip.setText(f"  {skip_text} ({countdown[0]}s)")
 
         timer.timeout.connect(tick)
         timer.start()
@@ -4082,7 +4102,35 @@ class DashboardScreen(QWidget):
         btn_skip.clicked.connect(timer.stop)
 
         choice = dlg.exec()
-        self._exam_retry_choice = bool(choice == 1)
+        return bool(choice == 1)
+
+    def _on_exam_retry(self, exam_name, reason):
+        """考试没考成/没通过：弹窗问是否重考。倒计时结束未操作 = 不重考。"""
+        timeout = EXAM_RETRY_TIMEOUT
+        self._exam_retry_choice = self._run_exam_choice_dialog(
+            title="考试未通过",
+            headline=f"「{exam_name}」未通过",
+            info_text=reason or "本次考试没有完成",
+            hint_text=f"不操作将在 {timeout} 秒后按「不重考」继续，不阻塞学习",
+            retry_text="重考一次",
+            skip_text="不重考",
+            timeout=timeout,
+            skip_icon=FIF.ACCEPT,
+        )
+
+    def _on_exam_passed_retry(self, exam_name, detail):
+        """上次已通过：弹窗问跳过还是再考一次。倒计时结束未操作 = 跳过。"""
+        timeout = EXAM_PASSED_RETRY_TIMEOUT
+        self._exam_retry_choice = self._run_exam_choice_dialog(
+            title="考试已通过",
+            headline=f"「{exam_name}」上次已通过",
+            info_text=f"{detail or '已通过'}。要跳过还是再考一次？",
+            hint_text=f"不操作将在 {timeout} 秒后跳过（不再考），不阻塞学习",
+            retry_text="再考一次",
+            skip_text="跳过",
+            timeout=timeout,
+            skip_icon=FIF.ACCEPT,
+        )
         self._exam_retry_event.set()
 
     def _on_browser_download(self, status):

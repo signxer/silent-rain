@@ -126,5 +126,113 @@ class ExamUrlClassificationTests(unittest.TestCase):
                       "两条路径必须共用同一段考试逻辑")
 
 
+class PassedExamRetakePromptTests(unittest.TestCase):
+    """任务里发现"已通过"的考试时：问用户跳过还是再考一次，无响应则跳过。"""
+
+    def setUp(self):
+        self.debugs = []
+        patcher = patch("main.debug", side_effect=lambda m: self.debugs.append(str(m)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        self.learner.exam_passed_retry_hook = None
+        self.task = {"name": "某场考试", "url": EXAM_URL}
+        self.log = lambda m, s="": self.logs.append(str(m))
+
+    def _ask(self):
+        return asyncio.run(self.learner._confirm_retake_passed_exam(
+            self.task, "已通过 90 分", self.log))
+
+    def test_no_hook_means_skip(self):
+        """命令行/无界面时不能卡住：默认跳过。"""
+        self.assertFalse(self._ask())
+
+    def test_user_choosing_retake_returns_true(self):
+        async def hook(name, detail):
+            return True
+        self.learner.exam_passed_retry_hook = hook
+        self.assertTrue(self._ask())
+        self.assertTrue(any("询问是否再考一次" in m for m in self.logs), self.logs)
+
+    def test_user_choosing_skip_returns_false(self):
+        async def hook(name, detail):
+            return False
+        self.learner.exam_passed_retry_hook = hook
+        self.assertFalse(self._ask())
+
+    def test_hook_exception_falls_back_to_skip(self):
+        async def hook(name, detail):
+            raise RuntimeError("dialog boom")
+        self.learner.exam_passed_retry_hook = hook
+        self.assertFalse(self._ask(), "询问失败要当作跳过，不能把考试卡死")
+        self.assertTrue(any("再考确认失败" in m for m in self.debugs), self.debugs)
+
+    def test_hook_receives_name_and_detail(self):
+        seen = {}
+
+        async def hook(name, detail):
+            seen["name"] = name
+            seen["detail"] = detail
+            return False
+        self.learner.exam_passed_retry_hook = hook
+        self._ask()
+        self.assertEqual(seen["name"], "某场考试")
+        self.assertEqual(seen["detail"], "已通过 90 分")
+
+    def test_cancellation_propagates(self):
+        async def hook(name, detail):
+            raise asyncio.CancelledError()
+        self.learner.exam_passed_retry_hook = hook
+        with self.assertRaises(asyncio.CancelledError):
+            self._ask()
+
+    def test_already_passed_exam_consults_the_prompt(self):
+        """已通过分支必须先问，用户同意再考就继续往下走（不再直接跳过）。"""
+        src = inspect.getsource(AutoLearner._solve_one_exam)
+        self.assertIn("_confirm_retake_passed_exam", src)
+        self.assertIn("按用户选择再考一次", src)
+        # 「待批阅」仍然是直接跳过，不该多问一次
+        self.assertIn("不再重考", src)
+
+
+class ExamPassedDialogWiringTests(unittest.TestCase):
+    """GUI 侧：10 秒倒计时、无响应按跳过处理。"""
+
+    def setUp(self):
+        try:
+            import gui  # noqa: F401
+            self.gui = gui
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"GUI 不可导入: {exc}")
+
+    def test_timeout_is_ten_seconds(self):
+        self.assertEqual(self.gui.EXAM_PASSED_RETRY_TIMEOUT, 10)
+
+    def test_signal_exists_on_thread(self):
+        src = inspect.getsource(self.gui.AsyncThread)
+        self.assertIn("exam_passed_signal", src)
+
+    def test_handler_is_connected(self):
+        src = inspect.getsource(self.gui.DashboardScreen)
+        self.assertIn("exam_passed_signal.connect(self._on_exam_passed_retry)", src)
+
+    def test_hook_is_injected_with_timeout(self):
+        src = inspect.getsource(self.gui.DashboardScreen._run_learning)
+        self.assertIn("exam_passed_retry_hook", src)
+        self.assertIn("EXAM_PASSED_RETRY_TIMEOUT", src)
+        self.assertIn("跳过不考", src)
+
+    def test_countdown_defaults_to_skip(self):
+        src = inspect.getsource(self.gui.DashboardScreen._run_exam_choice_dialog)
+        self.assertIn("dlg.done(0)", src, "倒计时结束必须按跳过")
+        self.assertIn("timer.stop()", src)
+
+    def test_passed_dialog_asks_skip_or_retake(self):
+        src = inspect.getsource(self.gui.DashboardScreen._on_exam_passed_retry)
+        self.assertIn("再考一次", src)
+        self.assertIn("跳过", src)
+
+
 if __name__ == "__main__":
     unittest.main()
