@@ -152,8 +152,9 @@ class AsyncThread(QThread):
     page_confirm_signal = Signal(int)  # last_page
     eta_reset_signal = Signal()  # worker 请求在 GUI 线程重置 ETA 状态
     browser_download_signal = Signal(object)  # True=开始, str=进度文本, False=下载结束
-    exam_retry_signal = Signal(str, str)  # (考试名称, 失败原因) → 询问是否重考
-    exam_passed_signal = Signal(str, str)  # (考试名称, 已通过说明) → 询问跳过还是再考
+    exam_retry_signal = Signal(int, str, str)   # (prompt_id, 考试名称, 失败原因) → 是否重考
+    exam_passed_signal = Signal(int, str, str)  # (prompt_id, 考试名称, 已通过说明) → 跳过还是再考
+    exam_unanswered_signal = Signal(int, str, int, int)  # (prompt_id, 考试名, 未答数, 总题数) → 是否按未答提交
 
     def __init__(self, coro_func, parent=None):
         super().__init__(parent)
@@ -2138,8 +2139,9 @@ class DashboardScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tag_event = threading.Event()
-        self._exam_retry_event = threading.Event()
-        self._exam_retry_choice = False
+        self._exam_prompt_seq = 0                     # 每次询问的递增 id
+        self._exam_prompt_events = {}                # {prompt_id: threading.Event}
+        self._exam_prompt_choices = {}               # {prompt_id: [bool]}
         self._learn_start_time = None      # 学习开始时间
         self._progress_history = []         # [(timestamp, pct), ...]
         # 每个 worker 独立记录当前课程的进度，用于训练营课程回调未提供
@@ -2695,7 +2697,7 @@ class DashboardScreen(QWidget):
         """停止正在运行的学习任务（配置变更/重新开始时调用）"""
         self._stop_worker_rotation()
         # 1) 解除可能阻塞 worker 的对话框等待
-        for ev in ("_tag_event", "_page_event", "_exam_retry_event"):
+        for ev in ("_tag_event", "_page_event"):
             ev_obj = getattr(self, ev, None)
             if ev_obj:
                 ev_obj.set()
@@ -2784,6 +2786,7 @@ class DashboardScreen(QWidget):
         self._worker.browser_download_signal.connect(self._on_browser_download)
         self._worker.exam_retry_signal.connect(self._on_exam_retry)
         self._worker.exam_passed_signal.connect(self._on_exam_passed_retry)
+        self._worker.exam_unanswered_signal.connect(self._on_exam_unanswered)
         self._worker.start()
 
     def _poll_learning_restart(self):
@@ -3033,32 +3036,68 @@ class DashboardScreen(QWidget):
             cfg_chrome_path = getattr(win, "cfg_chrome_path", "")
             log("正在初始化浏览器...")
             learner = AutoLearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
-            # 考试没考成/没通过时弹窗询问是否重考（worker 线程通过信号回主线程弹窗）
+            # 并发保护的考试询问：每次生成独立 prompt_id 与独立的 Event/choice，
+            # 多个 worker 同时在等弹窗也不会互相串台（各自拿到自己的结果）。
+            async def _ask_exam_prompt(passed: bool, exam_name, text):
+                self._exam_prompt_seq += 1
+                prompt_id = self._exam_prompt_seq
+                ev = threading.Event()
+                holder = [False]
+                self._exam_prompt_events[prompt_id] = ev
+                self._exam_prompt_choices[prompt_id] = holder
+                try:
+                    timeout = EXAM_PASSED_RETRY_TIMEOUT if passed else EXAM_RETRY_TIMEOUT
+                    if passed:
+                        thread.exam_passed_signal.emit(prompt_id, exam_name, text or "")
+                    else:
+                        thread.exam_retry_signal.emit(prompt_id, exam_name, text or "")
+                    finished = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: ev.wait(timeout))
+                    if not finished:
+                        if passed:
+                            log(f"「{exam_name}」再考确认超时"
+                                f"（{timeout}秒未操作），跳过不考", "yellow")
+                        else:
+                            log(f"「{exam_name}」重考确认超时"
+                                f"（{timeout}秒未操作），不重考", "yellow")
+                        return False
+                    return bool(holder[0])
+                finally:
+                    self._exam_prompt_events.pop(prompt_id, None)
+                    self._exam_prompt_choices.pop(prompt_id, None)
+
             async def _ask_exam_retry(exam_name, reason):
-                self._exam_retry_event.clear()
-                self._exam_retry_choice = False
-                thread.exam_retry_signal.emit(exam_name, reason or "")
-                finished = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._exam_retry_event.wait(EXAM_RETRY_TIMEOUT))
-                if not finished:
-                    log(f"「{exam_name}」重考确认超时（{EXAM_RETRY_TIMEOUT}秒未操作），不重考", "yellow")
-                    return False
-                return bool(self._exam_retry_choice)
+                return await _ask_exam_prompt(False, exam_name, reason or "")
 
             learner.exam_retry_hook = _ask_exam_retry
 
+            # 空题占比过高时问"按未答提交"还是放弃（走同一个 prompt 配对机制）
+            async def _ask_exam_unanswered(exam_name, unanswered, total):
+                self._exam_prompt_seq += 1
+                prompt_id = self._exam_prompt_seq
+                ev = threading.Event()
+                holder = [False]
+                self._exam_prompt_events[prompt_id] = ev
+                self._exam_prompt_choices[prompt_id] = holder
+                try:
+                    thread.exam_unanswered_signal.emit(
+                        prompt_id, exam_name, unanswered, total)
+                    finished = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: ev.wait(EXAM_PASSED_RETRY_TIMEOUT))
+                    if not finished:
+                        log(f"「{exam_name}」{unanswered}/{total} 题未作答，"
+                            f"超时（{EXAM_PASSED_RETRY_TIMEOUT}秒）默认按未答提交", "yellow")
+                        return True
+                    return bool(holder[0])
+                finally:
+                    self._exam_prompt_events.pop(prompt_id, None)
+                    self._exam_prompt_choices.pop(prompt_id, None)
+
+            learner.exam_confirm_unanswered_hook = _ask_exam_unanswered
+
             # 上次已通过时问"跳过还是再考一次"（10 秒无响应 → 跳过）
             async def _ask_exam_passed_retry(exam_name, detail):
-                self._exam_retry_event.clear()
-                self._exam_retry_choice = False
-                thread.exam_passed_signal.emit(exam_name, detail or "")
-                finished = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._exam_retry_event.wait(EXAM_PASSED_RETRY_TIMEOUT))
-                if not finished:
-                    log(f"「{exam_name}」再考确认超时"
-                        f"（{EXAM_PASSED_RETRY_TIMEOUT}秒未操作），跳过不考", "yellow")
-                    return False
-                return bool(self._exam_retry_choice)
+                return await _ask_exam_prompt(True, exam_name, detail or "")
 
             learner.exam_passed_retry_hook = _ask_exam_passed_retry
             # 考试自动答题：只有开启且配置了 Key 时才生效
@@ -3799,7 +3838,11 @@ class DashboardScreen(QWidget):
             pct = max(0, min(100, pct))
             self._animate_ring(pct)
             self._animate_progress_bar(self.goal_progress, pct)
-            self.lbl_goal_info.setText(f"手动模式 · 已完成 {done}/{total} 项（{pct}%）")
+            # 阶段说明（如"考试 通过X 未通过Y"）在 total>0 时也展示，
+            # 避免课程→考试→专题班多阶段运行时用户看不清当前在干嘛
+            phase = getattr(self, "_manual_status", "") or ""
+            base = f"手动模式 · 已完成 {done}/{total} 项（{pct}%）"
+            self.lbl_goal_info.setText(f"{base} · {phase}" if phase else base)
         else:
             # 还没确定要学多少：先给文字反馈，进度保持 0
             self.progress_ring.setValue(0)
@@ -4104,10 +4147,19 @@ class DashboardScreen(QWidget):
         choice = dlg.exec()
         return bool(choice == 1)
 
-    def _on_exam_retry(self, exam_name, reason):
+    def _resolve_exam_prompt(self, prompt_id, choice: bool):
+        """把一次弹窗的选择写回它对应的等待方（按 prompt_id 配对，不串台）。"""
+        ev = self._exam_prompt_events.get(prompt_id)
+        holder = self._exam_prompt_choices.get(prompt_id)
+        if holder is not None:
+            holder[0] = bool(choice)
+        if ev is not None:
+            ev.set()
+
+    def _on_exam_retry(self, prompt_id, exam_name, reason):
         """考试没考成/没通过：弹窗问是否重考。倒计时结束未操作 = 不重考。"""
         timeout = EXAM_RETRY_TIMEOUT
-        self._exam_retry_choice = self._run_exam_choice_dialog(
+        choice = self._run_exam_choice_dialog(
             title="考试未通过",
             headline=f"「{exam_name}」未通过",
             info_text=reason or "本次考试没有完成",
@@ -4117,11 +4169,12 @@ class DashboardScreen(QWidget):
             timeout=timeout,
             skip_icon=FIF.ACCEPT,
         )
+        self._resolve_exam_prompt(prompt_id, choice)
 
-    def _on_exam_passed_retry(self, exam_name, detail):
+    def _on_exam_passed_retry(self, prompt_id, exam_name, detail):
         """上次已通过：弹窗问跳过还是再考一次。倒计时结束未操作 = 跳过。"""
         timeout = EXAM_PASSED_RETRY_TIMEOUT
-        self._exam_retry_choice = self._run_exam_choice_dialog(
+        choice = self._run_exam_choice_dialog(
             title="考试已通过",
             headline=f"「{exam_name}」上次已通过",
             info_text=f"{detail or '已通过'}。要跳过还是再考一次？",
@@ -4131,7 +4184,23 @@ class DashboardScreen(QWidget):
             timeout=timeout,
             skip_icon=FIF.ACCEPT,
         )
-        self._exam_retry_event.set()
+        self._resolve_exam_prompt(prompt_id, choice)
+
+    def _on_exam_unanswered(self, prompt_id, exam_name, unanswered, total):
+        """空题占比过高：按未答提交（默认）还是放弃本场。"""
+        timeout = EXAM_PASSED_RETRY_TIMEOUT
+        choice = self._run_exam_choice_dialog(
+            title="空题较多",
+            headline=f"「{exam_name}」有 {unanswered}/{total} 题未能作答",
+            info_text="这样提交大概率不及格。要按未答提交，还是放弃本场？",
+            hint_text=f"不操作将在 {timeout} 秒后按「按未答提交」继续，不阻塞学习",
+            retry_text="按未答提交",
+            skip_text="放弃本场",
+            timeout=timeout,
+            skip_icon=FIF.ACCEPT,
+        )
+        # True=按未答提交（coroutine 决定提交），False=放弃
+        self._resolve_exam_prompt(prompt_id, choice)
 
     def _on_browser_download(self, status):
         """Chromium 下载进度提示：模态等待框，下载完成前阻止继续使用。

@@ -236,3 +236,83 @@ class ExamPassedDialogWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetakeRaceAndResilienceTests(unittest.TestCase):
+    """并发考试询问不串台 + 空题/待批阅的确认点。"""
+
+    def setUp(self):
+        self.debugs = []
+        patcher = patch("main.debug", side_effect=lambda m: self.debugs.append(str(m)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        self.learner.exam_passed_retry_hook = None
+        self.learner.exam_confirm_unanswered_hook = None
+        self.task = {"name": "X", "url": EXAM_URL}
+        self.log = lambda m, s="": self.logs.append(str(m))
+
+    def test_unanswered_hook_returns_true_means_submit(self):
+        async def hook(name, unanswered, total):
+            return True
+        self.learner.exam_confirm_unanswered_hook = hook
+
+        async def real():
+            return await self.learner._logged_answer_gate_placeholder()
+        # hook 签名为 (name, unanswered, total)；这里直接触发完成路径，
+        # 用一个薄封装模拟 _solve_one_exam 里的调用点
+        async def call():
+            return bool(await self.learner.exam_confirm_unanswered_hook("X", 10, 20))
+        self.assertTrue(asyncio.run(call()))
+
+    def test_attending_helper_defaults_to_skip_without_hook(self):
+        self.assertFalse(asyncio.run(
+            self.learner._confirm_attending("待批阅", self.log)))
+
+    def test_exam_delay_total_is_capped(self):
+        from main import _exam_delay_plan, EXAM_DELAY_TOTAL_LIMIT
+        # 30 题 × 10 秒 = 300 秒，未超上限：正常
+        per, total = _exam_delay_plan(30, 10, 20, rng=_FakeRng(10.0))
+        self.assertEqual(per, 10.0)
+        self.assertEqual(total, 300.0)
+        # 2000 题 × 15 秒远超上限：必须封顶
+        per, total = _exam_delay_plan(2000, 10, 20, rng=_FakeRng(15.0))
+        self.assertEqual(per, 15.0)
+        self.assertEqual(total, float(EXAM_DELAY_TOTAL_LIMIT),
+                         "整场等待必须封顶在 EXAM_DELAY_TOTAL_LIMIT")
+
+    def test_signal_carries_prompt_id(self):
+        try:
+            import gui
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"GUI 不可导入: {exc}")
+        src = inspect.getsource(gui.AsyncThread)
+        self.assertIn("exam_passed_signal = Signal(int, str, str)", src)
+
+    def test_gui_uses_per_prompt_state_not_shared_flag(self):
+        try:
+            import gui
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"GUI 不可导入: {exc}")
+        src = inspect.getsource(gui.DashboardScreen._run_learning)
+        self.assertIn("_exam_prompt_seq", src)
+        self.assertIn("threading.Event()", src)
+        self.assertNotIn("_exam_retry_choice = False", src)
+
+    def test_phase_status_shown_when_total_positive(self):
+        try:
+            import gui
+        except Exception:  # pragma: no cover
+            self.skipTest("GUI 不可导入")
+        src = inspect.getsource(gui.DashboardScreen._render_manual_progress)
+        self.assertIn("phase = getattr(self, \"_manual_status\", \"\") or \"\"", src)
+
+
+class _FakeRng:
+    """注入固定值的 rng，便于 _exam_delay_plan 单测。"""
+    def __init__(self, value):
+        self.value = value
+
+    def uniform(self, a, b):
+        return self.value

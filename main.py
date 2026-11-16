@@ -691,6 +691,8 @@ EXAM_DELAY_MIN_DEFAULT = 10.0
 EXAM_DELAY_MAX_DEFAULT = 20.0
 # 单题耗时上限：防止误填（例如 1000）导致一次考试等待数小时
 EXAM_DELAY_PER_QUESTION_LIMIT = 600.0
+# 整场考试交卷前的模拟等待总时长上限（秒）：题再多也不能让用户枯等
+EXAM_DELAY_TOTAL_LIMIT = 900
 
 
 def _exam_delay_bounds(delay_min, delay_max) -> tuple:
@@ -727,7 +729,8 @@ def _exam_delay_plan(question_count: int, delay_min, delay_max, rng=None) -> tup
     if questions <= 0 or high <= 0:
         return 0.0, 0.0
     per_question = (rng or random).uniform(low, high)
-    return per_question, per_question * questions
+    total = min(per_question * questions, float(EXAM_DELAY_TOTAL_LIMIT))
+    return per_question, total
 
 
 def _exam_needs_retake_choice(result: Optional[Dict]) -> bool:
@@ -957,19 +960,47 @@ class DeepSeekClient:
             {"role": "user", "content": user_prompt},
         ]
 
+        # 应答层：允许返回"部分题目"的答案，不要因为整体不合法就把所有答案丢掉。
+        # chat() 内部已对网络错误做过重试；这里处理的是"模型输出解析"这一环。
+        collected: Dict[int, Dict] = {}
+        correction_sent = False
         last_err = None
         for attempt in range(2):
             budget = _exam_max_tokens(len(questions), self.thinking)
-            raw = await self.chat(messages, json_mode=True, max_tokens=budget)
+            try:
+                raw = await self.chat(messages, json_mode=True, max_tokens=budget)
+            except DeepSeekError as exc:
+                # 网络/服务端错误：chat() 已重试，仍失败则给出可读原因，不吞掉已收集的
+                last_err = exc
+                break
             parsed = _parse_exam_json(raw)
             if parsed:
-                return parsed
-            last_err = DeepSeekError("返回内容无法解析为 JSON")
-            messages = messages + [
-                {"role": "assistant", "content": raw[:2000]},
-                {"role": "user", "content": "上一次输出不是合法 JSON。请只输出 JSON 对象，"
-                                           "格式：{\"answers\":[{\"index\":1,\"choices\":[\"A\"]}]}"},
-            ]
+                # 合并本次有效答案（覆盖同题号）
+                collected.update(parsed)
+                # 已完整覆盖所有题 → 返回；否则带"补全剩余题"的上下文再问一次
+                if len(collected) >= len(questions):
+                    return collected
+            if not correction_sent:
+                # 让模型"补全还没答的题"，并说明已接受它的部分答案
+                missing = [q["index"] for q in questions if q["index"] not in collected]
+                messages = messages + [
+                    {"role": "assistant", "content": (raw or "")[:2000]},
+                    {"role": "user",
+                     "content": "你已作答了一部分。请针对还没答的题再输出 JSON："
+                                '{"answers":[...只包含还没答的题...]}。'
+                                f"还没答的题号: {missing}"},
+                ]
+                correction_sent = True
+            else:
+                last_err = DeepSeekError("返回内容无法解析为 JSON")
+                break
+        if collected:
+            if log is not None:
+                try:
+                    log(f"部分作答：成功解析 {len(collected)}/{len(questions)} 题", "yellow")
+                except Exception:
+                    pass
+            return collected
         raise last_err or DeepSeekError("答题结果解析失败")
 
 
@@ -1563,6 +1594,8 @@ class AutoLearner:
         self.exam_retry_hook = None
         # 上次已通过时询问"跳过还是再考一次"的回调（GUI 注入；None → 直接跳过）
         self.exam_passed_retry_hook = None
+        # 空题占比过高时询问"按未答提交还是放弃"（GUI 注入；None → 按未答提交）
+        self.exam_confirm_unanswered_hook = None
 
     async def _browser_step(self, coro, what: str, _log, seconds=None):
         """给浏览器启动的每一步加超时：卡住要能看见、能报错，而不是无声挂起。"""
@@ -4411,6 +4444,18 @@ class AutoLearner:
             waited += chunk
         return waited
 
+    async def _confirm_attending(self, detail: str, _log) -> bool:
+        """待批阅等场景问"是否继续/再考"，默认跳过。无界面时直接跳过。"""
+        if not self.exam_passed_retry_hook:
+            return False
+        try:
+            return bool(await self.exam_passed_retry_hook("待批阅考试", detail or ""))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug(f"待批阅确认失败: {type(exc).__name__}: {_safe_debug_error(exc)}")
+            return False
+
     async def _confirm_retake_passed_exam(self, task: Dict, prior_detail: str,
                                           _log) -> bool:
         """上次已通过时问用户"跳过还是再考一次"，返回 True 表示要再考。
@@ -4480,8 +4525,12 @@ class AutoLearner:
                     _log(f"「{task.get('name', '')}」按用户选择再考一次", "blue")
                     # 继续往下走：说明页此时的按钮是「再考一次」
                 if prior and "待批阅" in (prior.get("detail") or ""):
-                    return {"status": "skipped",
-                            "detail": f"上次{prior['detail']}，不再重考"}
+                    # 待批阅通常意味着"考过了、还没出分"。默认跳过，但给用户
+                    # 一个确认机会，避免刚交卷的考试被径直略过用户却不知道。
+                    proceed = await self._confirm_attending(prior.get("detail") or "", _log)
+                    if not proceed:
+                        return {"status": "skipped",
+                                "detail": f"上次{prior['detail']}，按用户选择跳过"}
 
             if not preview.get("isShowBtn"):
                 return {"status": "skipped",
@@ -4594,7 +4643,17 @@ class AutoLearner:
                 "answers": payload_answers,
             }
             if unanswered:
-                _log(f"{prefix} 有 {unanswered} 题未能作答，将按未答提交", "yellow")
+                _log(f"{prefix} 有 {unanswered}/{len(questions)} 题未能作答", "yellow")
+                # 空题占比过高时，让用户决定是按未答提交还是干脆放弃这场：
+                # 空题太多提交了也大概率不及格，问一下更稳妥。
+                if (self.exam_confirm_unanswered_hook
+                        and unanswered >= max(3, int(len(questions) * 0.5))):
+                    submit_blank = await self.exam_confirm_unanswered_hook(
+                        task["name"], unanswered, len(questions))
+                    if not submit_blank:
+                        return {"status": "skipped",
+                                "detail": f"{unanswered}/{len(questions)} 题未作答，用户选择放弃"}
+                    _log(f"{prefix} 用户选择按未答提交 {unanswered} 题", "blue")
 
             # 交卷节奏：AI 答题瞬间完成，直接交卷会显得异常。
             # 按题量等待「题量 × 每题随机耗时」秒，模拟正常作答时间后再提交。
@@ -4602,7 +4661,8 @@ class AutoLearner:
                 len(questions), self.exam_delay_min, self.exam_delay_max)
             if delay_seconds > 0:
                 _log(f"{prefix} 模拟作答节奏：{len(questions)} 题 × "
-                     f"{per_question:.1f} 秒 ≈ {delay_seconds:.0f} 秒后交卷", "blue")
+                     f"{per_question:.1f} 秒 ≈ {delay_seconds:.0f} 秒后交卷"
+                     f"（单场最多等待 {EXAM_DELAY_TOTAL_LIMIT // 60} 分钟）", "blue")
                 waited = await self._pace_exam_submission(delay_seconds, prefix, _log)
                 debug(f"{prefix} 交卷延时结束: 计划 {delay_seconds:.1f} 秒，"
                       f"实际等待 {waited:.1f} 秒")
@@ -8132,8 +8192,16 @@ class AutoLearner:
         if clicked_ids and fast_ids:
             debug(f"频道页取并集: 点击 {len(clicked_ids)} 个 + 快速通道 "
                   f"{len(fast_ids)} 个 → {len(workshop_ids)} 个")
-        _log(f"频道页采集到 {len(workshop_ids)} 个专题班",
-             "green" if workshop_ids else "yellow")
+        if workshop_ids:
+            _log(f"频道页采集到 {len(workshop_ids)} 个专题班", "green")
+        else:
+            # 一路下来都是空：把关键线索合成一行，用户/日志都能直接看出卡在哪
+            _log(f"频道页采集到 0 个专题班"
+                 f"（登录状态={login_state}，内容候选={candidates}，"
+                 f"快速通道={len(fast_ids)}，点击={len(clicked_ids)}）", "yellow")
+            debug(f"频道页诊断: login={login_state} candidates={candidates} "
+                  f"fast_ids={len(fast_ids)} clicked_ids={len(clicked_ids)} "
+                  f"gate={gate}")
         return workshop_ids
 
     async def _learn_exam_urls(self, exam_urls: List[str], _log, _progress) -> Dict:
@@ -8580,7 +8648,12 @@ class AutoLearner:
                 while pending and not self._stop_event.is_set():
                     tasks = await collect_one(pending.pop(0))
                     for task in tasks:
-                        queue.put_nowait((*task, 0))
+                        try:
+                            queue.put_nowait((*task, 0))
+                        except Exception as exc:
+                            debug(f"后台采集入队失败: {type(exc).__name__}: "
+                                  f"{_safe_debug_error(exc)}")
+                            break
                     total_counter[0] += len(tasks)
                     if tasks:
                         debug(f"边学边采集: 新增 {len(tasks)} 门课程，"
