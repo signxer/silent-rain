@@ -3038,66 +3038,36 @@ class DashboardScreen(QWidget):
             learner = AutoLearner(headless=cfg_headless, workers=cfg_workers, browser=cfg_browser)
             # 并发保护的考试询问：每次生成独立 prompt_id 与独立的 Event/choice，
             # 多个 worker 同时在等弹窗也不会互相串台（各自拿到自己的结果）。
-            async def _ask_exam_prompt(passed: bool, exam_name, text):
-                self._exam_prompt_seq += 1
-                prompt_id = self._exam_prompt_seq
-                ev = threading.Event()
-                holder = [False]
-                self._exam_prompt_events[prompt_id] = ev
-                self._exam_prompt_choices[prompt_id] = holder
-                try:
-                    timeout = EXAM_PASSED_RETRY_TIMEOUT if passed else EXAM_RETRY_TIMEOUT
-                    if passed:
-                        thread.exam_passed_signal.emit(prompt_id, exam_name, text or "")
-                    else:
-                        thread.exam_retry_signal.emit(prompt_id, exam_name, text or "")
-                    finished = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: ev.wait(timeout))
-                    if not finished:
-                        if passed:
-                            log(f"「{exam_name}」再考确认超时"
-                                f"（{timeout}秒未操作），跳过不考", "yellow")
-                        else:
-                            log(f"「{exam_name}」重考确认超时"
-                                f"（{timeout}秒未操作），不重考", "yellow")
-                        return False
-                    return bool(holder[0])
-                finally:
-                    self._exam_prompt_events.pop(prompt_id, None)
-                    self._exam_prompt_choices.pop(prompt_id, None)
-
             async def _ask_exam_retry(exam_name, reason):
-                return await _ask_exam_prompt(False, exam_name, reason or "")
+                name, prompt_id, on_choice = self._begin_exam_prompt()
+                thread.exam_retry_signal.emit(prompt_id, exam_name, reason or "")
+                return await self._wait_exam_prompt(
+                    name, EXAM_RETRY_TIMEOUT, log, prompt_id, on_choice,
+                    on_timeout="重考确认超时（{timeout}秒未操作），不重考")
 
             learner.exam_retry_hook = _ask_exam_retry
 
             # 空题占比过高时问"按未答提交"还是放弃（走同一个 prompt 配对机制）
             async def _ask_exam_unanswered(exam_name, unanswered, total):
-                self._exam_prompt_seq += 1
-                prompt_id = self._exam_prompt_seq
-                ev = threading.Event()
-                holder = [False]
-                self._exam_prompt_events[prompt_id] = ev
-                self._exam_prompt_choices[prompt_id] = holder
-                try:
-                    thread.exam_unanswered_signal.emit(
-                        prompt_id, exam_name, unanswered, total)
-                    finished = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: ev.wait(EXAM_PASSED_RETRY_TIMEOUT))
-                    if not finished:
-                        log(f"「{exam_name}」{unanswered}/{total} 题未作答，"
-                            f"超时（{EXAM_PASSED_RETRY_TIMEOUT}秒）默认按未答提交", "yellow")
-                        return True
-                    return bool(holder[0])
-                finally:
-                    self._exam_prompt_events.pop(prompt_id, None)
-                    self._exam_prompt_choices.pop(prompt_id, None)
+                name, prompt_id, on_choice = self._begin_exam_prompt()
+                thread.exam_unanswered_signal.emit(
+                    prompt_id, exam_name, unanswered, total)
+                # 空题提交的默认是"按未答提交"（True），超时也照此处理
+                return await self._wait_exam_prompt(
+                    name, EXAM_PASSED_RETRY_TIMEOUT, log, prompt_id, on_choice,
+                    on_timeout=f"「{exam_name}」{unanswered}/{total} 题未作答，"
+                               f"超时（{EXAM_PASSED_RETRY_TIMEOUT}秒）默认按未答提交",
+                    default=True)
 
             learner.exam_confirm_unanswered_hook = _ask_exam_unanswered
 
             # 上次已通过时问"跳过还是再考一次"（10 秒无响应 → 跳过）
             async def _ask_exam_passed_retry(exam_name, detail):
-                return await _ask_exam_prompt(True, exam_name, detail or "")
+                name, prompt_id, on_choice = self._begin_exam_prompt()
+                thread.exam_passed_signal.emit(prompt_id, exam_name, detail or "")
+                return await self._wait_exam_prompt(
+                    name, EXAM_PASSED_RETRY_TIMEOUT, log, prompt_id, on_choice,
+                    on_timeout="再考确认超时（{timeout}秒未操作），跳过不考")
 
             learner.exam_passed_retry_hook = _ask_exam_passed_retry
             # 考试自动答题：只有开启且配置了 Key 时才生效
@@ -4146,6 +4116,48 @@ class DashboardScreen(QWidget):
 
         choice = dlg.exec()
         return bool(choice == 1)
+
+    def _begin_exam_prompt(self):
+        """开始一次并发安全的考试询问：分配独立 prompt_id + Event/choice。
+
+        返回 (询问名, prompt_id, on_choice)。调用方负责发信号，然后用
+        _wait_exam_prompt 等待；GUI 线程收到选择后经 _resolve_exam_prompt
+        按 prompt_id 写回 —— 多个 worker 并发询问也不会互相串台。
+        """
+        self._exam_prompt_seq += 1
+        prompt_id = self._exam_prompt_seq
+        ev = threading.Event()
+        holder = [False]
+        self._exam_prompt_events[prompt_id] = ev
+        self._exam_prompt_choices[prompt_id] = holder
+
+        def on_choice(choice: bool):
+            if holder is not None:
+                holder[0] = bool(choice)
+            ev.set()
+
+        return f"询问#{prompt_id}", prompt_id, on_choice
+
+    async def _wait_exam_prompt(self, name, timeout, log, prompt_id, on_choice,
+                                on_timeout="", default=False) -> bool:
+        """等待一次考试询问的 GUI 选择；超时返回 default。"""
+        ev = self._exam_prompt_events.get(prompt_id)
+        if ev is None:
+            return default
+        holder = self._exam_prompt_choices.get(prompt_id)
+        try:
+            finished = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ev.wait(timeout))
+            if not finished:
+                msg = (on_timeout.format(timeout=timeout)
+                       if "{timeout}" in str(on_timeout) else on_timeout)
+                if msg:
+                    log(f"{name} {msg}", "yellow")
+                return default
+            return bool(holder[0]) if holder is not None else default
+        finally:
+            self._exam_prompt_events.pop(prompt_id, None)
+            self._exam_prompt_choices.pop(prompt_id, None)
 
     def _resolve_exam_prompt(self, prompt_id, choice: bool):
         """把一次弹窗的选择写回它对应的等待方（按 prompt_id 配对，不串台）。"""

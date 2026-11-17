@@ -234,6 +234,88 @@ class ExamPassedDialogWiringTests(unittest.TestCase):
         self.assertIn("跳过", src)
 
 
+class ConcurrentExamPromptTests(unittest.TestCase):
+    """并发核心：两个考试询问同时等待，各自的选择必须写回各自的那份。
+    直接驱动 DashboardScreen 的 _begin_exam_prompt/_resolve_exam_prompt——
+    这正是当初"共用 Event + 单个 choice 标志"会串台的地方（v2.4.17 修复）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import gui
+            cls.gui = gui
+        except Exception:  # pragma: no cover
+            raise unittest.SkipTest("GUI 不可导入")
+
+    def setUp(self):
+        self.dash = self.gui.DashboardScreen.__new__(self.gui.DashboardScreen)
+        # __new__ 不走 __init__，这里补齐并发询问需要的外部状态
+        self.dash._exam_prompt_seq = 0
+        self.dash._exam_prompt_events = {}
+        self.dash._exam_prompt_choices = {}
+
+    def _resolve(self, prompt_id, choice):
+        self.dash._resolve_exam_prompt(prompt_id, choice)
+
+    def test_two_prompts_resolve_independently(self):
+        """两个并发询问，一个选"再考"一个选"跳过"，各自结果必须正确。"""
+        import threading
+
+        name1, id1, on1 = self.dash._begin_exam_prompt()
+        name2, id2, on2 = self.dash._begin_exam_prompt()
+        self.assertNotEqual(id1, id2, "两个询问必须分配不同的 prompt_id")
+        results = {}
+
+        def run(prompt_id, on_choice, choice, key):
+            threading.Timer(0.05, lambda: self._resolve(prompt_id, choice)).start()
+            loop = asyncio.new_event_loop()
+            try:
+                results[key] = loop.run_until_complete(
+                    self.dash._wait_exam_prompt(
+                        name1, 10, lambda m, s="": None, prompt_id, on_choice))
+            finally:
+                loop.close()
+
+        threads = [
+            threading.Thread(target=run, args=(id1, on1, True, "a"), daemon=True),
+            threading.Thread(target=run, args=(id2, on2, False, "b"), daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertTrue(results.get("a"),
+                        "第一个询问应拿到 再考（不能被第二个的跳过覆盖）")
+        self.assertFalse(results.get("b"),
+                         "第二个询问应拿到 跳过（不能被第一个的再考覆盖）")
+
+    def test_timeout_uses_default(self):
+        """询问超时未响应 → 返回 default（并发场景也不会卡死）。"""
+        name, prompt_id, on_choice = self.dash._begin_exam_prompt()
+        loop = asyncio.new_event_loop()
+        try:
+            val = loop.run_until_complete(self.dash._wait_exam_prompt(
+                name, 0.05, lambda m, s="": None, prompt_id, on_choice,
+                default=True))
+        finally:
+            loop.close()
+        self.assertTrue(val)
+        self.assertNotIn(prompt_id, self.dash._exam_prompt_events)
+
+    def test_state_cleaned_after_resolve(self):
+        name, prompt_id, on_choice = self.dash._begin_exam_prompt()
+        self._resolve(prompt_id, True)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.dash._wait_exam_prompt(
+                name, 5, lambda m, s="": None, prompt_id, on_choice))
+        finally:
+            loop.close()
+        # 结束后事件与 choice 都应清理，避免泄漏导致 id 暴增
+        self.assertNotIn(prompt_id, self.dash._exam_prompt_events)
+        self.assertNotIn(prompt_id, self.dash._exam_prompt_choices)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -295,10 +377,12 @@ class RetakeRaceAndResilienceTests(unittest.TestCase):
             import gui
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"GUI 不可导入: {exc}")
-        src = inspect.getsource(gui.DashboardScreen._run_learning)
+        src = inspect.getsource(gui.DashboardScreen)
+        self.assertIn("def _begin_exam_prompt", src)
         self.assertIn("_exam_prompt_seq", src)
         self.assertIn("threading.Event()", src)
         self.assertNotIn("_exam_retry_choice = False", src)
+        self.assertNotIn("self._exam_retry_event", src)
 
     def test_phase_status_shown_when_total_positive(self):
         try:
@@ -316,3 +400,105 @@ class _FakeRng:
 
     def uniform(self, a, b):
         return self.value
+
+
+class UnansweredPromptFlowTests(unittest.TestCase):
+    """空题占比过高时确认"按未答提交"还是"放弃"的分支。"""
+
+    def setUp(self):
+        self.debugs = []
+        patcher = patch("main.debug", side_effect=lambda m: self.debugs.append(str(m)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        self.learner = AutoLearner.__new__(AutoLearner)
+        self.learner.exam_confirm_unanswered_hook = None
+        self.log = lambda m, s="": self.logs.append(str(m))
+
+    async def _resolve_flow(self, unanswered, total):
+        """模拟 _solve_one_exam 里那段判定逻辑（return 是否继续提交）。"""
+        if (self.learner.exam_confirm_unanswered_hook
+                and unanswered >= max(3, int(total * 0.5))):
+            return await self.learner.exam_confirm_unanswered_hook("X", unanswered, total)
+        # 未达阈值：照常按未答提交，不问
+        return True
+
+    def test_low_unanswered_skips_prompt(self):
+        """11/30 未答（不足一半）→ 不弹窗，直接按未答提交。"""
+        def _boom(name, u, t):  # pragma: no cover
+            raise AssertionError("不应被调用")
+        self.learner.exam_confirm_unanswered_hook = _boom
+        self.assertTrue(asyncio.run(self._resolve_flow(11, 30)))
+
+    def test_high_unanswered_asks_and_submit_on_yes(self):
+        async def hook(name, unanswered, total):
+            return True  # 用户选"按未答提交"
+        self.learner.exam_confirm_unanswered_hook = hook
+        self.assertTrue(asyncio.run(self._resolve_flow(20, 30)))
+
+    def test_high_unanswered_can_choose_to_give_up(self):
+        async def hook(name, unanswered, total):
+            return False  # 用户选"放弃本场"
+        self.learner.exam_confirm_unanswered_hook = hook
+        self.assertFalse(asyncio.run(self._resolve_flow(20, 30)))
+
+    def test_threshold_used_is_half_or_three(self):
+        """触发条件是 max(3, 50%)：小卷子至少 3 题空才问。"""
+        trigger = lambda u, t: (u >= max(3, int(t * 0.5)))
+        self.assertTrue(trigger(3, 5), "3/5 → 触发")
+        self.assertFalse(trigger(2, 5), "2/5 → 不触发")
+        self.assertTrue(trigger(4, 5), "4/5 → 触发")
+
+    def test_solve_flow_integrates_the_hook(self):
+        """_solve_one_exam 里确实接了 exam_confirm_unanswered_hook，且返回 skipped 表示放弃。"""
+        import inspect
+        src = inspect.getsource(AutoLearner._solve_one_exam)
+        self.assertIn("exam_confirm_unanswered_hook", src)
+        self.assertIn("用户选择放弃", src)
+        self.assertIn("按未答提交", src)
+
+
+class AnswerExamResilienceTests(unittest.TestCase):
+    """answer_exam 保留部分答案，不再整卷丢弃。"""
+
+    def setUp(self):
+        import main as main_mod
+        self.main = main_mod
+        self.client = main_mod.DeepSeekClient.__new__(main_mod.DeepSeekClient)
+        self.client.api_key = "k"
+        self.client.thinking = False
+        self.client.model = "m"
+        self.calls = []
+
+    def _fake_chat(self, seq):
+        async def chat(messages, **kw):
+            n = len(self.calls)
+            self.calls.append(messages)
+            return seq[n if n < len(seq) else -1]
+        self.client.chat = chat
+
+    def test_partial_json_preserves_parsed_answers(self):
+        questions = [{"index": 1, "type": "SingleChoice", "content": "q1",
+                      "options": []}, {"index": 2, "type": "SingleChoice",
+                                       "content": "q2", "options": []}]
+        first = '{"answers":[{"index":1,"choices":["A"]}],"extra":true}'
+        # 第二轮用补全上下文请求返回缺失的第 2 题
+        seq = [first, '{"answers":[{"index":2,"choices":["B"]}]}']
+        self._fake_chat(seq)
+        out = asyncio.run(self.client.answer_exam(questions, log=None))
+        self.assertEqual(out[1]["choices"], ["A"])
+        self.assertEqual(out[2]["choices"], ["B"])
+        # 第二轮必须带了"补全没答的题"的请求（calls[1][3] 是追加的补全提示）
+        self.assertEqual(len(self.calls), 2)
+        correction_msg = " ".join(m.get("content", "") for m in self.calls[1][2:])
+        self.assertIn("还没答的题", correction_msg)
+        self.assertIn("[2]", correction_msg)
+
+    def test_complete_first_answer_returns_immediately(self):
+        questions = [{"index": 1, "type": "SingleChoice", "content": "q1",
+                      "options": []}]
+        seq = ['{"answers":[{"index":1,"choices":["A"]}]}']
+        self._fake_chat(seq)
+        out = asyncio.run(self.client.answer_exam(questions, log=None))
+        self.assertEqual(out[1]["choices"], ["A"])
+        self.assertEqual(len(self.calls), 1, "一次就拿全就不必再问")
