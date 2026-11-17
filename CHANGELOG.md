@@ -1,5 +1,9 @@
 # 更新日志
 
+## 2.4.20
+- refactor(timeout): 收敛高频硬编码超时为命名常量 —— `PAGE_NAV_TIMEOUT`(goto/reload/关键节点, 20s)、`PAGE_LOAD_TIMEOUT`(次级导航/登录, 15s)、`PAGE_SETTLE_WAIT`(落地稳定, 3s)、`PAGE_REFRESH_WAIT`(轻量重载, 2s)、`PAGE_SHORT_WAIT`(翻页衔接, 1s)。共替换 82 处 magic number，语义相同、数值不变，统一调参不再逐个找
+- 说明：本次只做"把散落的相同数值命名"，不改任何等待时长/逻辑，纯维护性改动；全量测试与 console 泄漏检查均通过
+
 ## 2.4.19
 - refactor(exam): 抽离并发安全的考试询问握手 `_begin_exam_prompt`/`_wait_exam_prompt` —— 未通过重考、已通过是否再考、空题是否提交三种询问共用同一套"独立 prompt_id + Event/choice 按 id 配对"机制，行为与之前完全一致
 - test(exam): 新增**真正的并发测试** —— 两个考试询问同时等待、各自选不同结果（一个再考、一个跳过），验证互不串台（v2.4.17 修复的竞态有了可回放的覆盖）；超时返回 default 且清理状态

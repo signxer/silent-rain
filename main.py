@@ -146,6 +146,15 @@ WORKER_STAGGER_SECONDS = 3.0
 # 拦截或驱动半死，就会永远卡在「使用系统 Chrome」那一步且毫无提示。
 BROWSER_STEP_TIMEOUT_SECONDS = 90
 
+# ── 页面导航/等待的通用超时（毫秒）────────────────────────────
+# 历史上散落着 magic number：鼠标悬停同一段语义却各写各的，排查与统一调参都很费劲。
+# 这里把最高频、语义一致的几档集中命名；下方所有站点统一替换，不留半吊子。
+PAGE_NAV_TIMEOUT = 20000       # goto / reload / 关键节点 wait_for_selector
+PAGE_LOAD_TIMEOUT = 15000      # 登录、详情等次级导航
+PAGE_SETTLE_WAIT = 3000        # 落地后等 SPA 稳定
+PAGE_REFRESH_WAIT = 2000       # 轻量的重新加载/轻量等待
+PAGE_SHORT_WAIT = 1000         # 极短停顿（翻页衔接等）
+
 # 学习频道页的专题班入口收割：能从 href / data-* / onclick 静态读出 ID 就不要点击。
 # 覆盖站点不同版本的写法：?id= / workshopId= / workshop_id= / /detail/<id>。
 # 故意不认 logChannelId：那是「频道」ID，当成专题班 ID 会跳错详情页。
@@ -1880,10 +1889,10 @@ class AutoLearner:
             console.print("正在检查登录状态...", style="blue")
             try:
                 await page.goto("https://u.ccb.com/portal/#/study",
-                                wait_until="networkidle", timeout=20000)
+                                wait_until="networkidle", timeout=PAGE_NAV_TIMEOUT)
             except:
                 await page.goto("https://u.ccb.com/portal/#/study",
-                                wait_until="domcontentloaded", timeout=15000)
+                                wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             # SPA 可能需要额外时间渲染，等待关键元素出现
             await page.wait_for_timeout(5000)
             
@@ -2278,7 +2287,7 @@ class AutoLearner:
                     
                     # 导航到study页面做最终确认
                     await page.goto("https://u.ccb.com/portal/#/study",
-                                    wait_until="domcontentloaded", timeout=15000)
+                                    wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                     await page.wait_for_timeout(5000)
                     
                     # 用和check_login_status相同的逻辑做最终验证
@@ -2366,7 +2375,7 @@ class AutoLearner:
                             await asyncio.sleep(1)
                             cu = page.url
                             if "/sys/#/login" not in cu:
-                                await page.wait_for_timeout(3000)
+                                await page.wait_for_timeout(PAGE_SETTLE_WAIT)
                                 nt = await page.locator(".cuWeb-swipe-web-info-notlogin-tips").count()
                                 if nt == 0:
                                     logged_in = True
@@ -2432,7 +2441,7 @@ class AutoLearner:
                 page_loaded = False
                 for refresh in range(1, 4):  # 最多刷新3次
                     try:
-                        await page.goto(login_url, timeout=15000)
+                        await page.goto(login_url, timeout=PAGE_LOAD_TIMEOUT)
                     except:
                         pass
                     await asyncio.sleep(3)
@@ -2530,10 +2539,10 @@ class AutoLearner:
                     if "/sys/#/login" not in page.url:
                         try:
                             await page.goto("https://u.ccb.com/portal/#/study",
-                                            wait_until="networkidle", timeout=15000)
+                                            wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
                         except:
                             pass
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(PAGE_SETTLE_WAIT)
                         if "/sys/#/login" not in page.url:
                             logged_in = True
                             break
@@ -2800,7 +2809,7 @@ class AutoLearner:
             # 等待标签树加载
             await page.wait_for_timeout(5000)
             try:
-                await page.wait_for_selector("ul.tag-tree-list", timeout=15000)
+                await page.wait_for_selector("ul.tag-tree-list", timeout=PAGE_LOAD_TIMEOUT)
             except:
                 debug("标签树未加载，继续尝试...")
 
@@ -2827,7 +2836,7 @@ class AutoLearner:
                             if text == tag:
                                 console.print(f"  找到匹配标签: {text}", style="green")
                                 await all_tags.nth(i).click()
-                                await page.wait_for_timeout(3000)
+                                await page.wait_for_timeout(PAGE_SETTLE_WAIT)
                                 console.print(f"  ✓ 已点击标签: {tag}", style="green")
                                 found = True
                                 break
@@ -2835,7 +2844,7 @@ class AutoLearner:
                             break
                     except Exception as e1:
                         console.print(f"  方法1尝试 {attempt+1} 失败: {e1}", style="yellow")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(PAGE_REFRESH_WAIT)
 
                 if found:
                     continue
@@ -2853,7 +2862,7 @@ class AutoLearner:
                                 if t == tag and await candidates.nth(j).is_visible():
                                     console.print(f"  找到可见标签元素: {tag}", style="green")
                                     await candidates.nth(j).click()
-                                    await page.wait_for_timeout(3000)
+                                    await page.wait_for_timeout(PAGE_SETTLE_WAIT)
                                     console.print(f"  ✓ 已点击标签: {tag}", style="green")
                                     found = True
                                     break
@@ -2863,7 +2872,7 @@ class AutoLearner:
                             break
                     except:
                         pass
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(PAGE_REFRESH_WAIT)
 
                 if not found:
                     console.print(f"  ✗ 未找到标签: {tag}", style="red")
@@ -2904,7 +2913,7 @@ class AutoLearner:
                     }""")
                     if result == 'no-btn':
                         break
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(PAGE_SHORT_WAIT)
                     # 点击最后一个选项（最低画质）
                     clicked = await page.evaluate("""() => {
                         const items = document.querySelectorAll('.quality-list li');
@@ -2928,7 +2937,7 @@ class AutoLearner:
                     qbtn = page.locator('.current-quality').first
                     if await qbtn.count() > 0:
                         await qbtn.click(force=True)
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(PAGE_SHORT_WAIT)
                         # 等待下拉菜单可见
                         try:
                             await page.locator('.quality-list li').last.wait_for(state="visible", timeout=3000)
@@ -2978,7 +2987,7 @@ class AutoLearner:
                     break
             except Exception as _se:
                 debug(f"倍速异常(attempt={attempt}): {_se}")
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(PAGE_SHORT_WAIT)
 
 
     async def _check_video_progress(self, page: Page) -> float:
@@ -3035,7 +3044,7 @@ class AutoLearner:
                 if refresh_attempt < max_load_refreshes:
                     debug(f"[工作线程 {worker_id+1}] phase=video_probe player_not_found; refresh={refresh_attempt+1}/{max_load_refreshes}; {_page_debug_state(page)}")
                     try:
-                        await page.reload(wait_until="domcontentloaded", timeout=15000)
+                        await page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                         await page.wait_for_timeout(5000)
                         debug(f"[工作线程 {worker_id+1}] phase=video_probe refresh_complete={refresh_attempt+1}; {_page_debug_state(page)}")
                     except Exception as exc:
@@ -3494,7 +3503,7 @@ class AutoLearner:
                     break
                 if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                     return False
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(PAGE_SHORT_WAIT)
                 state = await snapshot()
 
             components = media_components(state)
@@ -3579,7 +3588,7 @@ class AutoLearner:
                         break
                     if self._stop_event.is_set() or (cancel_event and cancel_event.is_set()):
                         return False
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(PAGE_SHORT_WAIT)
 
                 # 没有播放器可播：记为待平台结算，不再进播放/停滞循环（否则要空转十几分钟）
                 if not media_ready:
@@ -3679,7 +3688,7 @@ class AutoLearner:
                         refresh_count += 1
                         debug(f"{prefix} 播放进度停滞，刷新课程页重试 ({refresh_count}/3)")
                         try:
-                            await page.reload(wait_until="domcontentloaded", timeout=20000)
+                            await page.reload(wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                             await page.wait_for_timeout(5000)
                             if not re.search(r"#/traincamp/study/", page.url):
                                 return False
@@ -3693,7 +3702,7 @@ class AutoLearner:
                                 await page.locator(f".{component_class}").first.scroll_into_view_if_needed(timeout=5000)
                             except Exception:
                                 pass
-                            await page.wait_for_timeout(2000)
+                            await page.wait_for_timeout(PAGE_REFRESH_WAIT)
                             await page.evaluate(self._TRAINCAMP_PLAY_JS, component_class)
                         except Exception as e:
                             debug(f"{prefix} 刷新课程页失败: {e}")
@@ -4181,7 +4190,7 @@ class AutoLearner:
                     except Exception as e2:
                         debug(f"{prefix} 完成学习 JS 点击也失败: {e2}")
                 for _ in range(8):
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(PAGE_SHORT_WAIT)
                     if await page.evaluate(done_js):
                         return True
                 # 平台可能弹了错误提示（例如仍有组件未完成），关掉再重试
@@ -4398,7 +4407,7 @@ class AutoLearner:
                 data = None
             if data and (data.get("records") or data.get("lastStatus")):
                 return data
-            await exam_page.wait_for_timeout(1000)
+            await exam_page.wait_for_timeout(PAGE_SHORT_WAIT)
         return None
 
     @staticmethod
@@ -4501,7 +4510,7 @@ class AutoLearner:
                     break
                 if self._stop_event.is_set():
                     return {"status": "skipped", "detail": "已请求停止"}
-                await exam_page.wait_for_timeout(1000)
+                await exam_page.wait_for_timeout(PAGE_SHORT_WAIT)
             if not preview:
                 return {"status": "error", "detail": "未能读取考试说明数据"}
             # 说明页会给出真实考试名：日志与"是否重考"弹窗都用它
@@ -4545,7 +4554,7 @@ class AutoLearner:
             start_btn = exam_page.locator(".exam-start-btn").first
             if await start_btn.count() == 0:
                 return {"status": "error", "detail": "未找到「开始考试」按钮"}
-            await start_btn.click(timeout=15000)
+            await start_btn.click(timeout=PAGE_LOAD_TIMEOUT)
             await exam_page.wait_for_timeout(1200)
             for _ in range(3):
                 try:
@@ -4702,7 +4711,7 @@ class AutoLearner:
             )
             try:
                 await exam_page.goto(finished_url, wait_until="domcontentloaded", timeout=30000)
-                await exam_page.wait_for_selector(".finishContainer", state="attached", timeout=20000)
+                await exam_page.wait_for_selector(".finishContainer", state="attached", timeout=PAGE_NAV_TIMEOUT)
                 score = None
                 for _ in range(20):
                     try:
@@ -4711,7 +4720,7 @@ class AutoLearner:
                         score = None
                     if score:
                         break
-                    await exam_page.wait_for_timeout(1000)
+                    await exam_page.wait_for_timeout(PAGE_SHORT_WAIT)
             except Exception as e:
                 debug(f"{prefix} 读取成绩失败: {e}")
                 score = None
@@ -4759,7 +4768,7 @@ class AutoLearner:
                     and not await page.query_selector("video, audio, .prism-player")):
                 debug(f"[工作线程 {worker_id+1}] 当前是课程详情页，不能刷新重试播放器")
                 return False
-            await page.reload(wait_until="domcontentloaded", timeout=20000)
+            await page.reload(wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
             await page.wait_for_timeout(5000)
             # 刷新后播放器状态丢失，重新点击学习按钮
             for kw in ["我要学习", "开始学习", "进入课程", "继续学习", "学习课程", "进入课程学习"]:
@@ -4784,7 +4793,7 @@ class AutoLearner:
                         pass
                 if video_found:
                     break
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(PAGE_SETTLE_WAIT)
             if not video_found:
                 debug(f"[工作线程 {worker_id+1}] 刷新后未找到视频元素")
                 return False
@@ -4918,7 +4927,7 @@ class AutoLearner:
                 await btn.click(timeout=8000)
                 # 报名后地址会变（详情路由切到"已报名"形态），等它切过去再继续
                 for _ in range(10):
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(PAGE_REFRESH_WAIT)
                     if _page_url(page) != old_url:
                         break
                     try:
@@ -4927,10 +4936,10 @@ class AutoLearner:
                     except Exception:
                         break
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=15000)
+                    await page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT)
                 except Exception:
                     pass
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(PAGE_SETTLE_WAIT)
                 debug(f"报名前后 URL: {_safe_debug_url(old_url)} → "
                       f"{_safe_debug_url(_page_url(page))}")
                 return True
@@ -4958,7 +4967,7 @@ class AutoLearner:
                     break
                 debug(f"  等待课程数据加载({_wait+1}/6)...")
                 await page.wait_for_timeout(5000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(PAGE_REFRESH_WAIT)
 
             # 检查页面是否加载了课程表格
             row_count = await page.locator("tr.text-center").count()
@@ -5083,7 +5092,7 @@ class AutoLearner:
         dom_result = None
         try:
             await _page.goto("https://u.ccb.com/portal/#/studyCenter",
-                           wait_until="domcontentloaded", timeout=20000)
+                           wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
             # 先等「今年已训」行标签出现，再等学时数值绑定完成，最后留一点稳定时间；
             # 比固定 sleep 8s 更快，也避免数据未到位时把学时解析成 0。
             try:
@@ -5146,7 +5155,7 @@ class AutoLearner:
         # 课程列表交互式筛选（与专题班标签同结构）
         _fk = await async_input("是否筛选课程？(y/n，默认n)", default="n", timeout=5)
         if _fk in ('y', 'yes'):
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(PAGE_REFRESH_WAIT)
             # 提取tag-second过滤项
             _fitems = page.locator("li.tag-second:not(.active)")
             _fc = await _fitems.count()
@@ -5163,7 +5172,7 @@ class AutoLearner:
                     if _part.isdigit() and 1 <= int(_part) <= len(_all_flt):
                         await _all_flt[int(_part)-1].click()
                         await page.wait_for_timeout(1500)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(PAGE_SETTLE_WAIT)
             else:
                 console.print("未找到筛选选项", style="yellow")
 
@@ -5245,7 +5254,7 @@ class AutoLearner:
                 cp = None
                 try:
                     # 回到列表页并翻到课程所在页码（避免跨页全局索引点错/跳过）
-                    await wp.goto(list_url, wait_until="networkidle", timeout=20000)
+                    await wp.goto(list_url, wait_until="networkidle", timeout=PAGE_NAV_TIMEOUT)
                     await wp.wait_for_timeout(5000)
                     for _ in range(cpage - 1):
                         try:
@@ -5253,7 +5262,7 @@ class AutoLearner:
                             if await nxt.count() == 0:
                                 break
                             await nxt.first.click()
-                            await wp.wait_for_timeout(3000)
+                            await wp.wait_for_timeout(PAGE_SETTLE_WAIT)
                         except:
                             break
                     # 按标题精确定位（翻页后索引不再可靠）
@@ -5274,7 +5283,7 @@ class AutoLearner:
                     if link is None:
                         console.print(f"未找到课程: {c['title'][:30]}", style="yellow")
                         continue
-                    async with wp.expect_event("popup", timeout=20000) as pi:
+                    async with wp.expect_event("popup", timeout=PAGE_NAV_TIMEOUT) as pi:
                         await link.click()
                     cp = await pi.value
                     await cp.wait_for_load_state()
@@ -5366,11 +5375,11 @@ class AutoLearner:
                     # 只有 reload 才能按同一地址真正重新加载。
                     debug(f"{tag}phase=list_reload attempt={attempt}; "
                           f"同址 goto 不会重渲染，改为 reload; {_page_debug_state(page)}")
-                    await reload_page(wait_until="domcontentloaded", timeout=20000)
+                    await reload_page(wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                 else:
                     # 文档不同或 hash 不同：hash 变化会触发路由，goto 即可切到目标页。
                     # 这里不能改成 reload：reload 会停留在标签页当前所在的页（例如第 2 页）。
-                    await page.goto(list_url, wait_until="domcontentloaded", timeout=20000)
+                    await page.goto(list_url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                 navigated = True
             except Exception as exc:
                 debug(f"{tag}phase=list_nav_error attempt={attempt}; "
@@ -5527,7 +5536,7 @@ class AutoLearner:
                 return None
             next_page = current_page + 1
             target = parts._replace(fragment=f"{match.group(1)}{next_page}").geturl()
-            await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
         except Exception as exc:
             debug(f"网络课程分页路由兜底失败 current={current_page}; "
                   f"error={type(exc).__name__}: {_safe_debug_error(exc)}")
@@ -5619,7 +5628,7 @@ class AutoLearner:
             if self._route_page_index(_page_url(page)) == target_page:
                 return await self._wait_online_course_cards(page, 3000)
             target = parts._replace(fragment=f"{match.group(1)}{target_page}").geturl()
-            await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
         except Exception as exc:
             debug(f"网络课程列表深链跳转失败 page={target_page}; "
                   f"error={type(exc).__name__}: {_safe_debug_error(exc)}")
@@ -5698,7 +5707,7 @@ class AutoLearner:
                     course_page = popup.result()
                     debug(f"[工作线程 {worker_id+1}] phase=course_popup_opened; {_page_debug_state(course_page)}")
                     try:
-                        await course_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        await course_page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                         # The learning site is an SPA: DOMContentLoaded often precedes
                         # rendering its course detail content and action button.
                         settle = getattr(course_page, "wait_for_timeout", None)
@@ -5889,7 +5898,7 @@ class AutoLearner:
             if new_pages:
                 player_page = new_pages[-1]
                 try:
-                    await player_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await player_page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                 except Exception:
                     if not player_page.is_closed():
                         await player_page.close()
@@ -5936,7 +5945,7 @@ class AutoLearner:
                 _log("Session过期，请在浏览器中重新登录...", "red")
                 try:
                     await page.goto("https://u.ccb.com/portal/#/study",
-                                    wait_until="domcontentloaded", timeout=15000)
+                                    wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                 except:
                     pass
                 for _ in range(120):
@@ -5990,7 +5999,7 @@ class AutoLearner:
                     break
                 except Exception:
                     if attempt < 1:
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(PAGE_REFRESH_WAIT)
             if not loaded:
                 # 网络抖动不能等价于“没有下一页”；保留当前页，后续补课时重试。
                 retry_current_page = True
@@ -6056,7 +6065,7 @@ class AutoLearner:
                     # 翻页状态通常只保存在前端内存；非首页刷新会跳回第 1 页。
                     if page_num == 1:
                         try:
-                            await page.reload(wait_until="domcontentloaded", timeout=20000)
+                            await page.reload(wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                         except Exception as exc:
                             retry_current_page = True
                             _log(f"课程列表刷新失败，稍后重试: {exc}", "yellow")
@@ -6240,8 +6249,8 @@ class AutoLearner:
                             try:
                                 phase = "navigate_direct"
                                 debug(f"[线程{wid+1}] phase={phase} attempt={attempt}; course={ctitle!r}; target={_safe_debug_url(target_url)}")
-                                await wp.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                                await wp.wait_for_timeout(3000)
+                                await wp.goto(target_url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
+                                await wp.wait_for_timeout(PAGE_SETTLE_WAIT)
                                 if wp.url == list_url:
                                     raise OnlineCourseListUnavailable("课程地址返回列表页")
                                 cp = wp
@@ -6468,8 +6477,8 @@ class AutoLearner:
         async def init_collect_page(cp):
             try:
                 await cp.goto("https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise",
-                              wait_until="networkidle", timeout=20000)
-                await cp.wait_for_timeout(3000)
+                              wait_until="networkidle", timeout=PAGE_NAV_TIMEOUT)
+                await cp.wait_for_timeout(PAGE_SETTLE_WAIT)
                 if self.tags_to_learn:
                     for tag in self.tags_to_learn:
                         try:
@@ -6479,7 +6488,7 @@ class AutoLearner:
                                 text = (await all_tags.nth(i).inner_text()).strip()
                                 if text == tag:
                                     await all_tags.nth(i).click()
-                                    await cp.wait_for_timeout(3000)
+                                    await cp.wait_for_timeout(PAGE_SETTLE_WAIT)
                                     break
                         except:
                             pass
@@ -6516,7 +6525,7 @@ class AutoLearner:
                 # 直接用传入的页面（已认证），导航到专题班详情页
                 ws_url = f"https://u.ccb.com/workshop/#/myworkshop/detail?id={ws_id}"
                 try:
-                    await cp.goto(ws_url, wait_until="domcontentloaded", timeout=20000)
+                    await cp.goto(ws_url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                     await cp.wait_for_timeout(6000)
                 except:
                     pass
@@ -6542,7 +6551,7 @@ class AutoLearner:
                             old_url = cp.url
                             await btn.click()
                             for _ in range(10):
-                                await cp.wait_for_timeout(2000)
+                                await cp.wait_for_timeout(PAGE_REFRESH_WAIT)
                                 if cp.url != old_url:
                                     break
                                 try:
@@ -6550,8 +6559,8 @@ class AutoLearner:
                                         break
                                 except:
                                     break
-                            await cp.wait_for_load_state("networkidle", timeout=15000)
-                            await cp.wait_for_timeout(3000)
+                            await cp.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT)
+                            await cp.wait_for_timeout(PAGE_SETTLE_WAIT)
                             need_enroll = True
                             break
                     except:
@@ -6560,7 +6569,7 @@ class AutoLearner:
                 # 报名后重新导航到详情页，等服务器处理
                 if need_enroll:
                     try:
-                        await cp.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                        await cp.goto(ws_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                         await cp.wait_for_timeout(5000)
                     except:
                         pass
@@ -6571,7 +6580,7 @@ class AutoLearner:
                             tab = cp.locator(f"text={tab_text}").first
                             if await tab.count() > 0 and await tab.is_visible():
                                 await tab.click()
-                                await cp.wait_for_timeout(3000)
+                                await cp.wait_for_timeout(PAGE_SETTLE_WAIT)
                                 break
                         except:
                             pass
@@ -6709,8 +6718,8 @@ class AutoLearner:
         # 确保主页面回到列表页
         try:
             await page.goto("https://u.ccb.com/workshop/#/index?collegeId=&departmentId=&orderby=praise",
-                            wait_until="networkidle", timeout=15000)
-            await page.wait_for_timeout(3000)
+                            wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
+            await page.wait_for_timeout(PAGE_SETTLE_WAIT)
         except:
             pass
 
@@ -7020,10 +7029,10 @@ class AutoLearner:
 
                     # 1) 导航到专题班页（reload确保SPA刷新内容）
                     try:
-                        await page.goto(ws_url, wait_until="networkidle", timeout=20000)
-                        await page.reload(wait_until="networkidle", timeout=20000)
-                        await page.wait_for_selector("tr.text-center", timeout=15000)
-                        await page.wait_for_timeout(2000)
+                        await page.goto(ws_url, wait_until="networkidle", timeout=PAGE_NAV_TIMEOUT)
+                        await page.reload(wait_until="networkidle", timeout=PAGE_NAV_TIMEOUT)
+                        await page.wait_for_selector("tr.text-center", timeout=PAGE_LOAD_TIMEOUT)
+                        await page.wait_for_timeout(PAGE_REFRESH_WAIT)
                     except Exception as e:
                         debug(f"[工作线程 {w_id+1}] 页面加载异常: {traceback.format_exc()}")
                         if retry_task(ws_id, cidx, course, ws_title, retry, w_id):
@@ -7072,7 +7081,7 @@ class AutoLearner:
                             continue
 
                         try:
-                            async with page.expect_event("popup", timeout=20000) as pi:
+                            async with page.expect_event("popup", timeout=PAGE_NAV_TIMEOUT) as pi:
                                 await btn.click()
                             course_page = await pi.value
                             await course_page.wait_for_load_state()
@@ -7421,14 +7430,14 @@ class AutoLearner:
         _log = log_callback or (lambda msg, style="": console.print(msg, style=style))
         camp_url = f"https://u.ccb.com/trainingcamp/#/traincampdetail/{camp_id}/away"
         try:
-            await page.goto(camp_url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(camp_url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
             # 用 attached 而不是默认的 visible：目录为空时容器高度为 0，visible 会一直等
-            await page.wait_for_selector(".traincamp-journey", state="attached", timeout=20000)
+            await page.wait_for_selector(".traincamp-journey", state="attached", timeout=PAGE_NAV_TIMEOUT)
             await page.wait_for_function("""() => {
                 const root = document.querySelector('.traincamp-journey');
                 const vm = root && root.__vue__;
                 return !!(vm && Array.isArray(vm.dataList) && vm.dataList.length);
-            }""", timeout=20000)
+            }""", timeout=PAGE_NAV_TIMEOUT)
             collected = await page.evaluate("""() => {
                 const root = document.querySelector('.traincamp-journey');
                 const vm = root && root.__vue__;
@@ -7685,7 +7694,7 @@ class AutoLearner:
                     except Exception:
                         pass
                 try:
-                    await popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await popup.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                 except Exception:
                     pass
                 return await self._wait_popup_url(popup)
@@ -7997,7 +8006,7 @@ class AutoLearner:
                     if _page_url(page) != channel_url:
                         try:
                             await page.goto(channel_url, wait_until="domcontentloaded",
-                                            timeout=15000)
+                                            timeout=PAGE_LOAD_TIMEOUT)
                         except Exception:
                             pass
                 try:
@@ -8078,7 +8087,7 @@ class AutoLearner:
                 if not workshop_id and _page_url(page) != channel_url:
                     try:
                         await page.goto(channel_url, wait_until="domcontentloaded",
-                                        timeout=15000)
+                                        timeout=PAGE_LOAD_TIMEOUT)
                     except Exception:
                         pass
                 _take(workshop_id, label)
@@ -8131,7 +8140,7 @@ class AutoLearner:
                     pass
 
         try:
-            await page.goto(channel_url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(channel_url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
         except Exception as e:
             _drop_response_listener()
             _log(f"频道页打开失败: {e}", "yellow")
@@ -8282,7 +8291,7 @@ class AutoLearner:
                 _progress({"wid": wid, "course": title, "progress": "-", "eta": "-", "status": "加载中"})
                 last_reported_progress = [None]
                 try:
-                    await wp.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await wp.goto(url, wait_until="domcontentloaded", timeout=PAGE_NAV_TIMEOUT)
                     await wp.wait_for_timeout(5000)
                     is_trainingcamp = bool(re.search(r"https?://[^/]+/trainingcamp/#/traincamp/study/", url))
                     if is_trainingcamp:
@@ -8564,8 +8573,8 @@ class AutoLearner:
             body = ""
             for nav_url in [ws_url, ws_url.replace("/myworkshop/detail", "/detail")]:
                 try:
-                    await collect_page.goto(list_url, wait_until="domcontentloaded", timeout=15000)
-                    await collect_page.wait_for_timeout(2000)
+                    await collect_page.goto(list_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                    await collect_page.wait_for_timeout(PAGE_REFRESH_WAIT)
                     await collect_page.evaluate(
                         f"window.location.hash = '{nav_url.split('#')[1]}';")
                     await collect_page.wait_for_timeout(5000)
@@ -8586,7 +8595,7 @@ class AutoLearner:
             # 所以要重新进一次详情页等服务器处理（与自动模式同一套做法）。
             if await self._enroll_workshop_if_needed(collect_page, ws_url, _log):
                 try:
-                    await collect_page.goto(ws_url, wait_until="domcontentloaded", timeout=15000)
+                    await collect_page.goto(ws_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                     await collect_page.wait_for_timeout(5000)
                 except Exception as exc:
                     debug(f"报名后重新进入详情页失败: {type(exc).__name__}")
@@ -8597,7 +8606,7 @@ class AutoLearner:
                     tab = collect_page.locator(f"text={tab_text}").first
                     if await tab.count() > 0 and await tab.is_visible():
                         await tab.click()
-                        await collect_page.wait_for_timeout(3000)
+                        await collect_page.wait_for_timeout(PAGE_SETTLE_WAIT)
                         break
                 except Exception:
                     pass
@@ -8607,7 +8616,7 @@ class AutoLearner:
                 rows = await collect_page.locator("tr.text-center").count()
                 if rows > 0:
                     break
-                await collect_page.wait_for_timeout(3000)
+                await collect_page.wait_for_timeout(PAGE_SETTLE_WAIT)
 
             courses = await self.get_courses_from_workshop(collect_page)
             if not courses:
@@ -8725,8 +8734,8 @@ class AutoLearner:
     async def interactive_tag_selection(self, page: Page) -> List[str]:
         # 等待标签树加载
         try:
-            await page.wait_for_selector("ul.tag-tree-list", timeout=15000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_selector("ul.tag-tree-list", timeout=PAGE_LOAD_TIMEOUT)
+            await page.wait_for_timeout(PAGE_SETTLE_WAIT)
         except:
             console.print("标签树未加载，尝试从页面文本提取标签...", style="yellow")
             # 尝试从文本提取（兜底）
@@ -9066,7 +9075,7 @@ def start(headless, workers, target_hours, tags, exam, deepseek_key):
                     no_more_pages = True
                 else:
                     page_num += 1
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(PAGE_SETTLE_WAIT)
 
             if tasks:
                 # 定义回调：worker队列空时自动翻页采集更多课程
@@ -9099,7 +9108,7 @@ def start(headless, workers, target_hours, tags, exam, deepseek_key):
                             no_more_pages = True
                             return 0
                         page_num += 1
-                        await _page_ref[0].wait_for_timeout(3000)
+                        await _page_ref[0].wait_for_timeout(PAGE_SETTLE_WAIT)
                         # 采集新页
                         new_ws = await learner.get_workshops(_page_ref[0])
                         if not new_ws:
