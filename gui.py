@@ -4674,8 +4674,33 @@ class _BaseWindow(QMainWindow):
         self.navigationInterface.setVisible(bool(visible))
 
 
+# 窗口尺寸决策（纯函数，便于单测）：根据屏幕可用区域决定窗口该多大、是否最大化。
+# 返回 (should_maximize, resize_w, resize_h, min_w, min_h)。
+def _resolve_start_window_geometry(avail_w: int, avail_h: int,
+                                   default_w: int = 1440, default_h: int = 900,
+                                   min_w: int = 1120, min_h: int = 720) -> tuple:
+    if avail_w <= 0 or avail_h <= 0:
+        return False, default_w, default_h, min_w, min_h
+    # 头部品牌栏 + 底部操作按钮的最小内容高度：低于它缩了也挤不下 → 最大化
+    content_min_h = 680
+    if avail_h < content_min_h:
+        return True, default_w, default_h, min_w, min_h
+    resize_w = int(min(default_w, avail_w))
+    resize_h = int(min(default_h, max(content_min_h, avail_h - 40)))
+    resize_h = int(max(content_min_h, resize_h))
+    new_min_w = int(min(default_w, min_w, avail_w - 80))
+    new_min_h = int(min(default_h, min_h, avail_h - 80))
+    return False, resize_w, resize_h, new_min_w, new_min_h
+
+
 class MainWindow(_BaseWindow):
     update_check_signal = Signal(object)  # (latest, needs_update, notes, download_urls)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not event.spontaneous() and getattr(self, "_start_maximized", False):
+            self.showMaximized()
+            self._start_maximized = False
 
     def switchTo(self, widget):
         """切换到指定页面，附带轻微淡入（仪表盘除外，避免实时刷新闪烁）"""
@@ -4765,9 +4790,29 @@ class MainWindow(_BaseWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("润物 Moisten")
-        # 默认/最小尺寸要足够容纳各设置页内容（过小会导致文字被裁切）
-        self.resize(1440, 900)
-        self.setMinimumSize(1120, 720)
+        # 默认/最小尺寸要足够容纳各设置页内容（过小会导致文字被裁切）。
+        # 但有些电脑分辨率/缩放不够，1440×900 直接开出来会把底部按钮顶出屏幕
+        # （标题栏保持在屏内，窗口底边被裁），最大化才看得见。这里在启动时对照
+        # 当前屏幕的可用区域做三件事：
+        #   1) 太大 → 缩到屏幕范围内（含任务栏余量），让底部按钮不被裁掉；
+        #   2) 最小尺寸按屏幕放宽，别比屏幕还大；
+        #   3) 屏幕实在矮到放不下默认内容 → 直接最大化。
+        # 正常分辨率的屏幕不受影响，仍以窗口模式打开。
+        self._start_maximized = False
+        # 某些电脑分辨率/缩放不够：默认 1440×900 开出来会把底部按钮顶出屏幕，
+        # 最大化才看得见。这里按当前屏幕可用区域决定是"缩小到屏幕内"还是
+        # "直接最大化"，交给 showEvent 落地，避免与多次 show() 打架。
+        try:
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen else None
+        except Exception:
+            avail = None
+        start_max, resize_w, resize_h, new_min_w, new_min_h = (
+            _resolve_start_window_geometry(
+                avail.width() if avail else 0, avail.height() if avail else 0))
+        self.resize(resize_w, resize_h)
+        self.setMinimumSize(new_min_w, new_min_h)
+        self._start_maximized = start_max
         self._drag_pos = None
         self._in_main_shell = False
         self._settings_mode = False
